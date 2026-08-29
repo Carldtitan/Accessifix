@@ -24,8 +24,9 @@ export default function FindingsPage() {
             <span className="eyebrow">Evidence</span>
             <h2 id="findings-list">Recorded findings</h2>
             <p>
-              {sampleScore.findingsTotal} findings across {sampleScore.criteriaFailingBaseline}{" "}
-              failing criteria. FLAG findings are routed to a human and are never auto-fixed.
+              Showing {sampleFindings.length} of {sampleScore.findingsTotal} findings across{" "}
+              {sampleScore.criteriaFailingBaseline} failing criteria. FLAG findings are routed to
+              a human and are never auto-fixed.
             </p>
           </div>
         </div>
@@ -48,7 +49,8 @@ export default function FindingsPage() {
       </section>
 
       <p className="muted" style={{ marginTop: 18, fontSize: 13 }}>
-        Placeholder data. Findings will be read from the ledger.
+        Placeholder data. The cards above are an excerpt; the counts on each filter describe that
+        excerpt, not the whole run. The full ledger will be read from the database.
       </p>
     </main>
   );

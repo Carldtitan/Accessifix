@@ -149,7 +149,7 @@ export function AppShell({
         </nav>
 
         <div className="sidebar-bottom">
-          <Link className="account-link" href="/app/settings">
+          <Link className="account-link" href="/app/settings" onClick={closeMenu}>
             <span className="avatar" aria-hidden="true">
               {initials}
             </span>
