@@ -17,7 +17,7 @@
  * job already succeeded, it returns the stored result without doing the work
  * again.
  */
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, lt, ne, or, sql } from 'drizzle-orm';
 
 import { db } from '@/lib/db';
 
@@ -37,9 +37,50 @@ export interface BeginJobInput {
   agent?: string | null;
 }
 
-/** Create or reclaim the job row, and mark it running. */
+/**
+ * How long a `running` job row may go untouched before another conductor may
+ * reclaim it.
+ *
+ * Longer than the harness turn timeout (10 minutes), because a job that is
+ * genuinely still running on TrueForge must not be stolen out from under it.
+ * The normal recovery path is much faster than this: the run lease expires in a
+ * minute, and `resumeRun()` releases stranded rows explicitly.
+ */
+const JOB_STALE_AFTER_MS = 30 * 60_000;
+
+/**
+ * A job key that is already being worked on by someone else.
+ *
+ * Thrown rather than returned so the row is left exactly as it is: failing it
+ * would discard a TrueForge session that is still alive and paid for.
+ */
+export class JobLockedError extends Error {
+  readonly job: PipelineJob | null;
+
+  constructor(input: BeginJobInput, job: PipelineJob | null) {
+    super(
+      `The ${input.phase} job for "${input.jobKey}" on run ${input.runId} is already ` +
+        `running${job?.sessionId ? ` in TrueForge session ${job.sessionId}` : ''}; it was not reclaimed.`,
+    );
+    this.name = 'JobLockedError';
+    this.job = job;
+  }
+}
+
+/**
+ * Create or reclaim the job row, and mark it running.
+ *
+ * The reclaim is *conditional*. An unconditional upsert would reset a row that
+ * another conductor is actively working — the run lease makes that unlikely,
+ * but "unlikely" is not the standard for a write that discards a live harness
+ * session. A row is reclaimed only when it is not running, or when it has been
+ * running long enough that nothing can plausibly still be behind it.
+ *
+ * @throws JobLockedError when the row belongs to live work elsewhere.
+ */
 export async function beginJob(input: BeginJobInput): Promise<PipelineJob> {
   const now = new Date();
+  const staleBefore = new Date(now.getTime() - JOB_STALE_AFTER_MS);
 
   const [row] = await db
     .insert(pipelineJobs)
@@ -59,11 +100,20 @@ export async function beginJob(input: BeginJobInput): Promise<PipelineJob> {
         startedAt: now,
         completedAt: null,
         error: null,
+        attempts: sql`${pipelineJobs.attempts} + 1`,
       },
+      setWhere: or(
+        ne(pipelineJobs.status, 'running'),
+        lt(pipelineJobs.startedAt, staleBefore),
+      ),
     })
     .returning();
 
-  return row;
+  if (row) return row;
+
+  // No row came back: the conflict target matched and `setWhere` refused the
+  // update, which can only mean the row is running under someone else.
+  throw new JobLockedError(input, await findJob(input.runId, input.phase, input.jobKey));
 }
 
 /**
@@ -231,7 +281,27 @@ export async function runJob<T>(
     }
   }
 
-  const job = await beginJob(input);
+  let job: PipelineJob;
+  try {
+    job = await beginJob(input);
+  } catch (error) {
+    if (!(error instanceof JobLockedError)) throw error;
+
+    // Someone else is on it. Say so and step aside — failing the row here would
+    // throw away the session that is still working.
+    await emitEvent({
+      runId: input.runId,
+      type: 'job',
+      agent: input.agent ?? 'APP',
+      summary: `Skipped the ${input.phase} job for ${input.jobKey}; it is already running.`,
+      detail: error.message,
+      data: { phase: input.phase, jobKey: input.jobKey, sessionId: error.job?.sessionId ?? null },
+    });
+
+    const stepped = options.onError?.(error);
+    if (stepped !== undefined) return stepped;
+    throw error;
+  }
 
   try {
     const value = await work({

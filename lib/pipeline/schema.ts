@@ -13,16 +13,19 @@
  *   - `run_events`     — the append-only event log. The SSE stream replays it
  *                        on reconnect, so a browser reload loses nothing
  *                        (A11.1, A11.3, A13.8, A13.9).
+ *   - `run_leases`     — which process is conducting which run. Process-local
+ *                        memory cannot coordinate two Node processes, and two
+ *                        conductors over one run means two pull requests.
  *
- * Both reference `runs` with `on delete cascade`, so they disappear with the
- * run they describe.
+ * All three reference `runs` with `on delete cascade`, so they disappear with
+ * the run they describe.
  *
  * NOTE FOR THE SCHEMA OWNER: `drizzle.config.ts` points `schema` at
  * `./lib/db/schema.ts` only. Change it to
  * `['./lib/db/schema.ts', './lib/pipeline/schema.ts']` before `npm run db:push`
- * or these two tables will never be created. Nothing else in `lib/db` needs to
- * change — Drizzle's `schema` option only feeds the relational query builder,
- * and every query here uses the core builder.
+ * or these three tables will never be created. Nothing else in `lib/db` needs
+ * to change — Drizzle's `schema` option only feeds the relational query
+ * builder, and every query here uses the core builder.
  */
 import { sql } from 'drizzle-orm';
 import {
@@ -161,6 +164,48 @@ export const pipelineJobs = pgTable(
 );
 
 /* -------------------------------------------------------------------------- */
+/* Conductor leases                                                           */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Which process is conducting which run.
+ *
+ * The in-memory `activeRuns` map in `orchestrate.ts` stops a second conductor
+ * inside *one* Node process. It says nothing about a second process, and a
+ * second process is not hypothetical: `next start` behind a load balancer, a
+ * rolling deploy where old and new overlap, or a boot sweep firing while the
+ * previous instance is still draining. Two conductors over one run means two
+ * crawls, two FIX passes and - the expensive mistake - two pull requests.
+ *
+ * So exclusivity is a database row, claimed atomically, with an expiry. A
+ * conductor renews while it works; a conductor that dies stops renewing and the
+ * lease falls in on its own, which is what lets the boot sweep pick the run up
+ * without a human deciding the old process is really gone.
+ *
+ * One row per run: `run_id` is the primary key, and that is the whole mutual
+ * exclusion.
+ */
+export const runLeases = pgTable(
+  'run_leases',
+  {
+    runId: uuid('run_id')
+      .primaryKey()
+      .references(() => runs.id, { onDelete: 'cascade' }),
+    /** Identifies the conducting process: host, pid and a per-boot nonce. */
+    owner: text('owner').notNull(),
+    /** The lease is dead once `now()` passes this. Renewed while conducting. */
+    expiresAt: timestamp('expires_at', { withTimezone: true, mode: 'date' }).notNull(),
+    acquiredAt: timestamp('acquired_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .defaultNow(),
+    renewedAt: timestamp('renewed_at', { withTimezone: true, mode: 'date' })
+      .notNull()
+      .defaultNow(),
+  },
+  (t) => [index('run_leases_expires_idx').on(t.expiresAt)],
+);
+
+/* -------------------------------------------------------------------------- */
 /* Event log (A11.1, A11.3, A13.9)                                            */
 /* -------------------------------------------------------------------------- */
 
@@ -187,6 +232,9 @@ export const runEvents = pgTable(
   },
   (t) => [index('run_events_run_id_idx').on(t.runId, t.id)],
 );
+
+export type RunLease = typeof runLeases.$inferSelect;
+export type NewRunLease = typeof runLeases.$inferInsert;
 
 export type PipelineJob = typeof pipelineJobs.$inferSelect;
 export type NewPipelineJob = typeof pipelineJobs.$inferInsert;
