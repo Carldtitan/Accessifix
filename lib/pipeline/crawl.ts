@@ -123,7 +123,17 @@ export function originOf(url: string): string | null {
 export interface CrawledPage {
   /** The `pages` row id. Findings point at it. */
   pageId: string;
+  /**
+   * The page's identity: the URL the browser actually ended on, normalised.
+   *
+   * Not the URL that was requested. A request for `/blog` that redirects to
+   * `/blog/latest` captured the latter, and recording the former would file
+   * every finding against a page that was never opened - and would resolve the
+   * page's own links against the wrong base.
+   */
   url: string;
+  /** What the crawler asked for. Differs from `url` when the page redirected. */
+  requestedUrl: string;
   title: string | null;
   /** Everything the audit lanes need, taken while the page was open. */
   capture: PageCapture;
@@ -139,6 +149,8 @@ export interface CrawlResult {
   rejectedCrossOrigin: string[];
   /** Pages whose capture failed. The crawl continues past them. */
   failures: { url: string; reason: string }[];
+  /** Requests that landed somewhere else, for the run log. */
+  redirects: { from: string; to: string }[];
   origin: string;
   cap: number;
 }
@@ -189,11 +201,20 @@ export async function crawl(
     skipped: [],
     rejectedCrossOrigin: [],
     failures: [],
+    redirects: [],
     origin,
     cap,
   };
 
+  /** URLs already asked for. Stops the same request being queued twice. */
   const seen = new Set<string>([start]);
+  /**
+   * URLs actually captured, after redirects. Two different requests can land on
+   * one page - `/` and `/index.html`, say - and that page is audited once. The
+   * first request to land wins, which is deterministic because the frontier is
+   * ordered and `allSettled` preserves it.
+   */
+  const captured = new Set<string>();
   let frontier: { url: string; depth: number }[] = [{ url: start, depth: 0 }];
 
   await emitEvent({
@@ -213,7 +234,7 @@ export async function crawl(
     const discovered: { url: string; depth: number }[] = [];
 
     const settled = await Promise.allSettled(
-      batch.map((entry) => visit(runId, entry.url, entry.depth)),
+      batch.map((entry) => visit(runId, entry.url, entry.depth, origin)),
     );
 
     for (let i = 0; i < settled.length; i += 1) {
@@ -234,7 +255,54 @@ export async function crawl(
         continue;
       }
 
-      const page = outcome.value;
+      const visited = outcome.value;
+
+      /*
+       * A same-origin URL that redirects off the origin is refused, not
+       * captured. The consent the user gave was for one deployment; following
+       * a redirect out of it audits a site they did not connect, and files the
+       * result under a URL that never served it.
+       */
+      if (visited.kind === 'cross-origin') {
+        if (!result.rejectedCrossOrigin.includes(visited.finalUrl)) {
+          result.rejectedCrossOrigin.push(visited.finalUrl);
+        }
+        result.redirects.push({ from: visited.requestedUrl, to: visited.finalUrl });
+        await emitEvent({
+          runId,
+          type: 'log',
+          capability: 'sandbox',
+          summary: `${visited.requestedUrl} redirected off the crawl origin.`,
+          detail:
+            `It landed on ${visited.finalUrl}, which is not ${origin}. The page was not ` +
+            'recorded: a run is scoped to the deployment the user connected.',
+          data: { phase: 'crawl', url: visited.requestedUrl, finalUrl: visited.finalUrl },
+        });
+        continue;
+      }
+
+      const page = visited.page;
+
+      if (page.url !== page.requestedUrl) {
+        result.redirects.push({ from: page.requestedUrl, to: page.url });
+      }
+
+      // Two requests can land on one page. It is captured once, under the URL
+      // that actually served it.
+      if (captured.has(page.url)) {
+        await emitEvent({
+          runId,
+          type: 'log',
+          capability: 'sandbox',
+          summary: `${page.requestedUrl} redirected to ${page.url}, which was already captured.`,
+          detail: 'The page is audited once, under the URL the browser ended on.',
+          data: { phase: 'crawl', url: page.requestedUrl, finalUrl: page.url },
+        });
+        continue;
+      }
+
+      captured.add(page.url);
+      seen.add(page.url);
       result.pages.push(page);
       options.onPage?.(page);
 
@@ -269,6 +337,7 @@ export async function crawl(
       `Crawl complete: ${result.pages.length} page(s) captured` +
       (result.skipped.length > 0 ? `, ${result.skipped.length} left at the cap` : '') +
       (result.failures.length > 0 ? `, ${result.failures.length} failed` : '') +
+      (result.redirects.length > 0 ? `, ${result.redirects.length} redirected` : '') +
       '.',
     data: {
       phase: 'crawl',
@@ -276,6 +345,7 @@ export async function crawl(
       skipped: result.skipped.length,
       failed: result.failures.length,
       crossOriginRejected: result.rejectedCrossOrigin.length,
+      redirects: result.redirects.length,
     },
   });
 
@@ -289,8 +359,32 @@ export async function crawl(
   return result;
 }
 
-/** Open one page, write its `pages` row, hand back the capture. */
-async function visit(runId: string, url: string, depth: number): Promise<CrawledPage> {
+/**
+ * What one visit produced: a page, or a redirect that left the crawl's origin.
+ */
+type VisitOutcome =
+  | { kind: 'captured'; page: CrawledPage }
+  | { kind: 'cross-origin'; requestedUrl: string; finalUrl: string };
+
+/**
+ * Open one page, write its `pages` row, hand back the capture.
+ *
+ * The page's identity is `capture.finalUrl`, not the URL that was requested.
+ * The browser reports where it actually ended, and ignoring that had two
+ * consequences, both silent: a page was filed under a URL that never served it,
+ * and its links were resolved against the wrong base, so a redirect to another
+ * directory turned every relative link on the page into a wrong one.
+ *
+ * A redirect that leaves the crawl origin is refused rather than captured. The
+ * origin check on discovered links is not enough on its own - a same-origin
+ * link can redirect anywhere, and only the final URL says where it went.
+ */
+async function visit(
+  runId: string,
+  url: string,
+  depth: number,
+  origin: string,
+): Promise<VisitOutcome> {
   const capture = await capturePage(url, {
     labels: { runId, phase: 'crawl' },
     // A11.1: the live environments grid needs the sandbox id as it is created,
@@ -306,9 +400,32 @@ async function visit(runId: string, url: string, depth: number): Promise<Crawled
     },
   });
 
-  const pageId = await upsertPage(runId, url, capture.title || null);
+  /*
+   * `finalUrl` is normalised through the same rules as a discovered link, so
+   * `/a/` and `/a` are one page however the redirect spelled it. A finalUrl the
+   * normaliser refuses (an asset extension, a non-http scheme) leaves the
+   * requested URL standing: the capture is real, and there is nothing better to
+   * call it.
+   */
+  const landed = normaliseUrl(capture.finalUrl || url) ?? url;
 
-  return { pageId, url, title: capture.title || null, capture, depth };
+  if (!isSameOrigin(landed, origin)) {
+    return { kind: 'cross-origin', requestedUrl: url, finalUrl: landed };
+  }
+
+  const pageId = await upsertPage(runId, landed, capture.title || null);
+
+  return {
+    kind: 'captured',
+    page: {
+      pageId,
+      url: landed,
+      requestedUrl: url,
+      title: capture.title || null,
+      capture,
+      depth,
+    },
+  };
 }
 
 /**

@@ -28,7 +28,7 @@
  * Rejections are not silent. Each one is written to the event log with its
  * reason, which is what makes the gate auditable rather than merely strict.
  */
-import { and, eq, inArray } from 'drizzle-orm';
+import { and, eq, inArray, sql } from 'drizzle-orm';
 
 import {
   WCAG_CRITERIA,
@@ -314,40 +314,87 @@ export async function recordFindings(
   if (validated.length > 0) {
     // Resolve page ids for anything the lane did not carry one for.
     await attachPageIds(input.runId, validated);
-    const fresh = await dropAlreadyRecorded(input.runId, input.phase, validated);
-    result.duplicates += validated.length - fresh.length;
 
-    if (fresh.length > 0) {
-      const inserted = await db.transaction(async (tx) => {
-        const rows = await tx
-          .insert(findings)
-          .values(fresh.map((item) => item.row))
-          .returning();
+    /*
+     * The duplicate check and the insert are one atomic step.
+     *
+     * They used to be two: a `SELECT` for what was already recorded, then a
+     * separate `INSERT`. VIS, ACT, CODE and MEDIA run concurrently over the
+     * same pages and honestly notice the same problems, so two lanes could both
+     * read "nothing there" and both write the same finding - inflating the
+     * finding count and, worse, the failing-criterion count that is the
+     * headline number of the whole product.
+     *
+     * `findings` carries no unique key over the dedupe identity to lean on -
+     * that table belongs to the product schema, not to the pipeline - so the
+     * serialisation is a transaction-scoped advisory lock keyed on the run and
+     * phase. It is held only across the read and the write, so lanes still run
+     * in parallel everywhere except the few milliseconds where parallelism is
+     * precisely the bug.
+     */
+    const outcome = await db.transaction(async (tx) => {
+      await lockLedger(tx, input.runId, input.phase);
 
-        const evidenceRows = rows.flatMap((row, index) =>
-          (fresh[index]?.evidence ?? []).map((item) => ({
-            findingId: row.id,
-            runId: input.runId,
-            kind: item.kind,
-            mimeType: item.mimeType ?? defaultMimeType(item.kind),
-            data: item.data ? Buffer.from(item.data, 'base64') : null,
-            storagePath: item.storagePath ?? null,
-          })),
-        );
+      const fresh = await dropAlreadyRecorded(tx, input.runId, input.phase, validated);
+      if (fresh.length === 0) return { rows: [] as Finding[], fresh };
 
-        if (evidenceRows.length > 0) {
-          await tx.insert(artifacts).values(evidenceRows);
-        }
-        return rows;
-      });
+      const rows = await tx
+        .insert(findings)
+        .values(fresh.map((item) => item.row))
+        .returning();
 
-      result.inserted = inserted;
-      result.corrected = fresh.filter((item) => item.corrected).length;
-    }
+      // Evidence follows the rows that were actually inserted, index for index.
+      const evidenceRows = rows.flatMap((row, index) =>
+        (fresh[index]?.evidence ?? []).map((item) => ({
+          findingId: row.id,
+          runId: input.runId,
+          kind: item.kind,
+          mimeType: item.mimeType ?? defaultMimeType(item.kind),
+          data: item.data ? Buffer.from(item.data, 'base64') : null,
+          storagePath: item.storagePath ?? null,
+        })),
+      );
+
+      if (evidenceRows.length > 0) {
+        await tx.insert(artifacts).values(evidenceRows);
+      }
+      return { rows, fresh };
+    });
+
+    result.duplicates += validated.length - outcome.fresh.length;
+    result.inserted = outcome.rows;
+    result.corrected = outcome.fresh.filter((item) => item.corrected).length;
   }
 
   await announce(input, result);
   return result;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Serialisation                                                              */
+/* -------------------------------------------------------------------------- */
+
+/** A transaction handle, so the lock and the read it guards share one. */
+type LedgerTx = Parameters<Parameters<typeof db.transaction>[0]>[0];
+
+/**
+ * A fixed namespace for AccessiFix's advisory locks, so a lock taken here can
+ * never collide with one taken by anything else against this database.
+ */
+const LEDGER_LOCK_NAMESPACE = 0x4158; // "AX"
+
+/**
+ * Serialise ledger writes for one run and phase.
+ *
+ * `pg_advisory_xact_lock` releases when the transaction ends, committed or
+ * rolled back - there is no path where a crashed writer leaves the ledger
+ * locked. The key is per run and phase, so two different runs never wait on
+ * each other.
+ */
+async function lockLedger(tx: LedgerTx, runId: string, phase: RunPhase): Promise<void> {
+  await tx.execute(
+    sql`select pg_advisory_xact_lock(${LEDGER_LOCK_NAMESPACE}::int, hashtext(${runId + ':' + phase})::int)`,
+  );
 }
 
 /** Resolve `page_url` to a `pages` row so the run view can link the finding. */
@@ -375,13 +422,14 @@ async function attachPageIds(runId: string, validated: ValidatedClaim[]): Promis
  * should double the finding count.
  */
 async function dropAlreadyRecorded(
+  tx: LedgerTx,
   runId: string,
   phase: RunPhase,
   validated: ValidatedClaim[],
 ): Promise<ValidatedClaim[]> {
   const criteria = [...new Set(validated.map((item) => item.row.criterion))];
 
-  const existing = await db
+  const existing = await tx
     .select({
       criterion: findings.criterion,
       pageUrl: findings.pageUrl,
@@ -503,24 +551,30 @@ export async function recordBlockedCriteria(
 ): Promise<number> {
   const blocked = WCAG_CRITERIA.filter((criterion) => criterion.verdict === 'BLOCKED');
 
-  const existing = await db
-    .select({ criterion: findings.criterion })
-    .from(findings)
-    .where(
-      and(
-        eq(findings.runId, runId),
-        eq(findings.phase, phase),
-        inArray(
-          findings.criterion,
-          blocked.map((c) => c.id),
-        ),
-      ),
-    );
+  const rows = await db.transaction(async (tx) => {
+    // The same read-then-write race as `recordFindings`, closed the same way:
+    // the baseline and the final score both call this, and a concurrent caller
+    // would otherwise file the two BLOCKED rows twice.
+    await lockLedger(tx, runId, phase);
 
-  const already = new Set(existing.map((row) => row.criterion));
-  const rows = blocked
-    .filter((criterion) => !already.has(criterion.id))
-    .map((criterion) => ({
+    const existing = await tx
+      .select({ criterion: findings.criterion })
+      .from(findings)
+      .where(
+        and(
+          eq(findings.runId, runId),
+          eq(findings.phase, phase),
+          inArray(
+            findings.criterion,
+            blocked.map((c) => c.id),
+          ),
+        ),
+      );
+
+    const already = new Set(existing.map((row) => row.criterion));
+    const missing = blocked
+      .filter((criterion) => !already.has(criterion.id))
+      .map((criterion) => ({
       runId,
       phase,
       pageId: null,
@@ -534,13 +588,18 @@ export async function recordBlockedCriteria(
       agent: 'TREE' as const,
       summary: `${criterion.id} ${criterion.name} is out of reach for automated audit.`,
       detail: blockedReason(criterion.id) ?? 'No capability lane can observe this criterion.',
-      sourcePath: null,
-      sessionId: null,
-    }));
+        sourcePath: null,
+        sessionId: null,
+      }));
+
+    if (missing.length === 0) return missing;
+
+    await tx.insert(findings).values(missing);
+    return missing;
+  });
 
   if (rows.length === 0) return 0;
 
-  await db.insert(findings).values(rows);
   await emitEvent({
     runId,
     type: 'finding',
