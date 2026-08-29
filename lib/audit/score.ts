@@ -125,7 +125,20 @@ export function partitionFindings(findings: readonly AuditFinding[]): FindingPar
 /* -------------------------------------------------------------------------- */
 
 export interface ScoreOptions {
-  /** Overrides the count derived from distinct page URLs in the findings. */
+  /**
+   * The pages the run actually audited.
+   *
+   * Coverage cannot be read off the findings: a page with nothing wrong
+   * contributes no finding, so deriving the count from findings drops every
+   * clean page and reports an entirely clean crawl as zero pages audited.
+   * Hand over the crawl's page list - `audits.map((a) => a.pageUrl)` - and the
+   * count is what was measured rather than what happened to fail.
+   */
+  readonly auditedPageUrls?: Iterable<string>;
+  /**
+   * The audited page count outright, when the list itself is not to hand.
+   * Takes precedence over `auditedPageUrls`.
+   */
   readonly pagesAudited?: number;
   /**
    * The criteria a lane actually reached on this run.
@@ -179,6 +192,7 @@ export function scoreRun(
   }
 
   const evaluated = options.evaluatedCriteria ? new Set(options.evaluatedCriteria) : null;
+  const auditedPages = options.auditedPageUrls ? new Set(options.auditedPageUrls) : null;
 
   const criteria: CriterionScore[] = WCAG_CRITERIA.map((criterion) => {
     const own = byCriterion.get(criterion.id) ?? [];
@@ -265,7 +279,12 @@ export function scoreRun(
     findingsBySeverity,
     findingsByLevel,
     findingsByAgent,
-    pagesAudited: options.pagesAudited ?? pageUrls.size,
+    /*
+     * The last fallback is the pages that produced a finding, which is the only
+     * thing derivable here and is an undercount whenever a page came back
+     * clean. Supply `auditedPageUrls` or `pagesAudited`.
+     */
+    pagesAudited: options.pagesAudited ?? auditedPages?.size ?? pageUrls.size,
     rejectedFindings: rejected,
     conformanceClaim: null,
     disclaimer: NO_CONFORMANCE_CLAIM,
