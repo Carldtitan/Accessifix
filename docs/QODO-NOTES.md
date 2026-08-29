@@ -56,3 +56,20 @@ pushes are rejected for everyone including the repository owner.
   - Findings page now derives both numbers and labels the excerpt as a subset, so it no longer contradicts the criterion matrix beside it.
   - `failed` badge given its own deeper red ground plus a ring, so it differs from `live` by shape as well as hue rather than by colour alone. 8.5:1 composited, recorded in the contrast ledger.
 - **We dismissed:** Nothing. All five were genuine.
+
+---
+
+## PR #8 — Task 9: pipeline orchestrator, state machine and API routes
+
+- **Link:** https://github.com/Carldtitan/Accessifix/pull/8
+- **Qodo found:** 9 bugs — deployed-URL SSRF; conductors lack durable ownership; reattached work runs again; scoring runs never resume; approval race reverses the decision; resume duplicates approval gates; finding dedupe races; the terminal SSE event can disappear; redirects corrupt crawl identity.
+- **We changed:**
+  - **SSRF, the serious one.** A user-supplied target URL was fetched with no address vetting, so it could reach localhost or private ranges from our server. Now rejects URL credentials, localhost and private IP literals, covers the IANA special-purpose ranges for both families, and unwraps IPv4-mapped, 6to4 and NAT64 IPv6 so `::ffff:127.0.0.1` cannot slip past. Hostnames resolve first and the name is refused if *any* answer is private — the rebinding case. Redirects moved from `follow` to `manual` with a 5-hop loop that re-vets every destination.
+  - **Durable run ownership.** Exclusivity was process-local, so a restart or a second instance could drive the same pipeline twice — duplicate sandboxes, duplicate spend, duplicate findings. Now an atomic conditional upsert on `run_id` with a 60s TTL renewed every 20s; losing the lease aborts the conductor. `beginJob` refuses to reset a row that is running and not stale, since resetting would discard a live TrueForge session.
+  - **Resume replays instead of re-running.** A finished turn's output is parsed and replayed *through* `recordFindings()`, preserving the only-writer invariant. The stranded-job filter was resetting still-running turns to pending — the exact duplicate-work case it existed to prevent.
+  - `prPhase()` had no `fromResult`, so a resumed run would have opened a **second pull request**.
+  - Approval races now derive `approved` from the persisted status and return `applied: false` with the standing decision rather than reversing it.
+  - Dedupe moved inside the insert transaction under a `pg_advisory_xact_lock` keyed on run+phase.
+  - The terminal SSE event can no longer be lost: subscribe-then-replay with buffering, and a final catch-up read on close that consults the durable lease rather than process-local state.
+  - A redirect no longer keys the row to the requested URL while the audit describes the landed one.
+- **We dismissed:** Nothing outright. One deviation: Qodo suggested a unique constraint on `findings` for the dedupe race; that table is in `lib/db/schema.ts`, outside this PR's scope, and the advisory lock closes the same race without a migration. Noted in the code.
