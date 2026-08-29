@@ -80,6 +80,17 @@ export const OBSERVATION_KEYS = {
   stateAfterReadVia: 'stateAfterReadVia',
 
   /* Dialog */
+  /**
+   * Visible dialogs *before* the action.
+   *
+   * Without this, "one dialog is visible after the click" cannot be told apart
+   * from "one dialog was already visible", and a cookie banner sitting open on
+   * page load hands its focus and Escape findings to whichever control happened
+   * to be probed. `diff.ts` falls back to counting dialog-role nodes across the
+   * two trees when this is absent, so an executor that has not been taught the
+   * key yet degrades rather than misattributes.
+   */
+  dialogsVisibleBefore: 'dialogsVisibleBefore',
   dialogsVisibleAfterOpen: 'dialogsVisibleAfterOpen',
   focusAfterOpen: 'focusAfterOpen',
   dialogsVisibleAfterEscape: 'dialogsVisibleAfterEscape',
@@ -88,8 +99,31 @@ export const OBSERVATION_KEYS = {
   treeAfterEscape: 'treeAfterEscape',
 
   /* Form */
+  /**
+   * Live regions and their text *before* submitting.
+   *
+   * A permanent `aria-live` status - "Welcome back", a cart total, a cookie
+   * notice - is not validation output. Read as one it both invents a 3.3.3
+   * finding and, worse, satisfies the precondition that says the submission was
+   * rejected at all. `diff.ts` falls back to the before-tree's node names when
+   * this is absent.
+   */
+  formErrorsBefore: 'formErrorsBefore',
   formErrors: 'formErrors',
   focusAfterSubmit: 'focusAfterSubmit',
+
+  /* Navigation */
+  /**
+   * The page URL on each side of the action.
+   *
+   * Navigation replaces the whole accessibility tree, which is exactly the
+   * 4.1.2 signature, so suppressing it is load-bearing. Comparing two URLs is
+   * the direct measurement; `observations.navigated` below is the executor's
+   * own verdict, and `diff.ts` also derives one from the document title and id
+   * stability so that suppression never rests on a key nobody filed.
+   */
+  urlBefore: 'urlBefore',
+  urlAfter: 'urlAfter',
 
   /** Optional. Set by the executor when the action navigated the page. */
   navigated: 'navigated',
@@ -267,8 +301,16 @@ function actionVerb(path: InteractionPath): string {
  *
  * The reload is not optional. Without it, path N runs against whatever path
  * N-1 left open, which is depth two wearing a disguise.
+ *
+ * Every reading taken after the action has a counterpart taken before it. That
+ * symmetry is the point: a measurement with no baseline cannot distinguish
+ * "this control did it" from "it was already like that", and every one of those
+ * confusions turns into a finding filed against an innocent control.
+ *
+ * `preAction` is spliced in immediately before the action, for the baselines
+ * only one template needs.
  */
-function baselineSteps(path: InteractionPath): PathStep[] {
+function baselineSteps(path: InteractionPath, preAction: readonly PathStep[] = []): PathStep[] {
   const label = path.label || path.selector;
   return [
     {
@@ -286,11 +328,17 @@ function baselineSteps(path: InteractionPath): PathStep[] {
       records: 'stateBefore',
     },
     {
+      kind: 'read-url',
+      describe: 'Record the page URL before the interaction.',
+      records: OBSERVATION_KEYS.urlBefore,
+    },
+    {
       kind: 'mark-trigger',
       describe:
         'Stamp the control so its after-state is read from the same DOM node even if its label changes.',
       records: OBSERVATION_KEYS.triggerMarked,
     },
+    ...preAction,
     {
       kind: 'act',
       describe: `${actionVerb(path)} "${label}".`,
@@ -308,6 +356,12 @@ function baselineSteps(path: InteractionPath): PathStep[] {
       kind: 'read-element-state',
       describe: `Read the state attributes on "${label}" again, through the stamp.`,
       records: 'stateAfter',
+    },
+    {
+      kind: 'read-url',
+      describe:
+        'Record the page URL again. A change means the tree was replaced by navigation, which suppresses the 4.1.2 rules entirely.',
+      records: OBSERVATION_KEYS.urlAfter,
     },
   ];
 }
@@ -357,10 +411,17 @@ export function toggleTemplate(path: InteractionPath): PathSpec {
 export function dialogTemplate(path: InteractionPath): PathSpec {
   const label = path.label || path.selector;
   const steps: PathStep[] = [
-    ...baselineSteps(path),
+    ...baselineSteps(path, [
+      {
+        kind: 'count-dialogs',
+        describe:
+          'Count visible dialogs BEFORE acting, so a dialog the page loaded with is not attributed to this control.',
+        records: OBSERVATION_KEYS.dialogsVisibleBefore,
+      },
+    ]),
     {
       kind: 'count-dialogs',
-      describe: 'Count visible dialogs, to confirm one actually opened.',
+      describe: 'Count visible dialogs again. Only a rise means this control opened one.',
       records: OBSERVATION_KEYS.dialogsVisibleAfterOpen,
     },
     {
@@ -413,11 +474,18 @@ export function dialogTemplate(path: InteractionPath): PathSpec {
  */
 export function formTemplate(path: InteractionPath): PathSpec {
   const steps: PathStep[] = [
-    ...baselineSteps(path),
+    ...baselineSteps(path, [
+      {
+        kind: 'collect-form-errors',
+        describe:
+          'Collect live regions and their text BEFORE submitting, so a permanent status message is not read as validation output.',
+        records: OBSERVATION_KEYS.formErrorsBefore,
+      },
+    ]),
     {
       kind: 'collect-form-errors',
       describe:
-        'Collect live regions, their text, and the count of fields marked invalid or described.',
+        'Collect live regions, their text, and the count of fields marked invalid or described. Only messages absent from the baseline count as validation.',
       records: OBSERVATION_KEYS.formErrors,
     },
     {
