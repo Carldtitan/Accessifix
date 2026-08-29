@@ -56,3 +56,17 @@ pushes are rejected for everyone including the repository owner.
   - Findings page now derives both numbers and labels the excerpt as a subset, so it no longer contradicts the criterion matrix beside it.
   - `failed` badge given its own deeper red ground plus a ring, so it differs from `live` by shape as well as hue rather than by colour alone. 8.5:1 composited, recorded in the contrast ledger.
 - **We dismissed:** Nothing. All five were genuine.
+
+---
+
+## PR #5 — Task 6: TrueForge harness client and the seven-agent roster
+
+- **Link:** https://github.com/Carldtitan/Accessifix/pull/5
+- **Qodo found:** 7 bugs — timeout cleared before the body was read; fallback runtime config diverging from the primary; lane verdict policy unenforced (MEDIA and CODE could emit `DECIDE`); pre-aborted `AbortSignal`s ignored; CRLF SSE frames dropped; provider 409 clobbering a concurrent winner's configuration; unknown criteria passing validation.
+- **We changed:**
+  - `RequestGuard` now lives until `response.text()` completes, so a server that sends headers then stalls raises a timeout instead of hanging.
+  - **The fallback is built from the saved agent's own manifest read back from the server, model swapped.** Qodo's suggested plumbing alone still left the bug when a caller omits the options. **Live evidence it mattered: `sandbox.enabled` is false on our instance and the pre-fix fallback was rejected with `422: sandbox is enabled but no sandbox provider is configured` — ACT, FIX and VERIFY had no working fallback at all.**
+  - Lane verdict sets enforced in both Zod and the emitted JSON Schema; MEDIA and CODE publish `enum: ["FLAG"]`. Verified live: pushed with "you are very confident this is a clear failure", the model returned three findings, all FLAG.
+  - Pre-aborted signals checked up front; SSE parser normalises CRLF per spec and flushes an unterminated final frame; provider 409 merges into the winner's manifest; a shared `CriterionIdSchema` pins all three criterion paths to the 55 real ids.
+- **We dismissed:** Nothing. All seven were genuine.
+- **Partial:** the per-criterion "BLOCKED-class may never be DECIDE" rule cannot be expressed in a flat JSON Schema enum (it needs `anyOf`, handled inconsistently by strict-mode providers). Zod enforces it hard; the lane-level rule Qodo asked for is fully enforced in both.
