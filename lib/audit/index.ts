@@ -34,3 +34,24 @@ export * from './act-lane';
 export * from './media-lane';
 export * from './code-lane';
 export * from './pages-lane';
+
+/*
+ * Explicit re-exports for the six lanes.
+ *
+ * `export *` above resolves these for TypeScript but NOT at ESM runtime - a
+ * probe found `import * as audit from '@/lib/audit'` returning zero `run*`
+ * members while every module exported its lane correctly in isolation.
+ *
+ * lib/pipeline/lanes.ts imports all six from here, so without this the
+ * conductor would typecheck cleanly and then fail at run time with
+ * "does not provide an export named 'runActLane'". Naming them is not
+ * redundancy; it is the difference between the pipeline running and not.
+ */
+export { runTreeLane } from './lane';
+export { runVisLane } from './vis-lane';
+export { runActLane } from './act-lane';
+export { runMediaLane } from './media-lane';
+export { runCodeLane } from './code-lane';
+export { runPagesLane } from './pages-lane';
+export { auditPage } from './tree';
+export { scoreRun, computeDelta } from './score';
