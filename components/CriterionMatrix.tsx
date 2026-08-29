@@ -16,7 +16,9 @@ export type CriterionCell =
   | "passing"
   | "failing"
   | "flagged"
-  | "blocked";
+  | "blocked"
+  /* A criterion no lane reached. Not a pass. */
+  | "not_evaluated";
 
 export type CriterionRow = {
   id: string;

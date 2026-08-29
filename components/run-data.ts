@@ -65,7 +65,7 @@ export interface CriterionScoreWire {
   verdict: "DECIDE" | "FLAG" | "BLOCKED";
   findings: number;
   open: number;
-  state: "passing" | "failing" | "flagged" | "blocked";
+  state: "passing" | "failing" | "flagged" | "blocked" | "not_evaluated";
   reason?: string;
 }
 
@@ -76,6 +76,7 @@ export interface RunScoreWire {
   flaggedCriteria: number;
   blockedCriteria: number;
   passingCriteria: number;
+  notEvaluatedCriteria?: number;
   totalFindings: number;
   openFindings: number;
   bySeverity: Record<string, number>;
@@ -139,6 +140,20 @@ export interface PageWire {
   title: string | null;
 }
 
+/**
+ * One captured browser frame, as a reference rather than as bytes.
+ *
+ * A full-page PNG is measured in megabytes. It is never put on the SSE stream
+ * and never put in a React prop; the wire carries the artifact id, and the
+ * `<img>` fetches `/api/artifacts/{id}` like any other image.
+ */
+export interface FrameWire {
+  artifactId: string;
+  /** The page URL the frame depicts. Matches `pages.url`. */
+  pageUrl: string;
+  capturedAt: string;
+}
+
 export interface RunEventWire {
   id: number;
   runId: string;
@@ -158,6 +173,8 @@ export interface RunDetailWire {
   score: RunScoreWire;
   finalScore: RunScoreWire | null;
   pages: PageWire[];
+  /** The browser frames this run captured, one per page. */
+  frames: FrameWire[];
   patches: PatchWire[];
   pendingHandoffs: HandoffWire[];
   jobs?: JobWire[];
@@ -348,6 +365,77 @@ const PHASE_VERB: Record<string, string> = {
   verify: "Verify",
 };
 
+/**
+ * The page URL inside a job key.
+ *
+ * `pipeline_jobs` keys a page-scoped job as `${runPhase}:${pageUrl}` —
+ * `baseline:https://example.com/` — so that the baseline and the final audit of
+ * one page are two rows rather than one. Anything joining a job to a page has
+ * to strip that prefix first; a lookup on the raw key silently misses every
+ * time, which is why the cards reported no finding counts.
+ *
+ * A key that carries no phase prefix (`crawl`, `score`, a source path) comes
+ * back unchanged.
+ */
+export function pageKeyOf(jobKey: string): string {
+  return jobKey.replace(/^(?:baseline|final):/, "");
+}
+
+/** Where a stored artifact's bytes are served from. */
+export function artifactUrl(artifactId: string): string {
+  return `/api/artifacts/${encodeURIComponent(artifactId)}`;
+}
+
+/**
+ * Frames arranged for lookup by job key.
+ *
+ * `landing` is the first frame the run captured — the deployed URL itself,
+ * because the crawl is breadth-first from there. It is what the crawl card
+ * shows, that card being keyed by its phase rather than by a page.
+ */
+export interface FrameIndex {
+  byPage: ReadonlyMap<string, string>;
+  landing?: string;
+}
+
+export function indexFrames(frames: ReadonlyArray<FrameWire>): FrameIndex {
+  const byPage = new Map<string, string>();
+
+  for (const frame of frames) {
+    const href = artifactUrl(frame.artifactId);
+    byPage.set(frame.pageUrl, href);
+    // A job key spells a page with or without its trailing slash; index both.
+    const alt = frame.pageUrl.endsWith("/") ? frame.pageUrl.slice(0, -1) : frame.pageUrl + "/";
+    if (!byPage.has(alt)) byPage.set(alt, href);
+  }
+
+  return {
+    byPage,
+    ...(frames[0] ? { landing: artifactUrl(frames[0].artifactId) } : {}),
+  };
+}
+
+/**
+ * The frame to show on one card, or `undefined` for the honest placeholder.
+ *
+ * Only a phase that actually drove a browser can have one. A build-sandbox or
+ * ledger job is left with the placeholder even when its key happens to be a
+ * page URL — CODE reads source, and dressing its card with a browser frame
+ * would claim a capture that phase never made.
+ */
+function frameFor(job: JobWire, frames: FrameIndex): string | undefined {
+  if (!BROWSER_PHASES.has(job.phase)) return undefined;
+
+  const direct = frames.byPage.get(pageKeyOf(job.jobKey));
+  if (direct) return direct;
+
+  // The crawl job is keyed by its phase, not by a page, because it opened all
+  // of them. Its card shows the first frame it took: the deployed URL.
+  if (job.phase === "crawl" || job.phase === "final_audit") return frames.landing;
+
+  return undefined;
+}
+
 /** A URL's path, or the whole string when it is not a URL. */
 function shortKey(key: string): string {
   try {
@@ -382,11 +470,18 @@ function describeJob(phase: string, jobKey: string): string {
  * `pageFindings` lets a page-keyed job report how many findings came out of it.
  * A job whose key is not a page URL reports no count at all rather than zero,
  * because "none found" and "not counted here" are different claims.
+ *
+ * `frames` is the run's captured screenshots, by page. A card gets one only if
+ * a browser phase actually captured that page; everything else keeps the
+ * placeholder, which says truthfully that no frame exists.
  */
 export function jobsToEnvironments(
   jobs: ReadonlyArray<JobWire>,
   pageFindings: ReadonlyMap<string, number> = new Map(),
+  frames: ReadonlyArray<FrameWire> = [],
 ): BrowserEnvironment[] {
+  const frameIndex = indexFrames(frames);
+
   const rank = (job: JobWire): number => {
     const state = JOB_STATE[job.status] ?? "queued";
     return state === "live" ? 0 : state === "failed" ? 1 : state === "queued" ? 2 : 3;
@@ -396,8 +491,9 @@ export function jobsToEnvironments(
     .sort((a, b) => rank(a) - rank(b) || a.phase.localeCompare(b.phase))
     .map((job) => {
       const state = JOB_STATE[job.status] ?? "queued";
-      const findings = pageFindings.get(job.jobKey);
+      const findings = pageFindings.get(pageKeyOf(job.jobKey));
       const captured = formatUtcTime(job.completedAt ?? job.startedAt);
+      const screenshotUrl = frameFor(job, frameIndex);
       const environment: BrowserEnvironment = {
         id: job.id,
         engine: engineFor(job.phase),
@@ -406,6 +502,7 @@ export function jobsToEnvironments(
         state,
         ...(findings === undefined ? {} : { findings }),
         ...(captured ? { capturedAt: captured } : {}),
+        ...(screenshotUrl ? { screenshotUrl } : {}),
       };
       return environment;
     });

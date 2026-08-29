@@ -11,7 +11,8 @@
  */
 import { and, eq } from 'drizzle-orm';
 
-import { WCAG_CRITERIA, blockedReason } from '@/lib/db/criteria';
+import { WCAG_CRITERIA, blockedReason, criteriaOwnedBy } from '@/lib/db/criteria';
+import { pipelineJobs } from './schema';
 import { db } from '@/lib/db';
 import {
   findings,
@@ -30,8 +31,14 @@ export interface CriterionScore {
   findings: number;
   /** Findings not yet fixed or dismissed. */
   open: number;
-  /** `blocked` outranks everything: A2.4 forbids reporting it as passing. */
-  state: 'passing' | 'failing' | 'flagged' | 'blocked';
+  /**
+   * `blocked` outranks everything: A2.4 forbids reporting it as passing.
+   *
+   * `not_evaluated` is the honest answer for a criterion no lane reached. It is
+   * distinct from `passing` on purpose - claiming a pass nobody checked is the
+   * failure that makes an accessibility report worthless.
+   */
+  state: 'passing' | 'failing' | 'flagged' | 'blocked' | 'not_evaluated';
   reason?: string;
 }
 
@@ -71,6 +78,31 @@ export async function scoreRun(runId: string, phase: RunPhase): Promise<RunScore
     .from(findings)
     .where(and(eq(findings.runId, runId), eq(findings.phase, phase)));
 
+  /*
+   * Which criteria a lane actually reached.
+   *
+   * Without this, every criterion with no findings was reported as PASSING -
+   * including the 51 nobody had checked. A run where ACT and VIS completed and
+   * MEDIA never started would have claimed a clean bill of health on media
+   * criteria it never looked at.
+   *
+   * That is the exact false-pass this product exists to eliminate, so it must
+   * not be ours: a criterion is passing only if the lane that owns it ran and
+   * came back with nothing.
+   */
+  const laneJobs = await db
+    .select({ agent: pipelineJobs.agent, status: pipelineJobs.status })
+    .from(pipelineJobs)
+    .where(eq(pipelineJobs.runId, runId));
+
+  const evaluated = new Set<string>();
+  for (const job of laneJobs) {
+    if (job.status !== 'succeeded' || !job.agent) continue;
+    for (const c of criteriaOwnedBy(job.agent as Parameters<typeof criteriaOwnedBy>[0])) {
+      evaluated.add(c.id);
+    }
+  }
+
   const bySeverity = Object.fromEntries(SEVERITIES.map((s) => [s, 0])) as Record<Severity, number>;
   const counts = new Map<string, { total: number; open: number }>();
   let openFindings = 0;
@@ -87,19 +119,21 @@ export async function scoreRun(runId: string, phase: RunPhase): Promise<RunScore
     counts.set(row.criterion, entry);
   }
 
-  // Left join against the fixed list of 55, so a criterion with no findings is
-  // reported as passing rather than silently absent.
+  // Left join against the fixed list of 55, so a criterion is never silently
+  // absent - but a criterion nobody evaluated is reported as such, not as a pass.
   const criteria: CriterionScore[] = WCAG_CRITERIA.map((criterion) => {
     const entry = counts.get(criterion.id) ?? { total: 0, open: 0 };
 
     const state: CriterionScore['state'] =
       criterion.verdict === 'BLOCKED'
         ? 'blocked'
-        : entry.open === 0
-          ? 'passing'
-          : criterion.verdict === 'FLAG'
+        : entry.open > 0
+          ? criterion.verdict === 'FLAG'
             ? 'flagged'
-            : 'failing';
+            : 'failing'
+          : evaluated.has(criterion.id)
+            ? 'passing'
+            : 'not_evaluated';
 
     return {
       criterion: criterion.id,
