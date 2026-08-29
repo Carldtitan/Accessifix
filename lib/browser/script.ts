@@ -269,9 +269,13 @@ async function loadAxeSource(job, warnings) {
 }
 
 async function runAxe(page, source, warnings) {
+  // Returns violations plus a ran flag. An empty violations array from a
+  // page where axe never executed is indistinguishable from a clean page,
+  // and reporting that as a pass is the worst result this tool can produce.
+  // Only a completed run sets ran to true.
   if (!source) {
     warnings.push('axe-core source unavailable; no deterministic violations collected');
-    return [];
+    return { violations: [], ran: false };
   }
   try {
     await page.addScriptTag({ content: source });
@@ -303,10 +307,10 @@ async function runAxe(page, source, warnings) {
         nodes: nodes
       });
     }
-    return out;
+    return { violations: out, ran: true };
   } catch (error) {
     warnings.push('axe-core run failed: ' + error.message);
-    return [];
+    return { violations: [], ran: false };
   }
 }
 
@@ -587,6 +591,7 @@ async function main() {
     axTree: {},
     screenshot: null,
     axeViolations: [],
+    axeRan: false,
     links: [],
     paths: [],
     timings: timings,
@@ -643,7 +648,9 @@ async function main() {
     if (job.axe !== false) {
       var axeStarted = Date.now();
       var axeSource = await loadAxeSource(job, warnings);
-      result.axeViolations = await runAxe(page, axeSource, warnings);
+      var axeOutcome = await runAxe(page, axeSource, warnings);
+      result.axeViolations = axeOutcome.violations;
+      result.axeRan = axeOutcome.ran;
       timings.axeMs = Date.now() - axeStarted;
     }
 
@@ -688,6 +695,7 @@ main().catch(function (error) {
     axTree: {},
     screenshot: null,
     axeViolations: [],
+    axeRan: false,
     links: [],
     paths: [],
     timings: {},

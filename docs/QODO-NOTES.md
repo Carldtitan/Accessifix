@@ -59,18 +59,30 @@ pushes are rejected for everyone including the repository owner.
 
 ---
 
-## PR #6 — Task 7: FIX, VERIFY and the GitHub PR layer
+## PR #7 — Task 4: deterministic TREE engine and the before/after score
 
-- **Link:** https://github.com/Carldtitan/Accessifix/pull/6
-- **Qodo found:** 15 bugs — approval payload unbound; PR head unverified; write APIs bypass approval; missing attribution becomes all findings; diff hides byte changes; missing build falsely passes; zero tests reported as passed; axe outage becomes resolution; wrong page proves fixes; criterion fallback conflates findings; duplicate patches escape parsing; escaping paths retarget files; every `npm ci` failure falls back; Playwright `test` script blocks patches; segfault misreported as OOM.
+- **Link:** https://github.com/Carldtitan/Accessifix/pull/7
+- **Qodo found:** 8 bugs — disabled axe appears successful; link purpose ignores context (x2); input type assumes user data; zoom lock treated as proof of no reflow; unmeasured target spacing becomes a failure; clean pages disappear from the score; new-password fields expected the current-password token.
 - **We changed:**
-  - **The approval gate was unbound — the worst of the fifteen.** An `ApprovalRequest` carried no binding to what would actually run, so a decision could be replayed against a different payload: approve a one-line label fix, get a rewrite. Every request now carries an `ApprovalOperation` — repo, branch, base, title, commitSha, and a **digest of each file's contents** — compared field by field, with the operation fingerprint folded into the request id.
-  - The write APIs bypassed the gate when called directly. `createBranch`, `commitFiles` and `openPullRequest` now require a `WriteAuthorization` on the **class methods**, not just the wrappers, so it cannot be sidestepped.
-  - The PR head is verified: the commit's branch and file set must match what was composed, and the branch SHA is re-checked immediately before `pulls.create`.
-  - **Three separate false-pass paths closed.** A repo with no build script reported success; a suite that ran zero tests reported as passing; and an axe-core outage made every finding look resolved because the violation list came back empty. Each now reports *unproven* or *inconclusive*, and build-unproven plus tests-unproven together is a hard stop — that is no evidence at all.
-  - Findings were rechecked against whatever page happened to be loaded; now grouped by URL and captured per route, with overflow reported unproven rather than assumed fixed.
-  - A patch naming no finding was credited with all of the group's findings, making the "named no finding" skip unreachable.
-  - The diff normalised CRLF, so a line-ending-only change showed as no change.
-  - A path escaping the repo was silently rewritten, so `../src/Nav.tsx` could retarget a real in-repo file.
-  - `npm ci` fallback now requires an actual lockfile-drift signature, and records `installReproducible: false` in the PR body when it fires. Exit 139 needs an explicit OOM signature before being called OOM, so a segfault no longer suppresses compile diagnostics.
-- **We dismissed:** Nothing. Two readings worth recording: on the missing build script we mirrored the tests precedent (allowed-but-unproven, stated honestly) rather than blocking outright, because a hard block would stop AccessiFix ever opening a PR against a build-script-less repo — with the added rule that unproven build *and* unproven tests together is a stop. And we deliberately kept `--passWithNoTests`, since removing it as the literal wording suggested would turn a *missing* suite into exit 1 and block the PR, the opposite of the invariant.
+  - **The most serious one: `axeRan` was derived from "violations is not `undefined`"**, but `PageCapture` defaults that to `[]` and callers can pass `job: { axe: false }`. A page where axe never ran was indistinguishable from a page with no violations, so contrast and every other axe-dependent criterion **passed untested**. A false pass is worse than no result — it is the failure that makes an audit worthless. Execution is now believed only on an explicit flag, a supplied passes/incomplete set, or at least one violation actually returning.
+  - 2.4.4 asks about link purpose *in context*, so context is now required: generic names fail only when captured context adds nothing beyond the name, and shared names fail only when name + context resolves to two different destinations. The AX-tree path no longer emits findings at all, since the tree carries no context.
+  - A `type="email"` field no longer implies the address belongs to the *user* — an invitation form's recipient box is not a 1.3.5 failure. The field's own name/label establishes scope first.
+  - A zoom lock no longer fails 1.4.10. It files 1.4.4 Resize Text, where W3C's ACT rule actually applies, and leaves reflow inconclusive pending a real 320px measurement. Needed a new `CheckResult.related` field for findings a check proves on someone else's behalf.
+  - Unmeasured target spacing now means "the 2.5.8 exception was not tested", not "no clearance".
+  - `pagesAudited` no longer derives from findings, which erased every page that passed cleanly — precisely the wrong pages to lose.
+  - Password fields resolve to an accepted *set* — `new-password`, `current-password`, or both when ambiguous — so a correctly marked signup field is no longer failed for using the right token.
+- **We dismissed:** One partial. Qodo grouped `type="password"` with email/tel/url as "assumes user data". We kept password decidable from its type: no form legitimately collects a third party's password, so scope is not genuinely in doubt. What *was* wrong is which of the two tokens it assumed, fixed separately. We also kept the fixed-viewport (`width=1024`) branch failing 1.4.10 — a viewport pinned above 320px means the content is never laid out at 320 CSS px, a direct mechanistic failure, unlike the zoom lock which W3C says can coexist with a passing 1.4.10.
+
+---
+
+## PR #7 (follow-up review) and PR #6 (follow-up review)
+
+- **Links:** https://github.com/Carldtitan/Accessifix/pull/7 · https://github.com/Carldtitan/Accessifix/pull/6
+- **Qodo found on re-review:** #7 — clean axe runs appear disabled; explicit recipient scope ignored; punctuated generic links pass. #6 — existing branch ignores base; Cypress tests treated as unit.
+- **We changed:**
+  - **Closed the axe-ran gap end to end.** `runAxe` returns `{violations, ran}` rather than a bare array, and the flag is forwarded through `browserResultSchema`, `PageCapture` and `capturePage`. `TreeLaneInput.axeRan` is **required**, not optional — optional would reproduce the silent `false` the finding is about, whereas required is a compile error until the dispatcher answers. Before this, an empty violations array from a page where axe never executed looked exactly like a clean page, and TREE reported contrast, page title and labels as *passing, untested*.
+  - A form field captured as `aboutUser: false` now drops out of 1.3.5 entirely rather than being failed for having a purpose word in its label. All three states — `true`, `undefined`, `false` — now mean different things.
+  - Generic-link detection decides membership through `normaliseText`, so "Read more!", "Details?" and "Click here:" are caught, and a name normalising to empty counts as generic — which is what makes `>>` and `...` work and generalises to their unlisted cousins.
+  - `createBranch` compares `base...tip` on the reuse path and refuses unless identical or ahead. **Ahead alone is not sufficient**: a colliding branch cut from current main with another author's commits also reads ahead, and those commits would ride into the PR under our approved patch — so every commit above the base must also be the signed-in user's.
+  - Cypress, TestCafe, Nightwatch and WebdriverIO now classify as e2e. Previously only Playwright was excluded, so `test: "cypress run"` was executed without a served app and the environment failure blocked the PR.
+- **We dismissed:** Nothing. One deliberate behaviour change recorded: if a resumed run omits `fromRef` and the default branch has moved, the base comparison reads `diverged` and branch reuse is refused **loudly**, rather than silently building on an unapproved parent. `BranchResult.baseSha` is exposed so a resuming caller can pin it.

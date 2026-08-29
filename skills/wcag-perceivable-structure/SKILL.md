@@ -10,10 +10,9 @@ shape: something is obvious to a sighted user from position, size, weight or
 proximity, and none of it reached the markup. Write down the structure you see
 in the image first, then read the tree and find out how much survived.
 
-Lane: VIS. All four criteria are DECIDE.
-
-You need both artefacts to rule. With a screenshot and no tree excerpt you can
-describe what you see but cannot say what the markup claims, so use FLAG.
+Lane: VIS. All four criteria are DECIDE. You need both artefacts to rule - with
+a screenshot and no tree excerpt you can describe what you see but cannot say
+what the markup claims, so use FLAG.
 
 ---
 
@@ -24,32 +23,25 @@ describe what you see but cannot say what the markup claims, so use FLAG.
 Information, structure and relationships conveyed through presentation must be
 programmatically determinable or available in text. Every grouping a sighted
 user reads from position, weight, proximity or a drawn box must also exist in
-markup: headings, lists, tables, form groupings, label-to-field association, and
+markup: headings, lists, tables, form groupings, label-to-field association and
 error-to-field association.
 
 ### How to test it
 
-1. From the screenshot alone, write the outline you see. Which text acts as a
+1. From the screenshot alone, write the outline you see - which text acts as a
    heading and at what level, which items form a list, which cells form a table
-   with row and column headers, which controls sit under a shared caption such
-   as "Delivery address".
-2. Read the same regions in the tree and check each one:
-   - Headings are `h1` to `h6`, or `role="heading"` with a correct `aria-level`.
-     A `p` styled 24px bold is not a heading.
-   - Lists are `ul`, `ol` or `dl`. Stacked `div` elements with bullet glyphs are
-     not a list.
-   - Tables are `table` with `th` carrying `scope`. A grid of `div` elements is
-     not a table, however neatly it aligns.
-   - Groups are `fieldset` with `legend`, or `role="group"` or `role="radiogroup"`
-     with an accessible name. A bold `div` above the controls gives them nothing.
-   - Every field has a programmatic label - `label` with `for`, a wrapping
-     `label`, `aria-label` or `aria-labelledby`.
-   - Error text is tied to its field with `aria-describedby`, not merely printed
-     beneath it.
-3. Check heading levels for skips and for cosmetic use - a `h4` chosen because it
+   with row and column headers, which controls sit under a shared caption.
+2. Read the same regions in the tree. Headings must be `h1` to `h6` or
+   `role="heading"` with `aria-level`; lists `ul`, `ol` or `dl`; tables `table`
+   with `th` carrying `scope`; groups `fieldset` with `legend` or a named
+   `role="group"` or `role="radiogroup"`.
+3. Check every field has a programmatic label - `label` with `for`, a wrapping
+   `label`, `aria-label` or `aria-labelledby` - and that error text is tied to
+   its field with `aria-describedby` rather than merely printed beneath it.
+4. Check heading levels for skips and for cosmetic use. A `h4` chosen because it
    looked the right size breaks the outline.
-4. Read the landmarks: `header`, `nav`, `main`, `aside`, `footer` or the matching
-   roles. A page that is one `div` gives no way to navigate the regions you see.
+5. Read the landmarks - `header`, `nav`, `main`, `aside`, `footer` or the roles.
+   A page that is one `div` gives no way to navigate the regions you can see.
 
 ### Genuine failure
 
@@ -58,21 +50,18 @@ error-to-field association.
 - A visual list rendered as sibling `div` elements with pseudo-element bullets.
 - A data table built from `div class="row"` and `div class="cell"`, so no row or
   column relationship exists.
-- A `table` whose header row uses `td`, or whose `th` carry no `scope` in a table
-  with both row and column headers.
+- A `table` whose header row uses `td`, or whose `th` carry no `scope`.
 - A "Contact preference" radio set under a bold caption with no `fieldset`,
   `legend`, `role="radiogroup"` or `aria-labelledby`.
-- Text positioned above a field as its label, with no `for` and no
+- Text positioned above a field as its label with no `for` and no
   `aria-labelledby` - the association is only spatial.
-- `h1` followed directly by `h4` for the first subsection.
-- An error message under a field with no `aria-describedby`, so the field
-  announces as unexplained.
+- An error message under a field with no `aria-describedby`.
 
 ### False positive - do not report
 
-- A `div` with `role="heading"` and a correct `aria-level`. That is a heading.
-  Not idiomatic, but programmatically determinable, so 1.3.1 is satisfied. Do
-  not report it as a failure and do not report it as a style preference.
+- **A `div` with `role="heading"` and a correct `aria-level`. That is a
+  heading.** Not idiomatic, but programmatically determinable, so 1.3.1 is
+  satisfied. Do not report it as a failure or as a style preference.
 - A list of links marked up as a list with no visible bullet. The bullet is
   presentation; the relationship is what matters.
 - A layout table carrying `role="presentation"`.
@@ -80,8 +69,8 @@ error-to-field association.
 - Visual grouping carrying no information - card shadows, striped rows, spacing.
 - `aria-labelledby` pointing at a visually hidden element. Hidden text is still
   programmatic structure.
-- A single-column form with one correctly labelled field per line. Ungrouped
-  fields need no `fieldset`.
+- A single-column form of correctly labelled fields. Ungrouped fields need no
+  `fieldset`.
 
 ---
 
@@ -91,9 +80,8 @@ error-to-field association.
 
 Where the sequence in which content is presented affects its meaning, a correct
 reading sequence must be programmatically determinable. The DOM order assistive
-technology reads must match the meaningful order a sighted user reads.
-
-The usual causes are CSS reordering without touching the DOM: `order` on a flex
+technology reads must match the meaningful order a sighted user reads. The
+usual causes are CSS reordering that never touches the DOM: `order` on a flex
 item, `flex-direction: row-reverse` or `column-reverse`, `grid-row` and
 `grid-column` placement, `grid-auto-flow: dense`, absolute positioning, `float`.
 
@@ -117,29 +105,24 @@ item, `flex-direction: row-reverse` or `column-reverse`, `grid-row` and
   while `order` renders Basic, Standard, Enterprise, so the tree reads prices in
   a sequence that does not match what a sighted user compares.
 - A filter sidebar that appears right of the results but precedes them in the
-  DOM, so every screen reader user hears the whole panel before one result.
-- A submit button early in the DOM and placed at the bottom with
+  DOM, so a screen reader user hears the whole panel before one result.
+- A submit button early in the DOM, placed at the bottom with
   `position: absolute`.
-- `flex-direction: row-reverse` on a wizard's button row, so "Back" is read after
-  "Continue" while appearing before it.
-- A card whose visual order is image, heading, body and whose DOM order is body,
-  heading, image.
+- `flex-direction: row-reverse` on a wizard's button row, so "Back" is read
+  after "Continue" while appearing before it.
 - A footnote whose explanatory text is placed before the passage it annotates.
 
 ### False positive - do not report
 
-- Decorative content that is visually reordered. A hero illustration, a
-  flourish or a divider moved by CSS changes no meaning, and reordered
-  decoration is not a 1.3.2 failure.
-- A responsive reflow whose columns stack in a sensible order at narrow widths.
-  Different from desktop is not the same as meaningless.
-- Reordered blocks that read sensibly in either order - two independent,
-  self-contained promo cards.
+- **Visually reordered decorative content.** A hero illustration, a flourish or
+  a divider moved by CSS changes no meaning, and is not a 1.3.2 failure.
+- A responsive reflow whose columns stack sensibly at narrow widths. Different
+  from desktop is not the same as meaningless.
+- Reordered blocks that read sensibly either way - two independent promo cards.
 - A sticky header or floating action button positioned away from its DOM
   location, where its content is self-contained.
 - A difference between DOM order and tab order. That is 2.4.3.
-- Two columns read one after the other rather than interleaved. Sequential
-  column reading is correct.
+- Two columns read one after the other rather than interleaved.
 
 ---
 
@@ -150,23 +133,22 @@ item, `flex-direction: row-reverse` or `column-reverse`, `grid-row` and
 For a control with a visible text label, the accessible name must **contain**
 the visible label text, in the same order. A speech-input user says the words
 they read; if those words are not in the accessible name, the command does not
-match and the control cannot be operated by voice.
-
-Contain, not equal. Extra words are permitted **after** the visible text. Extra
-words before it break the match and fail.
+match and the control cannot be operated by voice. Contain, not equal - extra
+words are permitted **after** the visible text, and extra words before it break
+the match and fail.
 
 ### How to test it
 
-1. For every control with visible text - buttons, links, tabs, checkboxes, radio
-   buttons, labelled fields, menu items - read the visible string exactly as it
-   renders in the screenshot.
+1. For every control with visible text - buttons, links, tabs, checkboxes,
+   radio buttons, labelled fields, menu items - read the visible string exactly
+   as it renders.
 2. Read the accessible name the tree computes for the same control. `aria-label`
    and `aria-labelledby` override visible content entirely.
-3. Ask whether the visible string is present inside the accessible name, as a
-   contiguous run, in the same word order.
-4. Ignore case and punctuation when comparing. Where the label is an icon plus
-   text, only the text is compared.
-5. A control with no visible text is out of scope here - that is 1.1.1 and 4.1.2.
+3. Ask whether the visible string appears inside the accessible name as a
+   contiguous run in the same word order.
+4. Ignore case and punctuation. Where the label is an icon plus text, only the
+   text is compared.
+5. A control with no visible text is out of scope - that is 1.1.1 and 4.1.2.
 
 ### Genuine failure
 
@@ -174,25 +156,25 @@ words before it break the match and fail.
   "click Send" matches nothing.
 - A link reading "Read more" with `aria-label="Learn about our accessibility
   commitments"`. The visible words are absent from the name entirely.
-- A control reading "Search" with `aria-label="Site search"`. The extra word sits
-  before the visible text, so the spoken command does not match from the start.
-- A checkbox whose visible text is "I agree to the terms" and whose
-  `aria-labelledby` points at a hidden "Terms acceptance" string.
+- A control reading "Search" with `aria-label="Site search"`. The extra word
+  sits before the visible text, so the spoken command does not match from the
+  start.
+- A checkbox reading "I agree to the terms" whose `aria-labelledby` points at a
+  hidden "Terms acceptance" string.
 - An icon-plus-text button reading "Download" named "Export CSV".
 - A tab reading "Payments" named "Billing" via `aria-labelledby`.
 
 ### False positive - do not report
 
-- Case differences. "SEND" visible and "Send" in the name is a match.
-- Punctuation differences - a trailing full stop, a colon, an ellipsis, a
+- **Case differences.** "SEND" visible and "Send" in the name is a match.
+- **Punctuation differences** - a trailing full stop, a colon, an ellipsis, a
   non-breaking space, a trailing arrow glyph.
 - Extra words **after** the visible text. "Read more" visible with
   `aria-label="Read more about eligibility"` passes, and is often good practice.
 - A label rendered in caps by `text-transform`. Compare the underlying text.
 - An icon-only control with no visible text. See 1.1.1 and 4.1.2.
-- Placeholder text, which is not a visible label for this comparison. If the
-  placeholder is doing the labelling, that is 3.3.2 instead.
-- A matching name that reads awkwardly. Elegance is not the requirement.
+- Placeholder text, which is not a visible label here. If the placeholder is
+  doing the labelling, that is 3.3.2 instead.
 
 ---
 
@@ -201,12 +183,11 @@ words before it break the match and fail.
 ### What the standard requires
 
 Labels or instructions are provided when content requires user input. Every
-control needs a **persistent** visible label, plus any instruction the user needs
-**before** they commit: format requirements, required-ness, character or file
-limits, anything the field will reject.
-
-Placeholder-as-label is the canonical failure, because the text vanishes on the
-first keystroke and takes the only description of the field with it.
+control needs a **persistent** visible label, plus any instruction the user
+needs **before** they commit: format requirements, required-ness, character or
+file limits, anything the field will reject. Placeholder-as-label is the
+canonical failure, because the text vanishes on the first keystroke and takes
+the only description of the field with it.
 
 ### How to test it
 
@@ -220,8 +201,8 @@ first keystroke and takes the only description of the field with it.
    explained.
 4. Fill the field with sample text and look again. If the label vanished, it was
    a placeholder.
-5. Confirm instructions sit where they are read - beside the field, not in a
-   collapsed panel or a tooltip that must be discovered.
+5. Confirm instructions sit beside the field, not in a collapsed panel or a
+   tooltip that must be discovered.
 
 ### Genuine failure
 
@@ -238,10 +219,10 @@ first keystroke and takes the only description of the field with it.
 
 - A placeholder used **in addition to** a visible persistent label. A hint inside
   the field is not a failure when a label exists.
-- An **icon-only control with a tooltip**. There is no user input to label - it
+- **An icon-only control with a tooltip.** There is no user input to label - it
   is a button, and its name is 1.1.1 and 4.1.2 territory, not 3.3.2.
-- A visually hidden label exposed to the tree, where the field's purpose is clear
-  from context, such as a search field beside a "Search" button.
+- A visually hidden label exposed to the tree, where the purpose is clear from
+  context, such as a search field beside a "Search" button.
 - Instructions above the whole form rather than beside each field, where they
   clearly apply and are read first.
 - A terse label. Short is not missing.
@@ -263,7 +244,7 @@ first keystroke and takes the only description of the field with it.
 - Report the structure you observed, not the structure you would have authored.
   "This should have been a `section`" is not a finding unless information is lost.
 - Evidence discipline: quote the visible text and the computed accessible name
-  side by side and name the attribute that produced each - "the button at
+  side by side and name the attribute behind each - "the button at
   `#apply-submit` reads 'Send' and the tree computes 'Submit application form'
   from its `aria-label`". Never invent a selector, and never assert what the
   markup contains when you were given only a screenshot.
