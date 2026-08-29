@@ -42,28 +42,33 @@ export interface TreeLaneInput {
   /** A `PageCapture` from `lib/browser` satisfies this. */
   capture: TreePageInput;
   /**
-   * Whether axe-core actually executed on this page. Required, and required
-   * here rather than left to the capture, because a `PageCapture` cannot answer
-   * it: the browser result schema defaults `axeViolations` to `[]`, so a clean
-   * run and a run that never happened arrive looking identical.
+   * Whether axe-core actually executed on this page.
    *
-   * TREE will not read an empty violation list as proof of execution — that is
-   * how contrast came to pass untested — so without this every axe-dependent
-   * criterion goes to inconclusive and the page carries a warning saying axe did
-   * not run. On a page that axe swept clean, that is wrong in the other
-   * direction, and a caller that simply forgot would never notice.
+   * The distinction this answers is the one the product turns on: the browser
+   * result schema defaults `axeViolations` to `[]`, so a page axe swept clean
+   * and a page axe never ran on arrive looking identical, and reading the second
+   * as the first is how contrast came to pass untested.
    *
-   * The dispatcher is the only layer that knows: it chose `job.axe`, and it saw
-   * whether the worker got as far as running it. So it has to say, in one
-   * boolean, every time. `true` means axe executed and returned; `false` means
-   * it was switched off, never reached, or failed — all of which leave the
-   * axe-dependent criteria honestly inconclusive.
+   * **The capture is the authority, and this is the fallback.** A `PageCapture`
+   * from `lib/browser` always carries `axeRan` — the worker sets it from what it
+   * actually did, and `capturePage` copies it through — so on the ordinary path
+   * `capture.axeRan` answers the question and this field is not needed. It stays
+   * here for a caller holding a capture shape that predates the field, or one
+   * assembling `TreePageInput` by hand.
    *
-   * Passing `axeRan`, `axePasses` or `axeIncomplete` on the capture itself still
-   * works and takes precedence; this is the answer for the ordinary path, where
-   * the capture carries none of them.
+   * Optional, because the pipeline's `AuditPageInput` carries only the capture,
+   * and requiring a boolean the dispatcher would have to copy off the capture it
+   * is already passing buys nothing but a chance to copy it wrongly.
+   *
+   * Optional does **not** weaken the invariant, because absence resolves to
+   * `false` and not to a shrug: `runTreeLane` reads
+   * `capture.axeRan ?? this ?? false`, so axe is believed to have run only on
+   * positive evidence from one of the two. `false` — set, or defaulted — leaves
+   * every axe-dependent criterion inconclusive with a warning on the page, which
+   * is exactly what an absent signal must mean. An empty violations array from a
+   * page where axe never ran can never read as a pass.
    */
-  axeRan: boolean;
+  axeRan?: boolean;
   phase?: AuditPhase;
 }
 
@@ -133,8 +138,10 @@ export function toClaim(finding: AuditFinding): TreeFindingClaim {
  *
  * The axe execution signal is folded in here, at the one place that has both
  * the capture and the dispatcher's knowledge of what the browser job actually
- * did. It is still positive evidence and nothing else: `false` leaves the
- * axe-dependent criteria inconclusive, exactly as an absent signal would.
+ * did. It is still positive evidence and nothing else: the capture answers when
+ * it can, the caller's `axeRan` answers when the capture cannot, and when
+ * neither says yes the answer is `false`. `false` leaves the axe-dependent
+ * criteria inconclusive, exactly as an absent signal must.
  *
  * `async` only because every lane in the roster is; nothing here awaits.
  */
@@ -142,7 +149,7 @@ export async function runTreeLane(input: TreeLaneInput): Promise<TreeLaneResult>
   const audit = auditPage({
     ...input.capture,
     url: input.capture.url || input.pageUrl,
-    axeRan: input.capture.axeRan ?? input.axeRan,
+    axeRan: input.capture.axeRan ?? input.axeRan ?? false,
   });
   return {
     findings: audit.findings.map(toClaim),
