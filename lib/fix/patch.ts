@@ -14,19 +14,25 @@
  * gave the agent and the file it gave back, so it is a true description of the
  * change by construction.
  *
- * Note that this diverges from `PatchSchema` in `lib/harness/schemas.ts`, which
- * asks the saved FIX manifest for a diff. Use `FIX_PATCH_RESPONSE_FORMAT` from
- * this module when dispatching with the prompt this module builds.
+ * The provider-side half of that contract lives in `lib/harness/schemas.ts`
+ * as `FILE_PATCH_RESPONSE_FORMAT`, because that is what the saved FIX
+ * manifest is built from, and it is re-exported here as
+ * `FIX_PATCH_RESPONSE_FORMAT` so there is exactly one description of a FIX
+ * response in the codebase. There used to be two — the manifest asked for a
+ * unified diff while this module asked for file contents — and the result was
+ * a run that produced nothing and could not say why. The parser below still
+ * accepts the old shape, but it says out loud that it did.
  */
 
 import { z } from 'zod';
 
+import { FILE_PATCH_RESPONSE_FORMAT } from '@/lib/harness/schemas';
+
 import type { FixGroup, GroupedFinding } from './group';
 
 /**
- * The `response_format` shape TrueForge accepts, declared structurally rather
- * than imported. It is four lines, and this module has no other reason to
- * depend on the harness.
+ * The `response_format` shape TrueForge accepts, declared structurally so the
+ * parser's own types do not depend on the client's zod unions.
  */
 export interface JsonSchemaResponseFormat {
   readonly type: 'json_schema';
@@ -90,7 +96,20 @@ const CRITERION_PATTERN = /^[1-4]\.\d{1,2}\.\d{1,2}$/;
 
 const RawFileSchema = z.object({
   filePath: z.string().min(1),
-  newContents: z.string(),
+  /**
+   * Optional at the schema level so that a response in the wrong shape becomes
+   * a skip carrying a reason rather than a `FixResponseError` that says only
+   * "does not match the schema". `parseFixResponse` requires one of
+   * `newContents` or `diff` and names which was missing.
+   */
+  newContents: z.string().optional(),
+  /**
+   * Never asked for, sometimes given: a manifest still pinned to the old
+   * `accessifix_patch_set` shape constrains the model to answer with a diff.
+   * Accepted here only so the host can apply it against the exact bytes it
+   * sent and then compute its own diff from the result.
+   */
+  diff: z.string().optional(),
   criteria: z.array(z.string()).default([]),
   findingIds: z.array(z.string()).default([]),
   rationale: z.string().min(1),
@@ -108,11 +127,20 @@ const RawSkippedSchema = z.object({
  * model reaches for: `patches` instead of `files`, `sourcePath` instead of
  * `filePath`, `contents` instead of `newContents`. Rewriting a key is a repair;
  * inventing a value is not, and nothing below invents one.
+ *
+ * The top-level alias is not a nicety. `files` carries a `[]` default, so a
+ * response that used `patches` at the top level parsed cleanly into a response
+ * with no files and no skips — a silent no-op, which is the one failure mode
+ * this product exists to eliminate. `normalizeResponse` collapses the aliases
+ * before validation, and `parseFixResponse` refuses to return empty-handed.
  */
-export const FixResponseSchema = z.object({
-  files: z.array(z.preprocess(normalizeFileEntry, RawFileSchema)).default([]),
-  skipped: z.array(z.preprocess(normalizeSkippedEntry, RawSkippedSchema)).default([]),
-});
+export const FixResponseSchema = z.preprocess(
+  normalizeResponse,
+  z.object({
+    files: z.array(z.preprocess(normalizeFileEntry, RawFileSchema)).default([]),
+    skipped: z.array(z.preprocess(normalizeSkippedEntry, RawSkippedSchema)).default([]),
+  }),
+);
 
 export type FixResponse = z.infer<typeof FixResponseSchema>;
 
@@ -128,12 +156,39 @@ function firstString(source: Record<string, unknown>, keys: readonly string[]): 
   return undefined;
 }
 
+function firstArray(source: Record<string, unknown>, keys: readonly string[]): unknown[] {
+  for (const key of keys) {
+    const value = source[key];
+    if (Array.isArray(value)) return value;
+  }
+  return [];
+}
+
+/** The names a FIX response has actually arrived under, at the top level. */
+const FILES_KEYS = ['files', 'patches', 'filePatches', 'changes'] as const;
+
+function normalizeResponse(value: unknown): unknown {
+  const raw = asRecord(value);
+  return {
+    ...raw,
+    files: firstArray(raw, FILES_KEYS),
+    skipped: firstArray(raw, ['skipped', 'skips', 'declined']),
+  };
+}
+
+/** Which of `FILES_KEYS` a payload actually used. For the skip reason. */
+export function fileKeysUsed(payload: unknown): string[] {
+  const raw = asRecord(payload);
+  return FILES_KEYS.filter((key) => Array.isArray(raw[key]));
+}
+
 function normalizeFileEntry(value: unknown): unknown {
   const raw = asRecord(value);
   return {
     ...raw,
     filePath: firstString(raw, ['filePath', 'sourcePath', 'path', 'file']),
     newContents: firstString(raw, ['newContents', 'newContent', 'contents', 'content', 'source']),
+    diff: firstString(raw, ['diff', 'patch', 'unifiedDiff', 'unified_diff']),
     rationale: firstString(raw, ['rationale', 'reason', 'explanation', 'why']),
   };
 }
@@ -147,79 +202,19 @@ function normalizeSkippedEntry(value: unknown): unknown {
   };
 }
 
-const NULLABLE_STRING = { type: ['string', 'null'] } as const;
-
 /**
  * `response_format` for a FIX turn dispatched with `buildFixPrompt`.
  *
- * Pass this on an inline agent spec — the saved FIX manifest asks for diffs and
- * would constrain the model to the wrong shape.
+ * The same object the saved FIX manifest is built from, so the constraint the
+ * provider applies and the shape this module parses cannot drift apart again.
+ * A saved manifest whose `json_schema.name` is not `FIX_RESPONSE_FORMAT_NAME`
+ * is stale; `npm run agents:init -- --update` replaces it.
  */
-export const FIX_PATCH_RESPONSE_FORMAT: JsonSchemaResponseFormat = {
-  type: 'json_schema',
-  json_schema: {
-    name: 'accessifix_file_patch',
-    description:
-      'The complete new contents of each file changed, with the findings each change addresses.',
-    strict: true,
-    schema: {
-      type: 'object',
-      additionalProperties: false,
-      required: ['files', 'skipped'],
-      properties: {
-        files: {
-          type: 'array',
-          description: 'One entry for the file you were given. Empty if you changed nothing.',
-          items: {
-            type: 'object',
-            additionalProperties: false,
-            required: ['filePath', 'newContents', 'criteria', 'findingIds', 'rationale', 'risk'],
-            properties: {
-              filePath: {
-                type: 'string',
-                description: 'Repository-relative path, exactly as it was given to you.',
-              },
-              newContents: {
-                type: 'string',
-                description:
-                  'The complete file after your change. Every line, first to last. Never an excerpt, never a diff, never an ellipsis.',
-              },
-              criteria: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'WCAG success criterion numbers this change addresses.',
-              },
-              findingIds: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Ids of the findings this change addresses, from the list given.',
-              },
-              rationale: {
-                type: 'string',
-                description: 'Why the change is correct, in prose a reviewer can check.',
-              },
-              risk: { ...NULLABLE_STRING, description: 'What it might break, or null.' },
-            },
-          },
-        },
-        skipped: {
-          type: 'array',
-          description: 'Findings you deliberately did not fix, each with a real reason.',
-          items: {
-            type: 'object',
-            additionalProperties: false,
-            required: ['criterion', 'findingIds', 'reason'],
-            properties: {
-              criterion: NULLABLE_STRING,
-              findingIds: { type: 'array', items: { type: 'string' } },
-              reason: { type: 'string' },
-            },
-          },
-        },
-      },
-    },
-  },
-};
+export const FIX_PATCH_RESPONSE_FORMAT =
+  FILE_PATCH_RESPONSE_FORMAT as JsonSchemaResponseFormat;
+
+/** The `json_schema.name` a correctly-registered FIX manifest carries. */
+export const FIX_RESPONSE_FORMAT_NAME = FIX_PATCH_RESPONSE_FORMAT.json_schema.name;
 
 /* -------------------------------------------------------------------------- */
 /* The prompt                                                                 */
@@ -384,12 +379,25 @@ export function parseFixResponse(
     );
   }
 
+  const keysUsed = fileKeysUsed(payload);
   const parsed = FixResponseSchema.safeParse(payload);
   if (!parsed.success) {
     throw new FixResponseError(
-      `FIX response for ${group.filePath} does not match the schema: ${formatIssues(parsed.error)}`,
+      `FIX response for ${group.filePath} does not match the schema: ${formatIssues(parsed.error)}` +
+        (keysUsed.length > 0 && !keysUsed.includes('files')
+          ? ` The response used \`${keysUsed.join('`, `')}\` where \`files\` was expected, which is the ` +
+            `${FIX_RESPONSE_FORMAT_NAME} contract drifting from the saved FIX manifest. ` +
+            'Re-register it with `npm run agents:init -- --update`.'
+          : ''),
       typeof raw === 'string' ? raw : undefined,
       parsed.error,
+    );
+  }
+
+  if (keysUsed.length > 0 && !keysUsed.includes('files')) {
+    warnings.push(
+      `FIX answered under \`${keysUsed.join('`, `')}\` rather than \`files\`. The saved FIX ` +
+        'manifest is out of date; re-register it with `npm run agents:init -- --update`.',
     );
   }
 
@@ -436,7 +444,49 @@ export function parseFixResponse(
       }
     }
 
-    if (file.newContents.trim().length === 0) {
+    /*
+     * The prompt asks for whole contents. A model held to a stale manifest
+     * answers with a diff instead, and throwing that away is how a run ends up
+     * with nothing to show and nothing to say. Applying it here does not weaken
+     * the rule that the host owns the diff: `applyUnifiedDiff` checks every
+     * context and every removed line against the exact bytes we sent, so a diff
+     * that describes some other file cannot apply at all, and the diff we store
+     * is still recomputed below from the bytes on both ends.
+     */
+    let newContents = file.newContents;
+    if (typeof newContents !== 'string') {
+      if (typeof file.diff === 'string' && file.diff.trim().length > 0) {
+        const applied = applyUnifiedDiff(originalContents, file.diff);
+        if (applied === null) {
+          skipped.push({
+            findingIds: group.findingIds,
+            criterion: null,
+            reason:
+              `FIX answered with a unified diff for ${group.filePath} rather than the file ` +
+              'contents the prompt asked for, and the diff does not apply to the bytes that ' +
+              'were sent. It was rejected rather than guessed at. The saved FIX manifest is ' +
+              'out of date; re-register it with `npm run agents:init -- --update`.',
+          });
+          continue;
+        }
+        warnings.push(
+          `FIX returned a diff for ${group.filePath} instead of the file contents. It applied ` +
+            'cleanly to the bytes we sent, so the patch was rebuilt from the result.',
+        );
+        newContents = applied;
+      } else {
+        skipped.push({
+          findingIds: group.findingIds,
+          criterion: null,
+          reason:
+            `FIX returned an entry for ${group.filePath} carrying neither \`newContents\` nor a ` +
+            'diff, so there is nothing to apply. The findings stay open.',
+        });
+        continue;
+      }
+    }
+
+    if (newContents.trim().length === 0) {
       skipped.push({
         findingIds: group.findingIds,
         criterion: null,
@@ -445,7 +495,7 @@ export function parseFixResponse(
       continue;
     }
 
-    if (file.newContents === originalContents) {
+    if (newContents === originalContents) {
       skipped.push({
         findingIds: group.findingIds,
         criterion: null,
@@ -454,7 +504,7 @@ export function parseFixResponse(
       continue;
     }
 
-    if (isNormalizationOnly(originalContents, file.newContents)) {
+    if (isNormalizationOnly(originalContents, newContents)) {
       skipped.push({
         findingIds: group.findingIds,
         criterion: null,
@@ -466,12 +516,12 @@ export function parseFixResponse(
       continue;
     }
 
-    if (looksTruncated(originalContents, file.newContents, minRatio)) {
+    if (looksTruncated(originalContents, newContents, minRatio)) {
       skipped.push({
         findingIds: group.findingIds,
         criterion: null,
         reason:
-          `FIX returned ${group.filePath} at ${file.newContents.length} characters against an ` +
+          `FIX returned ${group.filePath} at ${newContents.length} characters against an ` +
           `original of ${originalContents.length}. That is an abbreviated file, not a patch, ` +
           'so it was rejected rather than applied.',
       });
@@ -503,13 +553,13 @@ export function parseFixResponse(
     const diff = unifiedDiff(
       group.filePath,
       originalContents,
-      file.newContents,
+      newContents,
       options.diffContext ?? 3,
     );
 
     patches.push({
       filePath: group.filePath,
-      newContents: file.newContents,
+      newContents,
       originalContents,
       diff,
       findingIds,
@@ -519,6 +569,28 @@ export function parseFixResponse(
       stats: diffStats(diff),
     });
     emitted = true;
+  }
+
+  /*
+   * The rule this whole module exists to enforce, stated once at the end: a FIX
+   * turn that produced no patch has to say why. A response that named no file
+   * and skipped nothing used to leave both lists empty, the run reported "FIX
+   * produced no patches" with no explanation, and the findings were closed out
+   * of the pass without anybody being told. That is the failure mode this
+   * product exists to eliminate, so it must not be ours.
+   */
+  if (patches.length === 0 && skipped.length === 0) {
+    const shape =
+      keysUsed.length > 0
+        ? `It answered under \`${keysUsed.join('`, `')}\` with no entries.`
+        : 'It named no `files` array at all.';
+    skipped.push({
+      findingIds: group.findingIds,
+      criterion: null,
+      reason:
+        `FIX returned a response for ${group.filePath} that proposed no change and skipped ` +
+        `nothing. ${shape} Nothing was applied and the findings stay open for a human.`,
+    });
   }
 
   return { patches, skipped, warnings };

@@ -18,8 +18,8 @@ import type { AgentSpec, ResponseFormat, RuntimeConfig } from "./client";
 import { renderCriterionTable, requireCriterion } from "./criteria";
 import {
   ALL_VERDICTS,
+  FILE_PATCH_RESPONSE_FORMAT,
   FLAG_ONLY,
-  PATCH_SET_RESPONSE_FORMAT,
   VERIFICATION_RESPONSE_FORMAT,
   buildFindingsResponseFormat,
   type FindingVerdict,
@@ -328,8 +328,10 @@ HOW TO FIX THE COMMON CASES
 - 2.5.8 Target Size. Increase padding or the hit area rather than the icon.
 
 OUTPUT
-- Return JSON matching the response schema: one entry per file, each with a unified diff against the file as you were given it, the criteria it addresses, a rationale a reviewer can check, and any risk it carries.
-- Diffs must apply cleanly. Use exact surrounding context from the file you were given.
+- Return JSON matching the response schema: one entry in \`files\` for the file you were given, carrying the COMPLETE new contents of that file in \`newContents\`.
+- \`newContents\` is every line of the file from the first to the last, including every line you did not touch. Not a diff. Not an excerpt. Not a fragment with "... rest unchanged ...". The application computes the diff itself by comparing what you return against what it gave you, so an abbreviated file is read as a deletion of everything you left out and is rejected.
+- Preserve the file's existing indentation, quote style, import order and trailing newline. Change only the lines the findings require.
+- Name in \`findingIds\` the ids of exactly the findings your change addresses, and in \`criteria\` their criterion numbers. A change that cannot say what it fixes is not recorded.
 - If you cannot fix a finding safely, put it in \`skipped\` with a real reason. Skipping honestly is better than a patch that breaks the build. VERIFY will run the repository's own test suite against your work, and Qodo will review the pull request, so a bad patch is caught — but it costs the run.
 - No prose outside the JSON object.`;
 
@@ -449,7 +451,7 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     verdicts: [],
     skills: ["accessibility-remediation"],
     instructions: FIX_INSTRUCTIONS,
-    responseFormat: PATCH_SET_RESPONSE_FORMAT,
+    responseFormat: FILE_PATCH_RESPONSE_FORMAT,
     requiresSandbox: true,
     usesSubagents: false,
     iterationLimit: 120,

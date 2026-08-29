@@ -152,6 +152,13 @@ export type WritePatches = (input: {
   patches: readonly ProposedPatch[];
   /** Findings FIX declined to touch, each with a reason. */
   skipped?: readonly { criterion: string; reason: string }[];
+  /**
+   * Repairs the response parser had to make on the way — a reply in the wrong
+   * shape, a path it had to reconcile. Not failures, but the run timeline wants
+   * them: contract drift between this seam and the saved agent manifest is
+   * invisible until it costs a whole run.
+   */
+  warnings?: readonly string[];
   sessionId?: string | null;
 }>;
 

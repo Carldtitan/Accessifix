@@ -202,35 +202,58 @@ export function buildFindingsSchema(
 // Patches (FIX)
 // ---------------------------------------------------------------------------
 
-/** One patch, batched per source file, recording which findings it covers (A5.2, A5.5). */
-export const PatchSchema = z.object({
-  sourcePath: z.string().min(1),
-  /** Unified diff against the file as it stands in the target repository. */
-  diff: z.string().min(1),
-  /** Criterion numbers this patch addresses. Never empty, always supported. */
+/**
+ * FIX returns the **whole new file**, never a diff.
+ *
+ * It is worth saying why this changed, because the divergence cost a whole
+ * run. `buildFixPrompt` in `lib/fix/patch.ts` has always asked for complete
+ * file contents and `parseFixResponse` has always validated
+ * `{ files: [...] }`. The saved FIX manifest asked for
+ * `{ patches: [{ diff }] }`. A model constrained by the manifest answered in
+ * the manifest's shape, zod stripped the unknown `patches` key, `files` fell
+ * through to its `[]` default, and the run reported "FIX produced no patches"
+ * with nothing to say about why. Two definitions of one contract was the bug.
+ * There is now one.
+ *
+ * The shape matters on its own terms too. A model-authored diff has to be
+ * right about line numbers and surrounding context before it can be right
+ * about accessibility, and when it is wrong the run finds out in the sandbox.
+ * Full contents always apply, and the host computes the diff from the exact
+ * bytes it sent and the exact bytes it got back, so the stored diff cannot
+ * describe a change that was not made.
+ */
+export const FilePatchSchema = z.object({
+  /** Repository-relative path, exactly as it was given to the agent. */
+  filePath: z.string().min(1),
+  /** The complete file after the change. Every line, first to last. */
+  newContents: z.string().min(1),
+  /** Criterion numbers this change addresses. Never empty, always supported. */
   criteria: z.array(CriterionIdSchema).min(1),
+  /** A5.5: ids of exactly the findings this change addresses. */
+  findingIds: z.array(z.string()).default([]),
   /** Why this change is correct, in prose a reviewer can check. */
   rationale: z.string().min(1),
-  /** Anything the patch might plausibly break, for VERIFY to watch. */
+  /** Anything the change might plausibly break, for VERIFY to watch. */
   risk: z.string().nullish(),
 });
 
-export type Patch = z.infer<typeof PatchSchema>;
+export type FilePatch = z.infer<typeof FilePatchSchema>;
 
-export const PatchSetResponseSchema = z.object({
-  patches: z.array(PatchSchema),
+export const FilePatchSetResponseSchema = z.object({
+  files: z.array(FilePatchSchema).default([]),
   /** Findings FIX declined to touch, each with a reason. */
   skipped: z
     .array(
       z.object({
-        criterion: CriterionIdSchema,
+        criterion: CriterionIdSchema.nullish(),
+        findingIds: z.array(z.string()).default([]),
         reason: z.string().min(1),
       }),
     )
     .default([]),
 });
 
-export type PatchSetResponse = z.infer<typeof PatchSetResponseSchema>;
+export type FilePatchSetResponse = z.infer<typeof FilePatchSetResponseSchema>;
 
 // ---------------------------------------------------------------------------
 // Verification (VERIFY)
@@ -332,26 +355,44 @@ function findingsJsonSchema(
 /** The generic findings schema, across all 55 criteria. */
 export const FINDINGS_JSON_SCHEMA: JsonSchema = findingsJsonSchema(WCAG_CRITERION_IDS);
 
-export const PATCH_SET_JSON_SCHEMA: JsonSchema = {
+/**
+ * The provider-side constraint that matches `FilePatchSetResponseSchema`, and
+ * therefore matches the prompt `buildFixPrompt` writes. These three move
+ * together; nothing else in the codebase describes a FIX response.
+ */
+export const FILE_PATCH_SET_JSON_SCHEMA: JsonSchema = {
   type: "object",
   additionalProperties: false,
-  required: ["patches", "skipped"],
+  required: ["files", "skipped"],
   properties: {
-    patches: {
+    files: {
       type: "array",
+      description: "One entry for the file you were given. Empty if you changed nothing.",
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["sourcePath", "diff", "criteria", "rationale", "risk"],
+        required: ["filePath", "newContents", "criteria", "findingIds", "rationale", "risk"],
         properties: {
-          sourcePath: { type: "string", description: "Repository-relative path of the file patched." },
-          diff: { type: "string", description: "Unified diff for this one file." },
+          filePath: {
+            type: "string",
+            description: "Repository-relative path, exactly as it was given to you.",
+          },
+          newContents: {
+            type: "string",
+            description:
+              "The complete file after your change. Every line, first to last, including the parts you did not touch. Never an excerpt, never a diff, never an ellipsis.",
+          },
           criteria: {
             type: "array",
             minItems: 1,
             items: { type: "string", enum: CRITERION_ENUM },
             description:
-              "Criterion numbers this patch addresses, from the supported WCAG 2.2 A/AA set. Never empty.",
+              "Criterion numbers this change addresses, from the supported WCAG 2.2 A/AA set. Never empty.",
+          },
+          findingIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Ids of exactly the findings this change addresses, from the list given.",
           },
           rationale: { type: "string", description: "Why this change is correct." },
           risk: { ...nullableString, description: "What it might break, or null." },
@@ -360,16 +401,17 @@ export const PATCH_SET_JSON_SCHEMA: JsonSchema = {
     },
     skipped: {
       type: "array",
+      description: "Findings you deliberately did not fix, each with a real reason.",
       items: {
         type: "object",
         additionalProperties: false,
-        required: ["criterion", "reason"],
+        required: ["criterion", "findingIds", "reason"],
         properties: {
           criterion: {
-            type: "string",
-            enum: CRITERION_ENUM,
-            description: "The criterion of the finding that was skipped.",
+            ...nullableString,
+            description: "The criterion of the finding that was skipped, or null.",
           },
+          findingIds: { type: "array", items: { type: "string" } },
           reason: { type: "string" },
         },
       },
@@ -444,11 +486,17 @@ export function buildFindingsResponseFormat(
   );
 }
 
-/** `response_format` for FIX. */
-export const PATCH_SET_RESPONSE_FORMAT: ResponseFormat = jsonSchemaResponseFormat(
-  "accessifix_patch_set",
-  PATCH_SET_JSON_SCHEMA,
-  "One unified diff per source file, with the findings each diff addresses.",
+/**
+ * `response_format` for FIX.
+ *
+ * The schema name changed with the shape on purpose: a saved manifest still
+ * pinned to `accessifix_patch_set` is a stale one, and
+ * `npm run agents:init -- --update` is what replaces it.
+ */
+export const FILE_PATCH_RESPONSE_FORMAT: ResponseFormat = jsonSchemaResponseFormat(
+  "accessifix_file_patch",
+  FILE_PATCH_SET_JSON_SCHEMA,
+  "The complete new contents of each file changed, with the findings each change addresses.",
 );
 
 /** `response_format` for VERIFY. */

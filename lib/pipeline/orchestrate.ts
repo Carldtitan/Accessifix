@@ -376,11 +376,12 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     }
 
     if (reached('fixing')) await enterState(runId, 'fixing');
-    const proposed = await fixPhase(context, token, decidable);
+    const fixed = await fixPhase(context, token, decidable);
+    const proposed = fixed.patches;
 
     if (proposed.length === 0) {
       await transition(runId, 'done', {
-        reason: 'FIX produced no patches. The findings remain open for a human.',
+        reason: describeNoPatches(fixed.skipped),
       });
       return;
     }
@@ -869,6 +870,58 @@ interface StoredPatch {
   findingIds: string[];
 }
 
+/** One finding the FIX pass did not patch, and the sentence that says why. */
+interface SkipNote {
+  filePath: string;
+  criterion: string;
+  reason: string;
+}
+
+/**
+ * What the FIX pass produced, and what it declined.
+ *
+ * `skipped` is not diagnostics. It is the other half of the answer: a run that
+ * ends without a pull request has to be able to say, finding by finding, why.
+ * The pass used to return only the patches, so "FIX produced no patches" was
+ * the entire report on a five-minute run — and when the agent was answering in
+ * a shape the parser silently discarded, that sentence was also the only
+ * symptom. A silent no-op is the failure mode this product exists to
+ * eliminate; it must not be ours.
+ */
+interface FixOutcome {
+  patches: StoredPatch[];
+  skipped: SkipNote[];
+}
+
+/** The closing sentence of a run that patched nothing, with the reasons. */
+function describeNoPatches(skipped: readonly SkipNote[]): string {
+  const head = 'FIX produced no patches. The findings remain open for a human.';
+  if (skipped.length === 0) {
+    return (
+      `${head} No reason was recorded for any of them, which is itself a defect — ` +
+      'the FIX pass is expected to state one per finding.'
+    );
+  }
+
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const note of skipped) {
+    const key = `${note.filePath}|${note.criterion}|${note.reason}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    lines.push(`- ${note.criterion} in ${note.filePath}: ${note.reason}`);
+  }
+
+  const shown = lines.slice(0, 8);
+  const rest = lines.length - shown.length;
+  return [
+    head,
+    '',
+    ...shown,
+    ...(rest > 0 ? [`- and ${rest} more, in the run timeline.`] : []),
+  ].join('\n');
+}
+
 /**
  * A5.3: only `DECIDE` findings are fixable. `FLAG` stays with a human (A5.4).
  *
@@ -972,7 +1025,7 @@ async function fixPhase(
   context: PipelineContext,
   token: string,
   fixable: Finding[],
-): Promise<StoredPatch[]> {
+): Promise<FixOutcome> {
   // A restarted run must not propose the same patch twice. Patches already on
   // the ledger are the FIX pass's output; rebuild the in-memory view from them
   // and skip straight to VERIFY.
@@ -991,19 +1044,22 @@ async function fixPhase(
     });
 
     const criteriaByFinding = new Map(fixable.map((finding) => [finding.id, finding.criterion]));
-    return existing.map((patch) => ({
-      id: patch.id,
-      filePath: patch.filePath,
-      diff: patch.diff,
-      criteria: [
-        ...new Set(
-          patch.findingIds
-            .map((id) => criteriaByFinding.get(id))
-            .filter((value): value is string => Boolean(value)),
-        ),
-      ],
-      findingIds: patch.findingIds,
-    }));
+    return {
+      patches: existing.map((patch) => ({
+        id: patch.id,
+        filePath: patch.filePath,
+        diff: patch.diff,
+        criteria: [
+          ...new Set(
+            patch.findingIds
+              .map((id) => criteriaByFinding.get(id))
+              .filter((value): value is string => Boolean(value)),
+          ),
+        ],
+        findingIds: patch.findingIds,
+      })),
+      skipped: [],
+    };
   }
 
   // VIS and ACT audited the deployed site, so their findings name an element
@@ -1017,19 +1073,29 @@ async function fixPhase(
   // A5.2: the batching is by file. Findings with no known source path go to the
   // human queue instead of being guessed at.
   const withSource = fixableWithPaths.filter((finding) => finding.sourcePath);
-  const withoutSource = fixableWithPaths.length - withSource.length;
+  const withoutSource = fixableWithPaths.filter((finding) => !finding.sourcePath);
 
-  if (withoutSource > 0) {
+  // Every finding this pass will not patch collects a sentence here, and those
+  // sentences travel all the way to the run's closing state event.
+  const notes: SkipNote[] = withoutSource.map((finding) => ({
+    filePath: '(no source file)',
+    criterion: finding.criterion,
+    reason:
+      'The audit decided this finding, but it could not be mapped to a file in the ' +
+      'repository, so there is nothing to patch.',
+  }));
+
+  if (withoutSource.length > 0) {
     await emitEvent({
       runId: context.runId,
       type: 'log',
       agent: 'FIX',
-      summary: `${withoutSource} finding(s) have no source location and were not batched.`,
+      summary: `${withoutSource.length} finding(s) have no source location and were not batched.`,
       detail: 'A fix needs a file. These stay open for a human.',
     });
   }
 
-  if (withSource.length === 0) return [];
+  if (withSource.length === 0) return { patches: [], skipped: notes };
 
   await db
     .update(findings)
@@ -1118,6 +1184,7 @@ async function fixPhase(
         }
 
         for (const skipped of outcome.skipped ?? []) {
+          notes.push({ filePath, criterion: skipped.criterion, reason: skipped.reason });
           await emitEvent({
             runId: context.runId,
             type: 'log',
@@ -1127,9 +1194,52 @@ async function fixPhase(
           });
         }
 
+        // A warning is the parser reporting a repair it had to make — a response
+        // in the wrong shape, a path it had to reconcile. It is not a failure, and
+        // it is exactly the thing that is invisible until it costs a whole run.
+        for (const warning of outcome.warnings ?? []) {
+          await emitEvent({
+            runId: context.runId,
+            type: 'log',
+            agent: 'FIX',
+            summary: `FIX response for ${filePath} needed repair.`,
+            detail: warning,
+          });
+        }
+
+        if (outcome.patches.length === 0 && (outcome.skipped ?? []).length === 0) {
+          const reason =
+            `FIX returned nothing usable for ${filePath} and gave no reason. The findings ` +
+            'stay open.';
+          for (const finding of forFile) {
+            notes.push({ filePath, criterion: finding.criterion, reason });
+          }
+          await emitEvent({
+            runId: context.runId,
+            type: 'log',
+            agent: 'FIX',
+            summary: `FIX produced no patch for ${filePath} and no reason.`,
+            detail: reason,
+          });
+        }
+
         return { patches: outcome.patches.length };
       },
-      { onError: () => ({ patches: 0 }) },
+      {
+        // `runJob` has already written the failure to the ledger and the
+        // timeline. Stepping aside here keeps the other files going, but the
+        // findings in this one must still carry a sentence into the run report
+        // rather than disappearing into a patch count of zero.
+        onError: (error) => {
+          const reason =
+            `The FIX job for ${filePath} failed: ` +
+            (error instanceof Error ? error.message : String(error));
+          for (const finding of forFile) {
+            notes.push({ filePath, criterion: finding.criterion, reason });
+          }
+          return { patches: 0 };
+        },
+      },
     );
   });
 
@@ -1146,7 +1256,7 @@ async function fixPhase(
       .where(and(eq(findings.runId, context.runId), inArray(findings.id, uncovered)));
   }
 
-  return stored;
+  return { patches: stored, skipped: notes };
 }
 
 /* -------------------------------------------------------------------------- */

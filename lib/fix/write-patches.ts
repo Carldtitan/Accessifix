@@ -16,11 +16,23 @@
  * 2. The diff is computed here, from the exact bytes we sent and the exact
  *    bytes we got back. A model-authored diff can describe a change it did not
  *    make; this one structurally cannot.
+ *
+ * 3. Every path out of this function that does not produce a patch produces a
+ *    reason. A FIX turn that failed, a response that could not be read, a file
+ *    that came back unchanged — each becomes an entry in `skipped`, and the
+ *    run report says which finding it belonged to and why. "FIX produced no
+ *    patches" with nothing after it is the one outcome this function will not
+ *    return.
  */
 import { runRosterAgent } from '@/lib/harness/run';
 
 import { groupFindingsForFix, type FixableFinding } from './group';
-import { buildFixPrompt, parseFixResponse } from './patch';
+import {
+  FixResponseError,
+  buildFixPrompt,
+  parseFixResponse,
+  type ParsedFixResponse,
+} from './patch';
 import { readRepoFile } from './source';
 
 /** Shape the pipeline seam expects. Mirrors `WritePatches` in lanes.ts. */
@@ -48,6 +60,12 @@ export interface WritePatchesResult {
     findingIds?: readonly string[];
   }[];
   skipped?: readonly { criterion: string; reason: string }[];
+  /**
+   * Repairs and contract drift the parser had to work around. Not failures —
+   * the run still wants them in the timeline, because a warning here is how a
+   * stale agent manifest announces itself before it costs a whole run.
+   */
+  warnings?: readonly string[];
   sessionId?: string | null;
 }
 
@@ -55,6 +73,7 @@ export async function writePatches(input: WritePatchesInput): Promise<WritePatch
   const grouped = groupFindingsForFix(input.findings);
   const patches: WritePatchesResult['patches'][number][] = [];
   const skipped: { criterion: string; reason: string }[] = [];
+  const warnings: string[] = [];
   let sessionId: string | null = null;
 
   // `humanQueue` is everything grouping refused to touch: FLAG findings,
@@ -99,8 +118,27 @@ export async function writePatches(input: WritePatchesInput): Promise<WritePatch
 
     // `parseFixResponse` is where a file that came back unchanged, empty,
     // truncated, or naming no finding becomes a skip with a reason rather
-    // than a silent no-op patch.
-    const parsed = parseFixResponse(group, raw, contents);
+    // than a silent no-op patch. A response it cannot read at all throws, and
+    // that is a reason too — it must reach the run as one rather than as an
+    // unhandled error that takes the remaining files down with it.
+    let parsed: ParsedFixResponse;
+    try {
+      parsed = parseFixResponse(group, raw, contents);
+    } catch (error) {
+      const detail =
+        error instanceof FixResponseError
+          ? error.message
+          : `FIX response for ${group.filePath} could not be read: ${(error as Error).message}`;
+      for (const criterion of group.criteria) {
+        skipped.push({ criterion, reason: detail });
+      }
+      if (group.criteria.length === 0) {
+        skipped.push({ criterion: 'unknown', reason: detail });
+      }
+      continue;
+    }
+
+    warnings.push(...parsed.warnings);
     for (const p of parsed.patches) {
       patches.push({
         sourcePath: p.filePath,
@@ -116,5 +154,5 @@ export async function writePatches(input: WritePatchesInput): Promise<WritePatch
     }
   }
 
-  return { patches, skipped, sessionId };
+  return { patches, skipped, warnings, sessionId };
 }
