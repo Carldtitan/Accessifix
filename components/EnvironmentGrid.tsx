@@ -33,7 +33,7 @@ const badgeClass: Record<EnvironmentState, string> = {
   live: "badge-live",
   done: "badge-done",
   queued: "badge-queued",
-  failed: "badge-live",
+  failed: "badge-failed",
 };
 
 const statusValue: Record<EnvironmentState, StatusValue> = {
