@@ -45,6 +45,7 @@ import { and, eq, inArray, ne } from 'drizzle-orm';
 
 import type { InteractionPath } from '@/lib/browser/types';
 import { operationMismatch, type ApprovalOperation } from '@/lib/fix/gate';
+import { normalizeRepoPath } from '@/lib/fix/source';
 import { db } from '@/lib/db';
 import { findings, patches, runs, targets, type Finding, type RunPhase } from '@/lib/db/schema';
 import { MAX_PAGES_PER_CRAWL } from '@/lib/sandbox/config';
@@ -1428,12 +1429,6 @@ async function pullRequestGate(
           ? `\nThe branch already exists at ${plan.resumeFromSha.slice(0, 7)}, ahead of ` +
             `\`${plan.base}\`. Approving this accepts those existing commits into the pull ` +
             'request as well.\n'
-          : '') +
-        (plan.failures.length > 0
-          ? `\n${plan.failures.length} proposed patch(es) are not included, because the files ` +
-            'they were written against have changed since: ' +
-            plan.failures.map((failure) => `${failure.filePath} (${failure.reason})`).join('; ') +
-            '\n'
           : ''),
       reason:
         `${verificationSummary} Pushing a branch and opening a pull request are ` +
@@ -1559,18 +1554,45 @@ async function prPhase(
         approval: { requestId: approvalRequestId, approved: true, operations },
       });
 
-      await db
-        .update(patches)
-        .set({ status: 'applied' })
-        .where(
-          and(
-            eq(patches.runId, context.runId),
-            inArray(
-              patches.id,
-              proposed.map((patch) => patch.id),
-            ),
-          ),
-        );
+      /*
+       * `applied` is a claim about bytes on a branch, so it is written from
+       * what the write returned rather than from what this phase proposed.
+       * `openPullRequest` is all-or-nothing — a patch that no longer applies
+       * stops the run before the card goes up — so the two lists agree today.
+       * Deriving the ledger from the commit anyway is what keeps them agreeing:
+       * a row says `applied` only if its file is in the pull request.
+       */
+      const committed = new Set(pr.files.map(normalizeRepoPath));
+      const appliedIds = proposed
+        .filter((patch) => committed.has(normalizeRepoPath(patch.filePath)))
+        .map((patch) => patch.id);
+
+      if (appliedIds.length > 0) {
+        await db
+          .update(patches)
+          .set({ status: 'applied' })
+          .where(and(eq(patches.runId, context.runId), inArray(patches.id, appliedIds)));
+      }
+
+      if (appliedIds.length !== proposed.length) {
+        // Unreachable while the write stays atomic; reported rather than
+        // swallowed if it ever is not. The pull request exists by now, so
+        // failing the run would be worse — but silence would leave the ledger
+        // claiming a fix the branch does not carry.
+        await emitEvent({
+          runId: context.runId,
+          type: 'log',
+          agent: 'APP',
+          capability: 'approval',
+          summary:
+            `${proposed.length - appliedIds.length} proposed patch(es) are not in pull request ` +
+            `#${pr.number}, so they are not recorded as applied.`,
+          detail: proposed
+            .filter((patch) => !committed.has(normalizeRepoPath(patch.filePath)))
+            .map((patch) => patch.filePath)
+            .join(', '),
+        });
+      }
 
       await emitEvent({
         runId: context.runId,
@@ -1585,7 +1607,14 @@ async function prPhase(
       return pr;
     },
     {
-      toResult: (pr) => ({ url: pr.url, number: pr.number, branch: pr.branch }),
+      // `files` goes down with the row: on the reuse path below it is the only
+      // record of what the pull request actually contains.
+      toResult: (pr) => ({
+        url: pr.url,
+        number: pr.number,
+        branch: pr.branch,
+        files: [...pr.files],
+      }),
       /*
        * Without this, `runJob`'s reuse path never fires and a resumed run opens
        * a *second* pull request against the user's repository. Opening a PR is
@@ -1596,6 +1625,7 @@ async function prPhase(
         url: String(result.url ?? ''),
         number: Number(result.number ?? 0),
         branch: String(result.branch ?? ''),
+        files: Array.isArray(result.files) ? result.files.map((file) => String(file)) : [],
       }),
     },
   );

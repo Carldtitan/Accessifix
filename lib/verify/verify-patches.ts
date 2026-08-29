@@ -8,6 +8,9 @@
  * The decision rule is the point of this file, and it is deliberately
  * pessimistic:
  *
+ * - A patch that **no longer applies** rejects the whole set before anything is
+ *   built. Verifying the survivors would produce a verdict about a tree the
+ *   proposal does not describe, and then recommend a pull request on it.
  * - A **failing** suite rejects the patches. That is A6.4 and it is absolute.
  * - A **missing** suite is not a pass. It returns allowed-but-unproven, and
  *   says so in prose rather than reporting a tick.
@@ -24,7 +27,8 @@
  * answers rather than restating them, so a change to either is picked up here
  * and in `openVerifiedPullRequest` alike.
  */
-import { materializePatches } from '@/lib/fix/source';
+import { materializeAllPatches, PatchesDoNotApplyError } from '@/lib/fix/source';
+import type { FilePatch } from '@/lib/fix/patch';
 import type { FixableFinding } from '@/lib/fix/group';
 
 import { withBuildWorkspace, buildGate } from './build';
@@ -79,19 +83,26 @@ export async function verifyPatches(input: VerifyPatchesInput): Promise<VerifyPa
   // turned back into bytes first — and refused if they no longer reproduce.
   // Verifying a tree assembled from a patch that does not apply would report on
   // a change nobody wrote.
-  const materialized = await materializePatches({
-    repoFullName: input.repoFullName,
-    accessToken: input.accessToken,
-    patches: input.patches,
-    ...(input.ref === undefined ? {} : { ref: input.ref }),
-    ...(input.signal === undefined ? {} : { signal: input.signal }),
-  });
-
-  if (materialized.patches.length === 0) {
+  //
+  // All of them, or none. Building the subset that still applies and reporting
+  // the rest in prose would let a run pass verification and reach the approval
+  // card as an incomplete fix, holding a recommendation earned by a tree that is
+  // not the one the patches describe.
+  let materialized: readonly FilePatch[];
+  try {
+    materialized = await materializeAllPatches({
+      repoFullName: input.repoFullName,
+      accessToken: input.accessToken,
+      patches: input.patches,
+      ...(input.ref === undefined ? {} : { ref: input.ref }),
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+    });
+  } catch (error) {
     return failure(
-      'None of the proposed patches could be applied to the current state of ' +
-        `${input.repoFullName}, so there was nothing to verify. ` +
-        materialized.failures.map((f) => `${f.filePath}: ${f.reason}`).join('; '),
+      error instanceof PatchesDoNotApplyError
+        ? `${error.message} Nothing was verified.`
+        : `The proposed patches could not be read back from ${input.repoFullName}: ` +
+          `${(error as Error).message}`,
     );
   }
 
@@ -100,7 +111,7 @@ export async function verifyPatches(input: VerifyPatchesInput): Promise<VerifyPa
       {
         repoFullName: input.repoFullName,
         token: input.accessToken,
-        files: materialized.patches.map((patch) => ({
+        files: materialized.map((patch) => ({
           path: patch.filePath,
           contents: patch.newContents,
         })),
@@ -135,7 +146,7 @@ export async function verifyPatches(input: VerifyPatchesInput): Promise<VerifyPa
         // labels that as the weakest method wherever it is shown.
         const report = await recheckFixedCriteria({
           findings: input.findings ?? [],
-          patches: materialized.patches,
+          patches: materialized,
           repoFullName: input.repoFullName,
         }).catch(() => null);
 
@@ -143,10 +154,6 @@ export async function verifyPatches(input: VerifyPatchesInput): Promise<VerifyPa
           buildVerdict.allowed && testVerdict.allowed && !nothingProven
             ? 'open-pull-request'
             : 'reject-patches';
-
-        const failedToApply = materialized.failures.map(
-          (f) => ` ${f.filePath} was left out: ${f.reason}.`,
-        );
 
         return {
           buildPassed: build.ok && build.buildRan,
@@ -157,7 +164,7 @@ export async function verifyPatches(input: VerifyPatchesInput): Promise<VerifyPa
           testSummary: nothingProven
             ? 'Neither the build nor a test suite could be run, so nothing about this ' +
               'patch has been demonstrated. Refusing to open a pull request on no evidence.'
-            : `${buildVerdict.reason} ${testVerdict.reason}${failedToApply.join('')}`,
+            : `${buildVerdict.reason} ${testVerdict.reason}`,
           recheck: (report?.outcomes ?? []).map((outcome) => ({
             criterion: outcome.criterion,
             // A6.3: only positive evidence resolves a criterion. Inconclusive

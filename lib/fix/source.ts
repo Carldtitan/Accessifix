@@ -26,9 +26,12 @@ import { rebuildFilePatch, type FilePatch } from './patch';
  * path that is written identical, so a Windows-shaped path in a stored row
  * cannot make an otherwise valid approval look like a different file set.
  */
-function normalizePath(path: string): string {
+export function normalizeRepoPath(path: string): string {
   return path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
 }
+
+/** Local alias, so the body of this module reads as it did. */
+const normalizePath = normalizeRepoPath;
 
 /**
  * The path, safe to interpolate into a Contents API URL.
@@ -114,6 +117,10 @@ export async function readRepoFile(
  * file is exactly the stored diff, or it comes back in `failures` with the
  * reason. There is no third outcome, and in particular there is no "close
  * enough" — a patch that cannot be reproduced is not applied.
+ *
+ * This is the per-file *report*. Anything that then verifies, commits or claims
+ * a fix must go through `materializeAllPatches` below, which turns that report
+ * into the all-or-nothing decision those callers actually need.
  */
 export async function materializePatches(
   input: {
@@ -182,4 +189,79 @@ export async function materializePatches(
   }
 
   return { patches, failures };
+}
+
+/**
+ * The materialization refused, with the files it could not rebuild named.
+ *
+ * Carries `failures` so a caller that wants to phrase the refusal in its own
+ * words does not have to re-derive them from the message.
+ */
+export class PatchesDoNotApplyError extends Error {
+  readonly failures: readonly UnmaterializedPatch[];
+
+  constructor(message: string, failures: readonly UnmaterializedPatch[]) {
+    super(message);
+    this.name = 'PatchesDoNotApplyError';
+    this.failures = failures;
+  }
+}
+
+/**
+ * Materialize the whole patch set, or none of it.
+ *
+ * `materializePatches` reports per-file outcomes because rebuilding is per-file;
+ * that is the right shape for a report and the wrong shape for a decision.
+ * VERIFY and the pull request are decisions about *a fix*, not about whichever
+ * part of it happened to survive, and a subset is not a smaller version of the
+ * same change — it is a different change nobody proposed:
+ *
+ *  - VERIFY building the surviving files proves the tree compiles without the
+ *    dropped ones, and then recommends a pull request on that evidence.
+ *  - The pull request commits the surviving files and cites every criterion the
+ *    full set claimed, so it says it fixed things it did not touch.
+ *
+ * Both are the same failure — a claim that outruns the bytes — and this product
+ * is worth nothing if its claims are not exact. So a single unrebuilt file
+ * stops the run here, before anything is verified and before anything is
+ * written, and the run says which files and why.
+ *
+ * An empty proposal is refused for the same reason: there is no fix to verify
+ * and nothing to open a pull request with.
+ */
+export async function materializeAllPatches(
+  input: {
+    readonly repoFullName: string;
+    readonly accessToken: string;
+    readonly patches: readonly StoredPatchInput[];
+    readonly ref?: string;
+    readonly signal?: AbortSignal;
+  },
+): Promise<readonly FilePatch[]> {
+  const at = input.ref ? `${input.repoFullName}@${input.ref}` : input.repoFullName;
+
+  if (input.patches.length === 0) {
+    throw new PatchesDoNotApplyError(
+      `No patches were proposed for ${at}, so there is nothing to apply.`,
+      [],
+    );
+  }
+
+  const { patches, failures } = await materializePatches(input);
+
+  // The length check is not redundant with `failures`: it is the invariant that
+  // every proposed patch produced exactly one outcome, and it is cheaper to
+  // assert than to debug.
+  if (failures.length > 0 || patches.length !== input.patches.length) {
+    const named = failures.map((f) => `${f.filePath}: ${f.reason}`).join('; ');
+    throw new PatchesDoNotApplyError(
+      `${failures.length || input.patches.length - patches.length} of the ` +
+        `${input.patches.length} proposed patch(es) could not be rebuilt against ${at}. ` +
+        'A partial fix would claim criteria it never repaired, so the whole set is refused' +
+        (named ? `: ${named}` : '.'),
+      failures,
+    );
+  }
+
+  return patches;
 }

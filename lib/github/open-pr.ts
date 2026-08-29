@@ -14,8 +14,10 @@
  *  - The seam carries **diffs**, because a `patches` row stores a diff and
  *    nothing else. Everything downstream needs whole files — to digest for the
  *    approval, and to commit. So the bytes are rebuilt from the diff and the
- *    file it was computed against, and a diff that no longer reproduces is
- *    dropped rather than forced (`lib/fix/source.ts`).
+ *    file it was computed against, and a diff that no longer reproduces takes
+ *    the whole set down with it rather than being forced or quietly dropped
+ *    (`lib/fix/source.ts`). A pull request cites every criterion the proposal
+ *    covered, so a partial commit would be a claim without the bytes behind it.
  *  - `openVerifiedPullRequest` requires a commit **already on the head branch**,
  *    because the build and the suite ran over local files and the commit is the
  *    only thing tying that evidence to what is on GitHub. So this adapter is
@@ -43,7 +45,7 @@ import {
   type GateDecision,
 } from '@/lib/fix/gate';
 import type { FilePatch } from '@/lib/fix/patch';
-import { materializePatches, type UnmaterializedPatch } from '@/lib/fix/source';
+import { materializeAllPatches, PatchesDoNotApplyError } from '@/lib/fix/source';
 import type { BuildResult } from '@/lib/verify/build';
 import type { RecheckReport } from '@/lib/verify/recheck';
 import type { TestRunResult } from '@/lib/verify/tests';
@@ -116,10 +118,13 @@ export interface PullRequestPlan {
   /** The default branch the diffs were read against and the PR would target. */
   readonly base: string;
   readonly composition: PullRequestComposition;
-  /** Whole files, rebuilt from the stored diffs and verified to reproduce them. */
+  /**
+   * Whole files, rebuilt from the stored diffs and verified to reproduce them.
+   *
+   * Every proposed patch, or the plan does not exist: planning throws rather
+   * than returning a shorter list, so this is never a subset of what FIX wrote.
+   */
   readonly patches: readonly FilePatch[];
-  /** Patches that no longer apply, named so the run can say what it dropped. */
-  readonly failures: readonly UnmaterializedPatch[];
   /** An existing branch tip above the base, which reuse would absorb. */
   readonly resumeFromSha: string | null;
   readonly operations: ApprovedWriteOperations;
@@ -145,29 +150,43 @@ export async function planPullRequestForRun(
   const client = existingClient ?? new GitHubClient(input.accessToken);
   const base = await client.getDefaultBranch(input.repoFullName);
 
-  // Whole files, rebuilt from the stored diffs and verified to reproduce them
-  // exactly. A patch that no longer applies is not committed on a guess.
-  const materialized = await materializePatches({
-    repoFullName: input.repoFullName,
-    accessToken: input.accessToken,
-    patches: input.patches,
-    ref: base,
-    ...(input.signal === undefined ? {} : { signal: input.signal }),
-  });
-
-  if (materialized.patches.length === 0) {
+  /*
+   * Whole files, rebuilt from the stored diffs and verified to reproduce them
+   * exactly. A patch that no longer applies is not committed on a guess — and
+   * neither are the ones beside it.
+   *
+   * All or nothing, because a pull request is a claim. Its body cites every
+   * criterion the proposal covered and its title counts them, so committing the
+   * subset that still applies would open a pull request asserting repairs whose
+   * bytes are not in it. Dropping the patch quietly and leaving the claim
+   * standing is the worst outcome this tool has: a reviewer reads the citation,
+   * not the diff, and merges an unfixed criterion believing it fixed.
+   *
+   * It throws rather than trimming, so the refusal happens here — before the
+   * card goes up — and the human is never asked to approve a fix that is
+   * already incomplete.
+   */
+  let patches: readonly FilePatch[];
+  try {
+    patches = await materializeAllPatches({
+      repoFullName: input.repoFullName,
+      accessToken: input.accessToken,
+      patches: input.patches,
+      ref: base,
+      ...(input.signal === undefined ? {} : { signal: input.signal }),
+    });
+  } catch (error) {
     throw new GitHubError(
       'openPullRequest',
-      `None of the ${input.patches.length} proposed patch(es) still apply to ${input.repoFullName}` +
-        `@${base}, so there is nothing to open a pull request with. ` +
-        materialized.failures.map((f) => `${f.filePath}: ${f.reason}`).join('; '),
+      error instanceof PatchesDoNotApplyError
+        ? `${error.message} No pull request was opened.`
+        : `The proposed patches could not be rebuilt against ${input.repoFullName}@${base}: ` +
+          `${(error as Error).message}`,
     );
   }
 
   const evidence = pullRequestVerificationEvidence(input, base);
-  const composition = composePullRequest(
-    composeInputFor(input, base, materialized.patches, evidence),
-  );
+  const composition = composePullRequest(composeInputFor(input, base, patches, evidence));
 
   // Read the tip first. An existing branch already ahead of the base is history
   // this run did not write, and the approval has to say so rather than absorb
@@ -190,7 +209,7 @@ export async function planPullRequestForRun(
     repoFullName: input.repoFullName,
     branch: composition.branch,
     baseBranch: base,
-    patches: materialized.patches,
+    patches,
     resumeFromSha,
   }).operation;
 
@@ -200,7 +219,7 @@ export async function planPullRequestForRun(
     branch: composition.branch,
     baseBranch: base,
     title: composition.title,
-    patches: materialized.patches,
+    patches,
     commitSha: null,
     buildSummary: evidence.build.summary,
     buildOk: evidence.build.ok,
@@ -215,8 +234,7 @@ export async function planPullRequestForRun(
     repoFullName: input.repoFullName,
     base,
     composition,
-    patches: materialized.patches,
-    failures: materialized.failures,
+    patches,
     resumeFromSha,
     operations: { branch: branchOperation, pullRequest: pullRequestOperation },
     evidence,
@@ -295,9 +313,26 @@ function pullRequestOperationForCommit(
   return { ...operation, commitSha };
 }
 
+/**
+ * The pull request that was opened, and the files that are actually in it.
+ *
+ * `files` is not decoration. The conductor writes `applied` against patch rows
+ * on the strength of this call returning, and "the pull request was opened" does
+ * not say *what* it contains. Returning the committed paths lets the ledger be
+ * marked from what was written rather than from what was proposed, so the two
+ * cannot drift even if a future change reintroduces a partial write.
+ */
+export interface OpenedPullRequestForRun {
+  readonly url: string;
+  readonly number: number;
+  readonly branch: string;
+  /** Repository-relative paths of every file committed, normalised. */
+  readonly files: readonly string[];
+}
+
 export async function openPullRequestForRun(
   input: PipelineOpenPullRequestInput,
-): Promise<{ url: string; number: number; branch: string }> {
+): Promise<OpenedPullRequestForRun> {
   if (!input.approval?.approved) {
     throw new Error(
       'openPullRequest was called without an approved decision. Opening a pull ' +
@@ -416,6 +451,9 @@ export async function openPullRequestForRun(
     url: opened.pullRequest.url,
     number: opened.pullRequest.number,
     branch: opened.pullRequest.head,
+    // The paths that were committed, taken from the plan the approval was
+    // checked against — the same list `commitFiles` digested and wrote.
+    files: plan.patches.map((patch) => patch.filePath),
   };
 }
 

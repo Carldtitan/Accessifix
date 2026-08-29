@@ -235,9 +235,7 @@ export interface OpenPullRequestInput {
   signal?: AbortSignal;
 }
 
-export type OpenPullRequest = (
-  input: OpenPullRequestInput,
-) => Promise<{ url: string; number: number; branch: string }>;
+export type OpenPullRequest = (input: OpenPullRequestInput) => Promise<OpenedPullRequestForRun>;
 
 /**
  * Everything the write would do, worked out without doing any of it (A7.1).
@@ -279,6 +277,7 @@ import {
   openPullRequestForRun as openPullRequestImpl,
   planPullRequestForRun as planPullRequestImpl,
   type ApprovedWriteOperations,
+  type OpenedPullRequestForRun,
   type PullRequestPlan,
 } from '@/lib/github/open-pr';
 
@@ -346,4 +345,4 @@ export const verifyPatches: VerifyPatches = verifyPatchesImpl;
 export const planPullRequest: PlanPullRequest = planPullRequestImpl;
 export const openPullRequest: OpenPullRequest = openPullRequestImpl;
 
-export type { ApprovedWriteOperations, PullRequestPlan };
+export type { ApprovedWriteOperations, OpenedPullRequestForRun, PullRequestPlan };
