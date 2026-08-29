@@ -7,8 +7,49 @@ import { BrandMark, Icon } from "@/components/Icon";
 export const metadata: Metadata = {
   title: "AccessiFix",
   description:
-    "Finds accessibility bugs that only appear when you click. Fixes them and opens a pull request.",
+    "Spins up a fleet of real browsers, clicks everything, and finds the accessibility bugs scanners cannot see.",
 };
+
+/**
+ * Four cards, one line each.
+ *
+ * `code` is the only place a card carries evidence, and only card 2 has it:
+ * the real Clearway finding, unedited. Everything else is one short sentence,
+ * because a visitor decides in about four seconds and prose does not help.
+ */
+interface Step {
+  readonly n: string;
+  readonly title: string;
+  readonly body: string;
+  /** Only card 3 carries evidence. */
+  readonly code?: readonly [string, string];
+  readonly dark?: boolean;
+}
+
+const STEPS: readonly Step[] = [
+  {
+    n: "1",
+    title: "Spins up 40 browsers",
+    body: "One real Chromium per interaction, all at once.",
+  },
+  {
+    n: "2",
+    title: "Clicks everything",
+    body: "Reads what a screen reader is told, before and after.",
+  },
+  {
+    n: "3",
+    title: "Catches the lie",
+    code: ["menu opened: 98 new items", "button still says: closed"],
+    body: "A blind user is told nothing happened.",
+    dark: true,
+  },
+  {
+    n: "4",
+    title: "Fixes it, asks you",
+    body: "Patches your code, runs your tests, opens a PR.",
+  },
+];
 
 export default async function LandingPage() {
   /*
@@ -25,15 +66,19 @@ export default async function LandingPage() {
           <BrandMark size={31} />
           AccessiFix
         </span>
-        <span className="eyebrow">WCAG 2.2 AA</span>
+        <span className="eyebrow">WCAG 2.2 AA · 55 criteria</span>
       </header>
 
       <main id="main-content" className="landing-main">
         <div className="landing-copy">
-          <h1>Most accessibility bugs only appear after you click.</h1>
+          <h1>
+            Scanners read one still page.
+            <br />
+            <em>We click everything.</em>
+          </h1>
           <p className="landing-lede">
-            Scanners look at a page sitting still. AccessiFix clicks things, watches what
-            the screen reader is told, and catches the lies.
+            Most accessibility bugs only show up after an interaction. AccessiFix runs a
+            fleet of real browsers, drives your interface, and fixes what it finds.
           </p>
 
           {/* Auth.js route handler, not an app route: a real navigation is required. */}
@@ -45,41 +90,30 @@ export default async function LandingPage() {
         </div>
 
         <ol className="landing-proof">
-          <li className="proof-module">
-            <span className="eyebrow">1</span>
-            <h2>It clicks</h2>
-            <p>Opens the menu in a real browser and reads the page before and after.</p>
-          </li>
-
-          <li className="proof-module is-dark">
-            <span className="eyebrow">2</span>
-            <h2>It catches the lie</h2>
-            <p>
-              <code>
-                menu opened: 98 new items
-                <br />
-                button still says: closed
-              </code>
-            </p>
-            <p>A blind user is told nothing happened. Found on a real benefits site.</p>
-          </li>
-
-          <li className="proof-module">
-            <span className="eyebrow">3</span>
-            <h2>It fixes it</h2>
-            <p>Writes the patch, runs your tests, opens a pull request.</p>
-          </li>
-
-          <li className="proof-module">
-            <span className="eyebrow">4</span>
-            <h2>You approve</h2>
-            <p>Nothing is pushed until you say so.</p>
-          </li>
+          {STEPS.map((step) => (
+            <li key={step.n} className={`proof-module${step.dark ? " is-dark" : ""}`}>
+              <span className="proof-n" aria-hidden="true">
+                {step.n}
+              </span>
+              <h2>{step.title}</h2>
+              {step.code ? (
+                <p>
+                  <code>
+                    {step.code[0]}
+                    <br />
+                    {step.code[1]}
+                  </code>
+                </p>
+              ) : null}
+              <p>{step.body}</p>
+            </li>
+          ))}
         </ol>
       </main>
 
       <footer className="landing-footer">
-        Reports real WCAG criteria with evidence. Never claims a conformance level.
+        Every finding cites a numbered WCAG criterion and carries evidence. Never claims a
+        conformance level.
       </footer>
     </div>
   );
