@@ -25,11 +25,15 @@ const tabs: ReadonlyArray<{ key: TabKey; label: string; match: (finding: Finding
  *
  * Accessibility contract:
  * - `role="tablist"` with one `role="tab"` per filter. `aria-selected` tracks
- *   the real selection on every change; `aria-controls` points at the panel.
+ *   the real selection on every change.
+ * - One `role="tabpanel"` per tab, not one shared panel. Each tab's
+ *   `aria-controls` names *its own* panel, and each panel is `aria-labelledby`
+ *   *its own* tab, so the relationship resolves correctly for every tab rather
+ *   than only for the selected one. Unselected panels stay in the DOM and are
+ *   closed with the `hidden` attribute, which takes them out of the
+ *   accessibility tree and out of the tab order.
  * - Roving tabindex: exactly one tab is in the tab order. Left/Right, Home and
  *   End move between tabs and activate automatically, per the pattern.
- * - The panel is `role="tabpanel"` with `tabIndex={0}` and `aria-labelledby`
- *   pointing back at its tab.
  * - Selection is signalled by weight and a raised surface as well as tint.
  */
 export function FindingsTabs({ findings }: { findings: ReadonlyArray<Finding> }) {
@@ -37,14 +41,22 @@ export function FindingsTabs({ findings }: { findings: ReadonlyArray<Finding> })
   const baseId = useId();
   const tabRefs = useRef<Array<HTMLButtonElement | null>>([]);
 
-  const activeIndex = tabs.findIndex((tab) => tab.key === active);
-  const activeTab = tabs[activeIndex] ?? tabs[0];
-  const visible = findings.filter(activeTab.match);
+  const tabId = (key: TabKey) => `${baseId}-tab-${key}`;
+  const panelId = (key: TabKey) => `${baseId}-panel-${key}`;
+
+  const activeIndex = Math.max(
+    0,
+    tabs.findIndex((tab) => tab.key === active),
+  );
+  const activeTab = tabs[activeIndex];
+  // One pass, reused by the count on each tab and by the panel beneath it.
+  const matches = tabs.map((tab) => findings.filter(tab.match));
+  const visibleCount = matches[activeIndex].length;
 
   function selectAt(index: number) {
-    const next = tabs[(index + tabs.length) % tabs.length];
-    setActive(next.key);
-    tabRefs.current[(index + tabs.length) % tabs.length]?.focus();
+    const wrapped = (index + tabs.length) % tabs.length;
+    setActive(tabs[wrapped].key);
+    tabRefs.current[wrapped]?.focus();
   }
 
   function onKeyDown(event: React.KeyboardEvent<HTMLDivElement>) {
@@ -75,7 +87,6 @@ export function FindingsTabs({ findings }: { findings: ReadonlyArray<Finding> })
       <div className="tablist" role="tablist" aria-label="Filter findings" onKeyDown={onKeyDown}>
         {tabs.map((tab, index) => {
           const selected = tab.key === active;
-          const count = findings.filter(tab.match).length;
           return (
             <button
               key={tab.key}
@@ -85,42 +96,49 @@ export function FindingsTabs({ findings }: { findings: ReadonlyArray<Finding> })
               type="button"
               className="tab"
               role="tab"
-              id={`${baseId}-tab-${tab.key}`}
+              id={tabId(tab.key)}
               aria-selected={selected}
-              aria-controls={`${baseId}-panel`}
+              aria-controls={panelId(tab.key)}
               tabIndex={selected ? 0 : -1}
               onClick={() => setActive(tab.key)}
             >
               {tab.label}
-              <span className="tab-count">{count}</span>
+              <span className="tab-count">{matches[index].length}</span>
             </button>
           );
         })}
       </div>
 
-      <div
-        className="tabpanel"
-        role="tabpanel"
-        id={`${baseId}-panel`}
-        aria-labelledby={`${baseId}-tab-${active}`}
-        tabIndex={0}
-      >
-        {visible.length === 0 ? (
-          <div className="quiet-panel">
-            <strong>Nothing in this filter</strong>
-            <span>No findings match {activeTab.label.toLowerCase()}.</span>
+      {tabs.map((tab, index) => {
+        const visible = matches[index];
+        return (
+          <div
+            key={tab.key}
+            className="tabpanel"
+            role="tabpanel"
+            id={panelId(tab.key)}
+            aria-labelledby={tabId(tab.key)}
+            tabIndex={0}
+            hidden={tab.key !== active}
+          >
+            {visible.length === 0 ? (
+              <div className="quiet-panel">
+                <strong>Nothing in this filter</strong>
+                <span>No findings match {tab.label.toLowerCase()}.</span>
+              </div>
+            ) : (
+              <div className="finding-stack">
+                {visible.map((finding) => (
+                  <FindingCard key={finding.id} finding={finding} />
+                ))}
+              </div>
+            )}
           </div>
-        ) : (
-          <div className="finding-stack">
-            {visible.map((finding) => (
-              <FindingCard key={finding.id} finding={finding} />
-            ))}
-          </div>
-        )}
-      </div>
+        );
+      })}
 
       <p className="sr-only" aria-live="polite">
-        {`${visible.length} finding${visible.length === 1 ? "" : "s"} shown for ${activeTab.label}.`}
+        {`${visibleCount} finding${visibleCount === 1 ? "" : "s"} shown for ${activeTab.label}.`}
       </p>
     </>
   );

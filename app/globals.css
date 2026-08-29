@@ -24,6 +24,8 @@
      #d9c6ba on espresso-900 (sidebar metadata) ........... 9.9:1
      #e8a17b on espresso-900 (nav accent, focus ring) ..... 7.6:1
      status ink/tint pairs (see .status-label) ....... 4.9 - 6.8:1
+     #ffffff on failed badge #8c1d18 over the card ........ 8.5:1
+     #8c1d18 on approval-error tint #fbede5 ............... 8.0:1
      focus ring terracotta #b85632 vs oat-100 ............. 4.0:1  (non-text floor is 3:1)
      focus ring terracotta #b85632 vs espresso-900 ........ 3.4:1
 
@@ -522,6 +524,13 @@ code, pre, kbd, samp { font-family: var(--font-mono); }
 .environment-badges .badge-live { background: rgba(133, 58, 33, 0.95); }
 .environment-badges .badge-done { background: rgba(38, 82, 62, 0.95); }
 .environment-badges .badge-queued { background: rgba(61, 40, 31, 0.9); }
+/* Failed is not a live state. Deeper, redder ground plus a light ring so the
+   difference survives a greyscale print and a red-green colour deficiency;
+   the word "Failed" carries the meaning regardless (1.4.1). */
+.environment-badges .badge-failed {
+  background: rgba(140, 29, 24, 0.96);
+  box-shadow: 0 0 0 1.5px rgba(255, 246, 237, 0.9);
+}
 
 .environment-body { display: grid; gap: 11px; padding: 13px 14px; }
 .environment-path { display: grid; gap: 3px; min-width: 0; }
@@ -726,6 +735,9 @@ code, pre, kbd, samp { font-family: var(--font-mono); }
   font-variant-numeric: tabular-nums;
 }
 .tabpanel { display: block; }
+/* Every tab owns a panel; the unselected ones are hidden, and `display`
+   here would otherwise defeat the `hidden` attribute. */
+.tabpanel[hidden] { display: none; }
 .tabpanel:focus-visible { outline-offset: 4px; }
 
 /* ---------- Timeline ---------- */
@@ -802,6 +814,17 @@ code, pre, kbd, samp { font-family: var(--font-mono); }
   background: var(--paper);
   color: var(--brown-700); font-size: var(--text-ui);
 }
+/* A decision that failed to reach the harness. #8c1d18 ink is 8.0:1 on the
+   #fbede5 tint and the #b04a38 boundary is 5.2:1 on ivory (1.4.11). The icon
+   and the wording carry the meaning; the tint only reinforces it (1.4.1). */
+.approval-error {
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 13px 15px;
+  border: 1px solid #b04a38; border-radius: 12px;
+  background: #fbede5;
+  color: #8c1d18; font-size: var(--text-ui); line-height: 1.55;
+}
+.approval-error svg { flex: none; margin-top: 2px; }
 
 /* ---------- Record list ---------- */
 
