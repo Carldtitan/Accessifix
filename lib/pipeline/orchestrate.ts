@@ -55,6 +55,7 @@ import { crawl, type CrawledPage } from './crawl';
 // this one seam. See `lanes.ts` for the contract each is held to.
 import {
   enumerateInteractionPaths,
+  extractVisionCandidates,
   openPullRequest,
   runActLane,
   runCodeLane,
@@ -658,9 +659,25 @@ async function laneOverPages(
 /**
  * Enumerate interaction paths per page (A4.1, A4.2).
  *
- * The discrepancy findings — a control vision can see that the accessibility
- * tree cannot — come back from the same call and go straight into the ledger.
- * They are the div-button findings, and they are the point.
+ * Two sources, and the job is only worth doing because there are two.
+ *
+ * The accessibility tree, enumeration reads for itself: every node whose role
+ * implies a state, every node already carrying `aria-expanded` and friends.
+ * That list alone is enough to catch a stale-state 4.1.2 — a control whose
+ * declared state never moves while the tree beneath it does — because both
+ * halves of that comparison live in the tree.
+ *
+ * The second source is a screenshot, and reading one needs a model. That is
+ * `extractVisionCandidates`, called here on the PNG the crawl already took —
+ * no page is reopened and no sandbox is taken. Subtracting the tree from what
+ * vision saw leaves the controls a sighted user can operate and a screen reader
+ * user is never told about: the div-buttons. They are findings the moment they
+ * are noticed, before anything has been clicked, and they are the point.
+ *
+ * The vision pass is best-effort by contract. A page whose screenshot is
+ * missing, too large to send, or whose model call failed is enumerated from the
+ * tree alone and says so on the timeline. Degrading is correct; failing the
+ * page is not.
  */
 async function enumeratePaths(
   context: PipelineContext,
@@ -677,12 +694,26 @@ async function enumeratePaths(
         agent: 'VIS',
       },
       async ({ attach }) => {
+        const vision = await extractVisionCandidates({
+          runId: context.runId,
+          pageUrl: input.pageUrl,
+          screenshot: input.capture.screenshot,
+          title: input.capture.title,
+        });
+
+        // Attached before enumeration so a crash mid-enumeration still leaves a
+        // session the restart can reattach to rather than pay for twice (A12.1).
+        await attach({ sessionId: vision.sessionId });
+        await reportVisionPass(context.runId, input.pageUrl, vision);
+
         const enumerated = await enumerateInteractionPaths({
           runId: context.runId,
           pageUrl: input.pageUrl,
           capture: input.capture,
+          visionCandidates: vision.candidates,
         });
-        await attach({ sessionId: enumerated.sessionId ?? null });
+        // Enumeration itself is pure and calls no model, so the vision pass is
+        // the only session this job ever has.
 
         if (enumerated.findings.length > 0) {
           await recordFindings({
@@ -690,7 +721,7 @@ async function enumeratePaths(
             phase: context.phase,
             agent: 'VIS',
             pageId: input.pageId,
-            sessionId: enumerated.sessionId ?? null,
+            sessionId: vision.sessionId,
             claims: enumerated.findings,
           });
         }
@@ -711,6 +742,44 @@ async function enumeratePaths(
   });
 
   return byPage;
+}
+
+/**
+ * Put the screenshot pass on the run timeline (A11.1).
+ *
+ * Worth an event of its own rather than folding into the enumeration line: the
+ * number of candidates is how an operator tells "the tree had nothing to
+ * subtract from" apart from "vision found nothing", and a page silently
+ * enumerated tree-only is exactly the state that looks like a clean bill of
+ * health and is not.
+ */
+async function reportVisionPass(
+  runId: string,
+  pageUrl: string,
+  vision: Awaited<ReturnType<typeof extractVisionCandidates>>,
+): Promise<void> {
+  const degraded = vision.error !== null || vision.skipped !== null;
+  const why = vision.error ?? vision.skipped ?? '';
+
+  await emitEvent({
+    runId,
+    type: degraded ? 'log' : 'job',
+    agent: 'VIS',
+    capability: 'model',
+    summary: degraded
+      ? `Vision pass produced no candidates for ${pageUrl}; enumerating from the accessibility tree alone.`
+      : `Vision identified ${vision.candidates.length} candidate control(s) on ${pageUrl}.`,
+    detail: degraded
+      ? `${why} Tree-only enumeration still finds stale-state 4.1.2 failures, but cannot find a control the tree does not contain.`
+      : null,
+    data: {
+      pageUrl,
+      candidates: vision.candidates.length,
+      sessionId: vision.sessionId,
+      skipped: vision.skipped,
+      error: vision.error,
+    },
+  });
 }
 
 /* -------------------------------------------------------------------------- */
