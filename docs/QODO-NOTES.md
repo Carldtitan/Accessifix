@@ -56,3 +56,19 @@ pushes are rejected for everyone including the repository owner.
   - Findings page now derives both numbers and labels the excerpt as a subset, so it no longer contradicts the criterion matrix beside it.
   - `failed` badge given its own deeper red ground plus a ring, so it differs from `live` by shape as well as hue rather than by colour alone. 8.5:1 composited, recorded in the contrast ledger.
 - **We dismissed:** Nothing. All five were genuine.
+
+---
+
+## PR #7 — Task 4: deterministic TREE engine and the before/after score
+
+- **Link:** https://github.com/Carldtitan/Accessifix/pull/7
+- **Qodo found:** 8 bugs — disabled axe appears successful; link purpose ignores context (x2); input type assumes user data; zoom lock treated as proof of no reflow; unmeasured target spacing becomes a failure; clean pages disappear from the score; new-password fields expected the current-password token.
+- **We changed:**
+  - **The most serious one: `axeRan` was derived from "violations is not `undefined`"**, but `PageCapture` defaults that to `[]` and callers can pass `job: { axe: false }`. A page where axe never ran was indistinguishable from a page with no violations, so contrast and every other axe-dependent criterion **passed untested**. A false pass is worse than no result — it is the failure that makes an audit worthless. Execution is now believed only on an explicit flag, a supplied passes/incomplete set, or at least one violation actually returning.
+  - 2.4.4 asks about link purpose *in context*, so context is now required: generic names fail only when captured context adds nothing beyond the name, and shared names fail only when name + context resolves to two different destinations. The AX-tree path no longer emits findings at all, since the tree carries no context.
+  - A `type="email"` field no longer implies the address belongs to the *user* — an invitation form's recipient box is not a 1.3.5 failure. The field's own name/label establishes scope first.
+  - A zoom lock no longer fails 1.4.10. It files 1.4.4 Resize Text, where W3C's ACT rule actually applies, and leaves reflow inconclusive pending a real 320px measurement. Needed a new `CheckResult.related` field for findings a check proves on someone else's behalf.
+  - Unmeasured target spacing now means "the 2.5.8 exception was not tested", not "no clearance".
+  - `pagesAudited` no longer derives from findings, which erased every page that passed cleanly — precisely the wrong pages to lose.
+  - Password fields resolve to an accepted *set* — `new-password`, `current-password`, or both when ambiguous — so a correctly marked signup field is no longer failed for using the right token.
+- **We dismissed:** One partial. Qodo grouped `type="password"` with email/tel/url as "assumes user data". We kept password decidable from its type: no form legitimately collects a third party's password, so scope is not genuinely in doubt. What *was* wrong is which of the two tokens it assumed, fixed separately. We also kept the fixed-viewport (`width=1024`) branch failing 1.4.10 — a viewport pinned above 320px means the content is never laid out at 320 CSS px, a direct mechanistic failure, unlike the zoom lock which W3C says can coexist with a passing 1.4.10.
