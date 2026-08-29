@@ -17,6 +17,7 @@ import {
   boolean,
   check,
   customType,
+  foreignKey,
   index,
   integer,
   jsonb,
@@ -28,6 +29,14 @@ import {
   uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
+
+import { WCAG_CRITERIA } from './criteria';
+
+/**
+ * The 55 valid criterion ids as a SQL literal list, generated from criteria.ts
+ * so the CHECK constraint and the seed data cannot disagree.
+ */
+const CRITERION_ID_SQL_LIST = WCAG_CRITERIA.map((c) => `'${c.id}'`).join(', ');
 
 /* -------------------------------------------------------------------------- */
 /* Shared column helpers                                                      */
@@ -226,7 +235,16 @@ export const runs = pgTable(
     failureReason: text('failure_reason'),
     createdAt: createdAt(),
   },
-  (t) => [index('runs_target_id_idx').on(t.targetId), index('runs_status_idx').on(t.status)],
+  (t) => [
+    index('runs_target_id_idx').on(t.targetId),
+    index('runs_status_idx').on(t.status),
+    /**
+     * Redundant on its own - `id` is already unique - but it is the target the
+     * findings composite FK needs. Without it a finding could claim a phase its
+     * run is not in, and the A8 before/after delta would silently corrupt.
+     */
+    uniqueIndex('runs_id_phase_key').on(t.id, t.phase),
+  ],
 );
 
 export const pages = pgTable(
@@ -317,6 +335,24 @@ export const findings = pgTable(
     index('findings_page_id_idx').on(t.pageId),
     index('findings_fix_id_idx').on(t.fixId),
     check('findings_criterion_not_blank', sql`length(btrim(${t.criterion})) > 0`),
+    /**
+     * Non-negotiable rule 3, enforced by the database rather than by
+     * convention: `criterion` must be one of the 55 real WCAG 2.2 Level A/AA
+     * success criteria. The list is generated from criteria.ts, so the schema
+     * and the seed data cannot drift.
+     */
+    check('findings_criterion_is_wcag', sql`${t.criterion} IN (${sql.raw(CRITERION_ID_SQL_LIST)})`),
+    /**
+     * A finding's phase must match its run's phase. `phase` is denormalised so
+     * the delta is one grouped query; this composite FK is what stops the
+     * denormalisation drifting. The before/after delta is the headline output -
+     * a drifted phase corrupts it silently, which is the worst failure mode.
+     */
+    foreignKey({
+      columns: [t.runId, t.phase],
+      foreignColumns: [runs.id, runs.phase],
+      name: 'findings_run_phase_fk',
+    }).onDelete('cascade'),
   ],
 );
 
