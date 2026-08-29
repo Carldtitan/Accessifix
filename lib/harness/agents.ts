@@ -17,9 +17,12 @@
 import type { AgentSpec, ResponseFormat, RuntimeConfig } from "./client";
 import { renderCriterionTable, requireCriterion } from "./criteria";
 import {
+  ALL_VERDICTS,
+  FLAG_ONLY,
   PATCH_SET_RESPONSE_FORMAT,
   VERIFICATION_RESPONSE_FORMAT,
   buildFindingsResponseFormat,
+  type FindingVerdict,
 } from "./schemas";
 
 /** The seven agent names. These are the registry keys; nothing else looks them up. */
@@ -45,6 +48,12 @@ export interface AgentDefinition {
   readonly fallbackModel: string | null;
   /** Criterion numbers this agent owns. Empty for FIX and VERIFY. */
   readonly criteria: readonly string[];
+  /**
+   * Verdicts this lane may emit. MEDIA and CODE are opinion lanes and are
+   * held to FLAG by the schema, not by the prompt (A2.4). Empty for the
+   * non-audit lanes, which do not produce findings at all.
+   */
+  readonly verdicts: readonly FindingVerdict[];
   /** Skills to mount. Only the criteria this agent owns (A13.2). */
   readonly skills: readonly string[];
   readonly instructions: string;
@@ -110,20 +119,37 @@ const EVIDENCE_RULE = `EVIDENCE
 - Put the observation in \`detail\`. Name the element, quote the attribute or the text, and say what the assistive-technology user would experience.
 - Never invent a selector or a file path. If you do not have one, use null.`;
 
-const CRITERION_RULE = `CRITERION DISCIPLINE
+/**
+ * The verdict bullet, written from the lane's actual verdict policy. A
+ * FLAG-only lane must not be told to "DECIDE when the evidence settles it":
+ * the response schema would reject the answer and the pass would be wasted.
+ */
+function verdictRule(verdicts: readonly FindingVerdict[]): string {
+  if (verdicts.length === 1) {
+    return `- \`verdict\` is always "${verdicts[0]}" in this lane, on every finding, however confident you are. The response schema accepts no other value.`;
+  }
+  return `- Use \`verdict\` honestly. DECIDE when the evidence settles it. FLAG when a human has to judge intent, tone, or business context. BLOCKED when you were unable to reach the thing you needed to inspect — and say why in \`detail\`.`;
+}
+
+function criterionRule(verdicts: readonly FindingVerdict[]): string {
+  return `CRITERION DISCIPLINE
 - Every finding carries a numbered WCAG 2.2 success criterion. There are no uncategorised findings. This is non-negotiable — a finding without a criterion number is discarded by the application and your work is wasted.
 - Only report criteria from your own list below. Another agent owns the rest, and the response schema will reject anything outside your lane.
 - One finding per element per criterion. If one element fails three criteria, that is three findings. If ten elements fail one criterion, that is ten findings.
-- Use \`verdict\` honestly. DECIDE when the evidence settles it. FLAG when a human has to judge intent, tone, or business context. BLOCKED when you were unable to reach the thing you needed to inspect — and say why in \`detail\`.
+${verdictRule(verdicts)}
 - Severity is about the disabled user's task, not about how tidy the markup is. \`critical\` means they cannot complete the task at all.`;
+}
 
 const OUTPUT_RULE = `OUTPUT
 - Return JSON matching the response schema. No prose, no markdown, no commentary before or after the JSON object.
 - An empty \`findings\` array is a valid, useful answer. Report nothing rather than padding the list. A false positive costs a developer more than a missed issue costs you.
 - You never write to a database. The application validates your JSON and persists it. Do not attempt to store anything yourself.`;
 
-function outputContract(criteria: readonly string[]): string {
-  return `${CRITERION_RULE}
+function outputContract(
+  criteria: readonly string[],
+  verdicts: readonly FindingVerdict[],
+): string {
+  return `${criterionRule(verdicts)}
 
 CRITERIA YOU OWN (${criteria.length})
 ${renderCriterionTable(criteria)}
@@ -150,7 +176,7 @@ HOW YOU WORK
 - Images of text (1.4.5) means text baked into a raster image. Logos and brand wordmarks are exempt.
 - For consistency criteria (3.2.3, 3.2.4, 3.2.6) you can only report what is visible in the material you were given. If you were given one page, you cannot judge consistency — say so and leave those criteria alone. PAGES owns the multi-page comparison.
 
-${outputContract(VIS_CRITERIA)}`;
+${outputContract(VIS_CRITERIA, ALL_VERDICTS)}`;
 
 const ACT_INSTRUCTIONS = `You are ACT, the interaction auditor in AccessiFix. You drive the interface through its state transitions and read the accessibility tree on both sides of every interaction. Twelve of the 55 criteria are only observable this way, and you own all twelve. This is the part of the audit no rule engine can do.
 
@@ -169,7 +195,7 @@ HOW YOU WORK
 - Delegate independent interaction paths to subagents so they run in parallel with isolated context. Give each subagent one path and the page URL. Do not let one path's DOM state leak into another's judgement.
 - Write screenshots, tree dumps and traces to the sandbox filesystem. Do not paste large artifacts into your reply; reference them by path in \`detail\`.
 
-${outputContract(ACT_CRITERIA)}`;
+${outputContract(ACT_CRITERIA, ALL_VERDICTS)}`;
 
 const PAGES_INSTRUCTIONS = `You are PAGES, the cross-page auditor in AccessiFix. Your criteria are comparative: none of them can be judged from a single page, which is why you run only after the crawl has finished.
 
@@ -184,7 +210,7 @@ HOW YOU WORK
 - Always name the specific pages you compared. "Navigation is inconsistent" is not a finding. "The nav on /apply lists Home, Apply, Help; on /status it lists Apply, Home, Help — Home and Apply are transposed" is.
 - If you were given fewer than two pages, you cannot rule on anything. Return an empty findings array and say nothing else.
 
-${outputContract(PAGES_CRITERIA)}`;
+${outputContract(PAGES_CRITERIA, ALL_VERDICTS)}`;
 
 const MEDIA_INSTRUCTIONS = `You are MEDIA, the audio and video auditor in AccessiFix. You run in your own queue, at your own pace, and you never block the browser fleet.
 
@@ -200,7 +226,7 @@ HOW YOU WORK
 - Quote the specific timestamp and the specific words. "Captions are inaccurate" is not usable. "At 01:12 the speaker says 'you may qualify' and the caption reads 'you will qualify'" is.
 - If the media has no alternative at all, that is still one finding per criterion, not a single generic complaint.
 
-${outputContract(MEDIA_CRITERIA)}`;
+${outputContract(MEDIA_CRITERIA, FLAG_ONLY)}`;
 
 const CODE_INSTRUCTIONS = `You are CODE, the source auditor in AccessiFix. You own three criteria that are invisible in the rendered DOM because they live entirely in event handlers.
 
@@ -214,7 +240,7 @@ HOW YOU WORK
 - The presence of a gesture handler is not by itself a failure. The absence of an alternative is. Look for the alternative before you report, and say in \`detail\` where you looked.
 - These three criteria are FLAG by policy: whether an alternative is genuinely equivalent is a human call. Use FLAG.
 
-${outputContract(CODE_CRITERIA)}`;
+${outputContract(CODE_CRITERIA, FLAG_ONLY)}`;
 
 const FIX_INSTRUCTIONS = `You are FIX, the remediation engineer in AccessiFix. You write the patch. You are the reason this product is not just a list of complaints.
 
@@ -274,9 +300,10 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     model: MODELS.anthropicOpus,
     fallbackModel: MODELS.anthropicSonnet,
     criteria: VIS_CRITERIA,
+    verdicts: ALL_VERDICTS,
     skills: ["wcag-perceivable", "wcag-operable", "wcag-understandable"],
     instructions: VIS_INSTRUCTIONS,
-    responseFormat: buildFindingsResponseFormat(VIS_CRITERIA),
+    responseFormat: buildFindingsResponseFormat(VIS_CRITERIA, ALL_VERDICTS),
     requiresSandbox: false,
     usesSubagents: false,
     iterationLimit: 60,
@@ -289,6 +316,7 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     model: MODELS.anthropicSonnet,
     fallbackModel: MODELS.anthropicOpus,
     criteria: ACT_CRITERIA,
+    verdicts: ALL_VERDICTS,
     skills: [
       "wcag-state-transitions",
       "wcag-operable",
@@ -296,7 +324,7 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
       "wcag-robust",
     ],
     instructions: ACT_INSTRUCTIONS,
-    responseFormat: buildFindingsResponseFormat(ACT_CRITERIA),
+    responseFormat: buildFindingsResponseFormat(ACT_CRITERIA, ALL_VERDICTS),
     requiresSandbox: true,
     usesSubagents: true,
     iterationLimit: 200,
@@ -309,9 +337,10 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     model: MODELS.fireworksBulk,
     fallbackModel: MODELS.anthropicSonnet,
     criteria: PAGES_CRITERIA,
+    verdicts: ALL_VERDICTS,
     skills: ["wcag-cross-page"],
     instructions: PAGES_INSTRUCTIONS,
-    responseFormat: buildFindingsResponseFormat(PAGES_CRITERIA),
+    responseFormat: buildFindingsResponseFormat(PAGES_CRITERIA, ALL_VERDICTS),
     requiresSandbox: false,
     usesSubagents: false,
     iterationLimit: 40,
@@ -324,9 +353,11 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     model: MODELS.anthropicSonnet,
     fallbackModel: MODELS.anthropicOpus,
     criteria: MEDIA_CRITERIA,
+    // Opinion, never a decision: the enum on the wire contains FLAG alone.
+    verdicts: FLAG_ONLY,
     skills: ["wcag-media"],
     instructions: MEDIA_INSTRUCTIONS,
-    responseFormat: buildFindingsResponseFormat(MEDIA_CRITERIA),
+    responseFormat: buildFindingsResponseFormat(MEDIA_CRITERIA, FLAG_ONLY),
     requiresSandbox: false,
     usesSubagents: false,
     iterationLimit: 40,
@@ -339,9 +370,11 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     model: MODELS.fireworksCode,
     fallbackModel: MODELS.anthropicSonnet,
     criteria: CODE_CRITERIA,
+    // Whether an alternative is genuinely equivalent is a human call.
+    verdicts: FLAG_ONLY,
     skills: ["wcag-gestures"],
     instructions: CODE_INSTRUCTIONS,
-    responseFormat: buildFindingsResponseFormat(CODE_CRITERIA),
+    responseFormat: buildFindingsResponseFormat(CODE_CRITERIA, FLAG_ONLY),
     requiresSandbox: false,
     usesSubagents: false,
     iterationLimit: 60,
@@ -354,6 +387,7 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     model: MODELS.anthropicOpus,
     fallbackModel: MODELS.fireworksCode,
     criteria: [],
+    verdicts: [],
     skills: ["accessibility-remediation"],
     instructions: FIX_INSTRUCTIONS,
     responseFormat: PATCH_SET_RESPONSE_FORMAT,
@@ -369,6 +403,7 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     model: MODELS.fireworksCode,
     fallbackModel: MODELS.anthropicSonnet,
     criteria: [],
+    verdicts: [],
     skills: ["target-repo-verification"],
     instructions: VERIFY_INSTRUCTIONS,
     responseFormat: VERIFICATION_RESPONSE_FORMAT,

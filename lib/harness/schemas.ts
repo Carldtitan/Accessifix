@@ -9,16 +9,23 @@
  *   - as a JSON Schema, for `response_format` on the agent manifest, so the
  *     provider constrains the model up front instead of us repairing prose.
  *
- * The findings schema is built per agent from the criteria that agent owns.
- * A VIS agent physically cannot emit a `2.5.4` finding: the enum does not
- * contain it. That is criterion routing enforced by the harness, not by a
- * sentence in a prompt.
+ * The findings schema is built per agent from the criteria that agent owns
+ * and the verdicts that agent's lane is allowed to reach. A VIS agent
+ * physically cannot emit a `2.5.4` finding: the enum does not contain it. A
+ * MEDIA agent physically cannot emit a `DECIDE`: that enum does not contain
+ * it either. That is policy enforced by the harness, not by a sentence in a
+ * prompt.
  */
 
 import { z } from "zod";
 
 import type { ResponseFormat } from "./client";
-import { WCAG_CRITERION_IDS, WCAG_CRITERION_PATTERN, isWcagCriterionId } from "./criteria";
+import {
+  WCAG_CRITERIA_BY_ID,
+  WCAG_CRITERION_IDS,
+  WCAG_CRITERION_PATTERN,
+  isWcagCriterionId,
+} from "./criteria";
 
 /** A JSON Schema document, kept loose because providers extend it. */
 export type JsonSchema = Record<string, unknown>;
@@ -36,32 +43,130 @@ export const SeveritySchema = z.enum(SEVERITIES);
 export type FindingVerdict = z.infer<typeof VerdictSchema>;
 export type FindingSeverity = z.infer<typeof SeveritySchema>;
 
+const CRITERION_MEMBERSHIP_MESSAGE =
+  "criterion must be one of the 55 WCAG 2.2 Level A/AA success criteria";
+
+/**
+ * A criterion number that is both well-shaped and one of the 55 the harness
+ * actually supports. `1.9.9` has the right shape and is still not a criterion;
+ * accepting it leaves FIX and VERIFY output detached from the findings ledger.
+ */
+const CriterionIdSchema = z
+  .string()
+  .regex(WCAG_CRITERION_PATTERN, "criterion must look like `4.1.2`")
+  .refine(isWcagCriterionId, { message: CRITERION_MEMBERSHIP_MESSAGE });
+
+// ---------------------------------------------------------------------------
+// Verdict policy
+// ---------------------------------------------------------------------------
+
+/**
+ * The verdicts one lane may emit. Two rules live here rather than in a prompt,
+ * because a prompt is advice and a schema is a guarantee:
+ *
+ *   - MEDIA and CODE are opinion lanes. Whether a transcript conveys the same
+ *     information, and whether a gesture alternative is genuinely equivalent,
+ *     are human calls; their output goes to the review queue and never to FIX.
+ *     FLAG is the only verdict they may produce. MEDIA owns 1.2.2, whose
+ *     registry class is DECIDE — the lane policy overrides the criterion.
+ *   - A criterion this harness classes as BLOCKED is out of reach by
+ *     definition, so DECIDE is never available for it, whatever the lane
+ *     otherwise allows.
+ */
+export const ALL_VERDICTS: readonly FindingVerdict[] = VERDICTS;
+
+/** The policy for the opinion lanes: every finding is a FLAG, always. */
+export const FLAG_ONLY: readonly FindingVerdict[] = ["FLAG"];
+
+/** The verdicts a given criterion may carry inside a lane allowing `laneVerdicts`. */
+export function allowedVerdicts(
+  criterionId: string,
+  laneVerdicts: readonly FindingVerdict[] = ALL_VERDICTS,
+): readonly FindingVerdict[] {
+  const isBlocked = WCAG_CRITERIA_BY_ID.get(criterionId)?.verdict === "BLOCKED";
+  return isBlocked ? laneVerdicts.filter((verdict) => verdict !== "DECIDE") : laneVerdicts;
+}
+
+/**
+ * The single verdict enum a flat JSON Schema can publish for a lane: the union
+ * of what each criterion in that lane allows. When one criterion is narrower
+ * than the union — a BLOCKED-class criterion sitting in a lane that may
+ * otherwise DECIDE — the flat enum cannot express it, so `verdictDescription`
+ * states it in words and the zod schema enforces it for real.
+ */
+function laneVerdictEnum(
+  criterionIds: readonly string[],
+  laneVerdicts: readonly FindingVerdict[],
+): FindingVerdict[] {
+  const union = new Set<FindingVerdict>();
+  for (const id of criterionIds) {
+    for (const verdict of allowedVerdicts(id, laneVerdicts)) union.add(verdict);
+  }
+  // A lane with no criteria still needs a legal enum.
+  if (union.size === 0) for (const verdict of laneVerdicts) union.add(verdict);
+  return VERDICTS.filter((verdict) => union.has(verdict));
+}
+
+function verdictDescription(
+  criterionIds: readonly string[],
+  published: readonly FindingVerdict[],
+): string {
+  if (published.length === 1) {
+    return `Always "${published[0]}" for this agent, and the only accepted value: this lane produces an opinion for a human to sign off, never a ruling.`;
+  }
+  let text =
+    "DECIDE when you are ruling; FLAG when a human must sign off; BLOCKED when the check is out of reach.";
+  const blocked = criterionIds.filter(
+    (id) => WCAG_CRITERIA_BY_ID.get(id)?.verdict === "BLOCKED",
+  );
+  if (blocked.length > 0 && published.includes("DECIDE")) {
+    text += ` DECIDE is never valid for ${blocked.join(", ")} — use BLOCKED and say in \`detail\` why the check was out of reach.`;
+  }
+  return text;
+}
+
 /**
  * One violation of one criterion on one page. `criterion` is never null and is
  * always one of the 55 — rule 3 of the non-negotiables.
  */
-function findingObject(isAllowedCriterion: (id: string) => boolean, allowedMessage: string) {
-  return z.object({
-    criterion: z
-      .string()
-      .regex(WCAG_CRITERION_PATTERN, "criterion must look like `4.1.2`")
-      .refine(isAllowedCriterion, { message: allowedMessage }),
-    verdict: VerdictSchema,
-    severity: SeveritySchema,
-    /** One sentence. Goes straight into the ledger's `summary` column. */
-    summary: z.string().min(1).max(400),
-    /** The reasoning and the evidence that supports the claim. */
-    detail: z.string().min(1),
-    /** CSS selector for the offending element, when there is one. */
-    selector: z.string().nullish(),
-    /** Repository-relative source path, with a line number when known. */
-    sourcePath: z.string().nullish(),
-  });
+function findingObject(
+  isAllowedCriterion: (id: string) => boolean,
+  allowedMessage: string,
+  laneVerdicts: readonly FindingVerdict[],
+) {
+  return z
+    .object({
+      criterion: z
+        .string()
+        .regex(WCAG_CRITERION_PATTERN, "criterion must look like `4.1.2`")
+        .refine(isAllowedCriterion, { message: allowedMessage }),
+      verdict: VerdictSchema,
+      severity: SeveritySchema,
+      /** One sentence. Goes straight into the ledger's `summary` column. */
+      summary: z.string().min(1).max(400),
+      /** The reasoning and the evidence that supports the claim. */
+      detail: z.string().min(1),
+      /** CSS selector for the offending element, when there is one. */
+      selector: z.string().nullish(),
+      /** Repository-relative source path, with a line number when known. */
+      sourcePath: z.string().nullish(),
+    })
+    .superRefine((finding, ctx) => {
+      const allowed = allowedVerdicts(finding.criterion, laneVerdicts);
+      if (!allowed.includes(finding.verdict)) {
+        ctx.addIssue({
+          code: "custom",
+          path: ["verdict"],
+          message: `verdict for ${finding.criterion} must be one of ${allowed.join(", ")}, not ${finding.verdict}`,
+        });
+      }
+    });
 }
 
 export const FindingSchema = findingObject(
   isWcagCriterionId,
-  "criterion must be one of the 55 WCAG 2.2 Level A/AA success criteria",
+  CRITERION_MEMBERSHIP_MESSAGE,
+  ALL_VERDICTS,
 );
 
 export type Finding = z.infer<typeof FindingSchema>;
@@ -73,16 +178,21 @@ export const FindingsResponseSchema = z.object({
 export type FindingsResponse = z.infer<typeof FindingsResponseSchema>;
 
 /**
- * A findings schema narrowed to one agent's criteria. Anything outside that
- * agent's lane fails validation instead of silently entering the ledger.
+ * A findings schema narrowed to one agent's criteria and one agent's verdict
+ * policy. Anything outside that agent's lane fails validation instead of
+ * silently entering the ledger.
  */
-export function buildFindingsSchema(criterionIds: readonly string[]) {
+export function buildFindingsSchema(
+  criterionIds: readonly string[],
+  laneVerdicts: readonly FindingVerdict[] = ALL_VERDICTS,
+) {
   const allowed = new Set(criterionIds);
   return z.object({
     findings: z.array(
       findingObject(
         (id) => allowed.has(id),
         `criterion must be one this agent owns (${criterionIds.join(", ")})`,
+        laneVerdicts,
       ),
     ),
   });
@@ -97,8 +207,8 @@ export const PatchSchema = z.object({
   sourcePath: z.string().min(1),
   /** Unified diff against the file as it stands in the target repository. */
   diff: z.string().min(1),
-  /** Criterion numbers this patch addresses. Never empty. */
-  criteria: z.array(z.string().regex(WCAG_CRITERION_PATTERN)).min(1),
+  /** Criterion numbers this patch addresses. Never empty, always supported. */
+  criteria: z.array(CriterionIdSchema).min(1),
   /** Why this change is correct, in prose a reviewer can check. */
   rationale: z.string().min(1),
   /** Anything the patch might plausibly break, for VERIFY to watch. */
@@ -113,7 +223,7 @@ export const PatchSetResponseSchema = z.object({
   skipped: z
     .array(
       z.object({
-        criterion: z.string().regex(WCAG_CRITERION_PATTERN),
+        criterion: CriterionIdSchema,
         reason: z.string().min(1),
       }),
     )
@@ -136,7 +246,7 @@ export const VerificationResponseSchema = z.object({
   /** Per-criterion re-check result for every criterion a patch claimed (A6.3). */
   recheck: z.array(
     z.object({
-      criterion: z.string().regex(WCAG_CRITERION_PATTERN),
+      criterion: CriterionIdSchema,
       resolved: z.boolean(),
       note: z.string().min(1),
     }),
@@ -158,7 +268,14 @@ export type VerificationResponse = z.infer<typeof VerificationResponseSchema>;
  */
 const nullableString = { type: ["string", "null"] } as const;
 
-function findingsJsonSchema(criterionIds: readonly string[]): JsonSchema {
+/** The 55 canonical criterion numbers, for the schemas that are not lane-scoped. */
+const CRITERION_ENUM: string[] = [...WCAG_CRITERION_IDS];
+
+function findingsJsonSchema(
+  criterionIds: readonly string[],
+  laneVerdicts: readonly FindingVerdict[] = ALL_VERDICTS,
+): JsonSchema {
+  const verdicts = laneVerdictEnum(criterionIds, laneVerdicts);
   return {
     type: "object",
     additionalProperties: false,
@@ -180,9 +297,8 @@ function findingsJsonSchema(criterionIds: readonly string[]): JsonSchema {
             },
             verdict: {
               type: "string",
-              enum: [...VERDICTS],
-              description:
-                "DECIDE when you are ruling; FLAG when a human must sign off; BLOCKED when the check is out of reach.",
+              enum: verdicts,
+              description: verdictDescription(criterionIds, verdicts),
             },
             severity: {
               type: "string",
@@ -232,8 +348,10 @@ export const PATCH_SET_JSON_SCHEMA: JsonSchema = {
           diff: { type: "string", description: "Unified diff for this one file." },
           criteria: {
             type: "array",
-            items: { type: "string" },
-            description: "Criterion numbers this patch addresses. Never empty.",
+            minItems: 1,
+            items: { type: "string", enum: CRITERION_ENUM },
+            description:
+              "Criterion numbers this patch addresses, from the supported WCAG 2.2 A/AA set. Never empty.",
           },
           rationale: { type: "string", description: "Why this change is correct." },
           risk: { ...nullableString, description: "What it might break, or null." },
@@ -247,7 +365,11 @@ export const PATCH_SET_JSON_SCHEMA: JsonSchema = {
         additionalProperties: false,
         required: ["criterion", "reason"],
         properties: {
-          criterion: { type: "string" },
+          criterion: {
+            type: "string",
+            enum: CRITERION_ENUM,
+            description: "The criterion of the finding that was skipped.",
+          },
           reason: { type: "string" },
         },
       },
@@ -278,7 +400,11 @@ export const VERIFICATION_JSON_SCHEMA: JsonSchema = {
         additionalProperties: false,
         required: ["criterion", "resolved", "note"],
         properties: {
-          criterion: { type: "string" },
+          criterion: {
+            type: "string",
+            enum: CRITERION_ENUM,
+            description: "A criterion one of the patches claimed to fix.",
+          },
           resolved: { type: "boolean" },
           note: { type: "string" },
         },
@@ -303,11 +429,17 @@ function jsonSchemaResponseFormat(
   };
 }
 
-/** `response_format` for an audit agent, narrowed to the criteria it owns. */
-export function buildFindingsResponseFormat(criterionIds: readonly string[]): ResponseFormat {
+/**
+ * `response_format` for an audit agent, narrowed to the criteria it owns and
+ * the verdicts its lane is allowed to reach.
+ */
+export function buildFindingsResponseFormat(
+  criterionIds: readonly string[],
+  laneVerdicts: readonly FindingVerdict[] = ALL_VERDICTS,
+): ResponseFormat {
   return jsonSchemaResponseFormat(
     "accessifix_findings",
-    findingsJsonSchema(criterionIds),
+    findingsJsonSchema(criterionIds, laneVerdicts),
     "Accessibility findings, one object per violated success criterion.",
   );
 }
