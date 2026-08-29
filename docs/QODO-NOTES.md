@@ -37,3 +37,22 @@ pushes are rejected for everyone including the repository owner.
 - **Qodo found:** No bugs. The review weighed three architecture options for the sandbox/browser split and agreed with the one implemented.
 - **We changed:** Nothing required.
 - **We dismissed:** Nothing.
+
+---
+
+## PR #4 — Task 8: Warm Control Room UI and run view
+
+- **Link:** https://github.com/Carldtitan/Accessifix/pull/4
+- **Qodo found:**
+  - `High` — Approval never reaches harness. The card rendered its outcome banner on click without ever calling the server.
+  - `Medium` — Account navigation leaves the mobile drawer open.
+  - `Medium` — Findings total contradicts the list shown on the same page.
+  - `Medium` — Tabs share the wrong panel; every tab pointed `aria-controls` at one shared panel.
+  - `Medium` — Failed environment badge styled identically to live.
+- **We changed:**
+  - Rewrote `ApprovalCard` around a real submit state machine (`idle → submitting → settled | error`). The decision now POSTs to `/api/runs/{runId}/approve`; the outcome banner renders only after the call succeeds, and a failure surfaces the server's reason in a `role="alert"`. Given neither a `runId` nor a handler, the controls stay disabled and say so — the card can never mime a decision. The approval gate is A7 and the centrepiece of the demo; a button that fakes it is worse than no button at all.
+  - Fixed the tabs properly against the WAI-ARIA pattern: one `role="tabpanel"` per tab, each tab's `aria-controls` naming its own panel and each panel's `aria-labelledby` naming its own tab, so the relationship resolves for inactive tabs too. Unselected panels stay in the DOM closed with `hidden`. Also needed a CSS fix — `.tabpanel { display: block }` would have silently defeated `hidden`. **This product detects exactly this class of ARIA wiring bug; shipping it would have been indefensible.**
+  - Added `onClick={closeMenu}` to the account link, matching every other nav link.
+  - Findings page now derives both numbers and labels the excerpt as a subset, so it no longer contradicts the criterion matrix beside it.
+  - `failed` badge given its own deeper red ground plus a ring, so it differs from `live` by shape as well as hue rather than by colour alone. 8.5:1 composited, recorded in the contrast ledger.
+- **We dismissed:** Nothing. All five were genuine.
