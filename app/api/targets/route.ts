@@ -22,11 +22,41 @@ export const dynamic = 'force-dynamic';
 /** `owner/repo`. GitHub allows letters, digits, dot, dash and underscore. */
 const REPO = /^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})\/[A-Za-z0-9._-]{1,100}$/;
 
+/**
+ * Accept what a person will actually paste.
+ *
+ * Everybody copies the address bar. Refusing a GitHub URL and demanding
+ * `owner/repo` is the form being pedantic about a detail it can work out for
+ * itself, so this normalises the obvious shapes before validating:
+ *
+ *   https://github.com/owner/repo        git@github.com:owner/repo.git
+ *   https://github.com/owner/repo.git    github.com/owner/repo/tree/main
+ *   owner/repo
+ */
+function normaliseRepo(input: string): string {
+  let value = input.trim();
+  if (!value) return value;
+
+  value = value.replace(/^git@github\.com:/i, '');
+  value = value.replace(/^(?:https?:\/\/)?(?:www\.)?github\.com\//i, '');
+  value = value.replace(/\.git$/i, '');
+  value = value.replace(/^\/+|\/+$/g, '');
+
+  // Anything after owner/repo is a branch, a file, or a tab. Not our business.
+  const parts = value.split('/');
+  if (parts.length > 2) value = `${parts[0]}/${parts[1]}`;
+
+  return value;
+}
+
 const CreateTarget = z.object({
   repoFullName: z
     .string()
-    .trim()
-    .regex(REPO, 'Repository must be in `owner/repo` form, for example `clearway/clearway`.'),
+    .transform(normaliseRepo)
+    .refine((v) => REPO.test(v), {
+      message:
+        'That does not look like a GitHub repository. Paste the repository URL, or type owner/repo.',
+    }),
   deployedUrl: z.string().trim().min(1, 'A deployed URL is required.'),
 });
 
