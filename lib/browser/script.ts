@@ -279,12 +279,24 @@ async function runAxe(page, source, warnings) {
   }
   try {
     await page.addScriptTag({ content: source });
-    var violations = await page.evaluate(function () {
-      if (!window.axe) return [];
+    // The page callback reports whether axe.run actually completed. Injecting a
+    // source that never defines window.axe -- a blocked, incompatible, or custom
+    // axePath/axeUrl -- resolves with no violations and must stay ran: false.
+    var outcome = await page.evaluate(function () {
+      if (!window.axe || typeof window.axe.run !== 'function') {
+        return { ran: false, violations: [] };
+      }
       return window.axe.run(document, { resultTypes: ['violations'] }).then(function (results) {
-        return results.violations || [];
+        return { ran: true, violations: (results && results.violations) || [] };
       });
     });
+    if (!outcome || outcome.ran !== true) {
+      warnings.push(
+        'axe-core source loaded but window.axe.run was never available; no deterministic violations collected'
+      );
+      return { violations: [], ran: false };
+    }
+    var violations = outcome.violations || [];
     var out = [];
     for (var i = 0; i < violations.length; i++) {
       var v = violations[i];
