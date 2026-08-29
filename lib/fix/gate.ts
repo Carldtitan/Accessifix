@@ -7,6 +7,13 @@
  * for the exact request in front of it, and `withApproval` is the only shape
  * the write-class call sites use.
  *
+ * "The exact request" means the operation, not the label. Every request carries
+ * an `ApprovalOperation` — repository, branch, base, title, commit, and a digest
+ * of every file's contents — and the enforcement point compares it field by
+ * field against what is about to be sent. An id alone binds nothing: a decision
+ * answering `run-7:open-pull-request` would otherwise authorise a pull request
+ * against any repository, from any branch, carrying any bytes.
+ *
  * The other half is A7.3 — the handoff is a written explanation, not a raw tool
  * payload. Nobody can consent to `{"tool":"create_pull_request","args":{...}}`.
  * They can consent to "I want to open a pull request against clearway that
@@ -42,6 +49,136 @@ const ACTION_TITLES: Record<WriteAction, string> = {
   'commit-files': 'Commit the patches to the branch',
   'open-pull-request': 'Open a pull request',
 };
+
+/* -------------------------------------------------------------------------- */
+/* The operation                                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The irreversible act itself, stripped of the prose around it.
+ *
+ * A request id alone cannot bind an approval to anything: `run-7:open-pull-request`
+ * says nothing about which repository, which branch or which bytes, so a decision
+ * for one payload would authorise any other. This is the part a human actually
+ * consented to, carried on the request so the call site can compare it — field by
+ * field — against what it is about to send.
+ *
+ * One flat shape for all four actions rather than a union: the enforcement point
+ * has to compare two of these without caring which action it is holding, and a
+ * field that does not apply is null rather than absent.
+ */
+export interface ApprovalOperation {
+  readonly action: WriteAction;
+  /** `owner/repo` the write lands in. */
+  readonly repoFullName: string;
+  /** The branch being written, or a pull request's head. Null when there is none. */
+  readonly branch: string | null;
+  /** The base branch, when the action has one. */
+  readonly base: string | null;
+  /** The pull-request title, when the action has one. */
+  readonly title: string | null;
+  /**
+   * `path@length:hash` for every file, ascending. Digests rather than paths,
+   * because approving "three files" and approving *these* three files with
+   * *these* contents are different consents.
+   */
+  readonly files: readonly string[];
+  /** The commit the head must already be at, when one was pushed. */
+  readonly commitSha: string | null;
+}
+
+/**
+ * A stable digest of one operation.
+ *
+ * Only used to make the default request id payload-specific, so a stored
+ * decision cannot be replayed against a different operation. Enforcement itself
+ * compares the operations field by field (`operationMismatch`) rather than
+ * trusting this, because a non-cryptographic hash is an integrity check and not
+ * an authentication one.
+ */
+export function fingerprintOperation(operation: ApprovalOperation): string {
+  return stableHash(
+    [
+      operation.action,
+      operation.repoFullName,
+      operation.branch ?? '',
+      operation.base ?? '',
+      operation.title ?? '',
+      operation.commitSha ?? '',
+      ...[...operation.files].sort(),
+    ].join('\u0000'),
+  );
+}
+
+/** `path@length:hash` per file, ascending. Binds the exact bytes, not the count. */
+export function fileDigests(
+  files: readonly { readonly path: string; readonly contents: string }[],
+): string[] {
+  return files
+    .map((file) => `${file.path}@${file.contents.length}:${stableHash(file.contents)}`)
+    .sort();
+}
+
+/**
+ * Why two operations differ, in a sentence, or null when they are the same act.
+ *
+ * Exported because the GitHub client enforces the same comparison at its own
+ * boundary, and two implementations of "the same" would eventually disagree.
+ */
+export function operationMismatch(
+  approved: ApprovalOperation,
+  aboutToRun: ApprovalOperation,
+): string | null {
+  const fields: ReadonlyArray<[string, unknown, unknown]> = [
+    ['action', approved.action, aboutToRun.action],
+    ['repository', approved.repoFullName, aboutToRun.repoFullName],
+    ['branch', approved.branch, aboutToRun.branch],
+    ['base branch', approved.base, aboutToRun.base],
+    ['title', approved.title, aboutToRun.title],
+    ['commit', approved.commitSha, aboutToRun.commitSha],
+  ];
+  for (const [name, was, now] of fields) {
+    if (was !== now) {
+      return `the approved ${name} is ${describe(was)}, but ${describe(now)} is about to run`;
+    }
+  }
+
+  const approvedFiles = [...approved.files].sort();
+  const runningFiles = [...aboutToRun.files].sort();
+  if (
+    approvedFiles.length !== runningFiles.length ||
+    approvedFiles.some((digest, index) => digest !== runningFiles[index])
+  ) {
+    return (
+      `the approved file set is not the one about to be written ` +
+      `(${approvedFiles.length} approved, ${runningFiles.length} about to run, and their contents ` +
+      'are compared by digest, not by name)'
+    );
+  }
+
+  return null;
+}
+
+function describe(value: unknown): string {
+  return value === null || value === undefined ? 'unset' : `"${String(value)}"`;
+}
+
+/**
+ * FNV-1a in four lanes, so the digest is wide enough to be useful and the module
+ * stays free of imports — `lib/fix/gate.ts` is rendered by the run view as well
+ * as run on the server, and pulling `node:crypto` in here would break the client
+ * bundle for no gain the field-by-field comparison does not already give.
+ */
+function stableHash(text: string): string {
+  const lanes = [0x811c9dc5, 0x01000193, 0x9e3779b9, 0x85ebca6b];
+  for (let i = 0; i < text.length; i += 1) {
+    const code = text.charCodeAt(i);
+    for (let lane = 0; lane < lanes.length; lane += 1) {
+      lanes[lane] = Math.imul((lanes[lane]! ^ (code + lane * 31 + i)) >>> 0, 0x01000193) >>> 0;
+    }
+  }
+  return lanes.map((lane) => lane.toString(16).padStart(8, '0')).join('');
+}
 
 /* -------------------------------------------------------------------------- */
 /* Evidence                                                                   */
@@ -89,6 +226,15 @@ export interface ApprovalRequest {
   readonly evidence: readonly GateEvidence[];
   /** The write-class tool being paused on. Shown quietly, never as the ask. */
   readonly toolName?: string;
+  /**
+   * Exactly what was consented to, in the terms the write call site works in.
+   * The enforcement point compares this against the operation it is about to
+   * run, so an approval cannot be carried across to a different repository,
+   * branch, title or file set.
+   */
+  readonly operation: ApprovalOperation;
+  /** Digest of `operation`, folded into the default id so a decision cannot drift. */
+  readonly fingerprint: string;
   /**
    * The structured facts behind the prose. For an operator reading the log, not
    * for the person deciding.
@@ -139,11 +285,38 @@ export function isApproved(
 /**
  * The enforcement point. Every irreversible call goes through this or through
  * `withApproval`, and there is no third way.
+ *
+ * Three questions, and all three have to answer yes:
+ *
+ *  1. Is this decision about this request at all?
+ *  2. Does the request describe the operation that is about to run? Pass
+ *     `aboutToRun` and it is compared field by field — repository, branch, base,
+ *     title, commit and the digest of every file. A human who approved a two-file
+ *     change to `accessifix/a11y-3f2c` has not approved anything else, and
+ *     without this argument the gate could not tell the difference.
+ *  3. Did the human say yes?
+ *
+ * `aboutToRun` is optional only so a caller that has already compared the
+ * operation itself is not forced to build it twice. A write-class call site that
+ * omits it is trusting its own caller, which is exactly what A7.1 forbids, so
+ * everything under `lib/github` passes it.
  */
 export function assertApproved(
   request: ApprovalRequest,
   decision: GateDecision | null | undefined,
+  aboutToRun?: ApprovalOperation,
 ): asserts decision is GateDecision {
+  if (aboutToRun) {
+    const mismatch = operationMismatch(request.operation, aboutToRun);
+    if (mismatch) {
+      throw new ApprovalRequiredError(
+        request,
+        'pending',
+        `the approval does not cover this operation — ${mismatch}`,
+      );
+    }
+  }
+
   if (!decision) throw new ApprovalRequiredError(request, 'pending');
 
   if (decision.requestId !== request.id) {
@@ -158,13 +331,14 @@ export function assertApproved(
   }
 }
 
-/** Run `fn` only if a human approved this exact request. */
+/** Run `fn` only if a human approved this exact request, for this exact operation. */
 export async function withApproval<T>(
   request: ApprovalRequest,
   decision: GateDecision | null | undefined,
   fn: () => Promise<T>,
+  aboutToRun?: ApprovalOperation,
 ): Promise<T> {
-  assertApproved(request, decision);
+  assertApproved(request, decision, aboutToRun);
   return fn();
 }
 
@@ -193,6 +367,10 @@ export interface PatchApprovalInput {
 export function buildPatchApproval(input: PatchApprovalInput): ApprovalRequest {
   const criteria = collectCriteria(input.patches);
   const files = input.patches.map((patch) => patch.filePath);
+  const operation = patchOperation('apply-patch', {
+    repoFullName: input.repoFullName,
+    patches: input.patches,
+  });
   const added = input.patches.reduce((n, p) => n + p.stats.linesAdded, 0);
   const removed = input.patches.reduce((n, p) => n + p.stats.linesRemoved, 0);
 
@@ -213,7 +391,7 @@ export function buildPatchApproval(input: PatchApprovalInput): ApprovalRequest {
   ].join('');
 
   return {
-    id: input.id ?? makeId(input.runId, 'apply-patch'),
+    id: input.id ?? makeId(input.runId, operation),
     runId: input.runId,
     action: 'apply-patch',
     title: ACTION_TITLES['apply-patch'],
@@ -238,6 +416,8 @@ export function buildPatchApproval(input: PatchApprovalInput): ApprovalRequest {
       ),
     ],
     toolName: 'write_files',
+    operation,
+    fingerprint: fingerprintOperation(operation),
     payload: {
       repoFullName: input.repoFullName,
       files,
@@ -262,9 +442,15 @@ export interface BranchApprovalInput {
 /** The gate before a branch reaches the remote (A7.1). */
 export function buildBranchApproval(input: BranchApprovalInput): ApprovalRequest {
   const files = input.patches.map((patch) => patch.filePath);
+  const operation = patchOperation('push-branch', {
+    repoFullName: input.repoFullName,
+    patches: input.patches,
+    branch: input.branch,
+    base: input.baseBranch,
+  });
 
   return {
-    id: input.id ?? makeId(input.runId, 'push-branch'),
+    id: input.id ?? makeId(input.runId, operation),
     runId: input.runId,
     action: 'push-branch',
     title: ACTION_TITLES['push-branch'],
@@ -284,6 +470,8 @@ export function buildBranchApproval(input: BranchApprovalInput): ApprovalRequest
       }),
     ),
     toolName: 'github.createBranch',
+    operation,
+    fingerprint: fingerprintOperation(operation),
     payload: {
       repoFullName: input.repoFullName,
       branch: input.branch,
@@ -303,9 +491,20 @@ export interface PullRequestApprovalInput {
   readonly title: string;
   readonly patches: readonly FilePatch[];
   readonly criterionNames?: ReadonlyMap<string, string>;
+  /**
+   * The commit already pushed to `branch`. The approval is bound to it, so a
+   * yes for one tree cannot open a pull request from a different one.
+   */
+  readonly commitSha?: string | null;
   /** Build outcome, in the caller's own words. */
   readonly buildSummary: string;
   readonly buildOk: boolean;
+  /**
+   * True when nothing was compiled — the repository defines no build script, so
+   * the build step ran nothing and proved nothing. `buildOk` is true alongside
+   * it, because nothing failed either, and the card must not read as a pass.
+   */
+  readonly buildUnproven?: boolean;
   /** Test outcome. A failing suite must never reach this builder (A6.4). */
   readonly testSummary: string;
   readonly testsOk: boolean;
@@ -326,6 +525,14 @@ export interface PullRequestApprovalInput {
 export function buildPullRequestApproval(input: PullRequestApprovalInput): ApprovalRequest {
   const criteria = collectCriteria(input.patches);
   const files = input.patches.map((patch) => patch.filePath);
+  const operation = patchOperation('open-pull-request', {
+    repoFullName: input.repoFullName,
+    patches: input.patches,
+    branch: input.branch,
+    base: input.baseBranch,
+    title: input.title,
+    commitSha: input.commitSha ?? null,
+  });
 
   const intent =
     `I want to open a pull request on ${input.repoFullName}, from \`${input.branch}\` into ` +
@@ -336,9 +543,11 @@ export function buildPullRequestApproval(input: PullRequestApprovalInput): Appro
 
   const reason = [
     criteriaSentence(criteria, input.criterionNames),
-    input.buildOk
-      ? `The patched tree builds: ${input.buildSummary}`
-      : `The build did not pass: ${input.buildSummary}`,
+    !input.buildOk
+      ? `The build did not pass: ${input.buildSummary}`
+      : input.buildUnproven
+        ? `Nothing was compiled: ${input.buildSummary}`
+        : `The patched tree builds: ${input.buildSummary}`,
     input.testsUnproven
       ? input.testSummary
       : input.testsOk
@@ -356,7 +565,11 @@ export function buildPullRequestApproval(input: PullRequestApprovalInput): Appro
     {
       id: 'build',
       kind: 'test',
-      label: input.buildOk ? 'Build passed' : 'Build failed',
+      label: !input.buildOk
+        ? 'Build failed'
+        : input.buildUnproven
+          ? 'Nothing to build'
+          : 'Build passed',
       detail: input.buildSummary,
     },
     {
@@ -394,7 +607,7 @@ export function buildPullRequestApproval(input: PullRequestApprovalInput): Appro
   ];
 
   return {
-    id: input.id ?? makeId(input.runId, 'open-pull-request'),
+    id: input.id ?? makeId(input.runId, operation),
     runId: input.runId,
     action: 'open-pull-request',
     title: ACTION_TITLES['open-pull-request'],
@@ -402,11 +615,14 @@ export function buildPullRequestApproval(input: PullRequestApprovalInput): Appro
     reason,
     evidence,
     toolName: 'github.openPullRequest',
+    operation,
+    fingerprint: fingerprintOperation(operation),
     payload: {
       repoFullName: input.repoFullName,
       head: input.branch,
       base: input.baseBranch,
       title: input.title,
+      commitSha: input.commitSha ?? null,
       files,
       criteria,
       resolvedCriteria: input.resolvedCriteria ?? [],
@@ -514,8 +730,38 @@ function countNoun(count: number, singular: string, plural?: string): string {
   return `${count} ${count === 1 ? singular : (plural ?? `${singular}s`)}`;
 }
 
-function makeId(runId: string, action: WriteAction): string {
-  return `${runId}:${action}`;
+/** The operation a patch set implies, for whichever action is asking. */
+function patchOperation(
+  action: WriteAction,
+  facts: {
+    readonly repoFullName: string;
+    readonly patches: readonly FilePatch[];
+    readonly branch?: string | null;
+    readonly base?: string | null;
+    readonly title?: string | null;
+    readonly commitSha?: string | null;
+  },
+): ApprovalOperation {
+  return {
+    action,
+    repoFullName: facts.repoFullName,
+    branch: facts.branch ?? null,
+    base: facts.base ?? null,
+    title: facts.title ?? null,
+    files: fileDigests(
+      facts.patches.map((patch) => ({ path: patch.filePath, contents: patch.newContents })),
+    ),
+    commitSha: facts.commitSha ?? null,
+  };
+}
+
+/**
+ * `run-7:open-pull-request:9a3f…` — the operation's digest is part of the id, so
+ * a decision stored against one payload cannot be presented for another. Without
+ * it the id is `run:action` and every pull request in a run shares one.
+ */
+function makeId(runId: string, operation: ApprovalOperation): string {
+  return `${runId}:${operation.action}:${fingerprintOperation(operation)}`;
 }
 
 function humanDuration(ms: number): string {

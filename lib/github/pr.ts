@@ -18,10 +18,16 @@
  */
 
 import { getCriterion } from '@/lib/db/criteria';
-import { assertApproved, type ApprovalRequest, type GateDecision } from '@/lib/fix/gate';
+import {
+  assertApproved,
+  fileDigests,
+  type ApprovalOperation,
+  type ApprovalRequest,
+  type GateDecision,
+} from '@/lib/fix/gate';
 import type { ExcludedFinding, FixableFinding } from '@/lib/fix/group';
 import type { FilePatch } from '@/lib/fix/patch';
-import type { BuildResult } from '@/lib/verify/build';
+import { buildGate, type BuildResult } from '@/lib/verify/build';
 import type { RecheckReport } from '@/lib/verify/recheck';
 import { pullRequestGate, type TestRunResult } from '@/lib/verify/tests';
 import {
@@ -150,18 +156,31 @@ function lead(
   findingCount: number,
 ): string {
   const target = input.targetUrl ? ` on ${input.targetUrl}` : '';
-  const gate = pullRequestGate(input.tests);
+  const tests = pullRequestGate(input.tests);
+  const build = buildGate(input.build);
 
   const opening =
     `This pull request fixes ${countNoun(findingCount, 'accessibility finding')} against ` +
     `${countNoun(criteria.length, 'WCAG 2.2 Level A/AA success criterion', 'WCAG 2.2 Level A/AA success criteria')}, ` +
     `found by auditing the deployed application${target}.`;
 
+  // Each half says what actually happened. "The patched tree builds" is a claim
+  // about a compiler having run, and a repository with no build script never ran
+  // one — saying so is the difference between evidence and a formality.
+  const buildSentence = build.unproven
+    ? 'This repository defines no build script, so nothing was compiled — the dependencies ' +
+      'install and that is all that was proven.'
+    : 'The patched tree builds.';
+  const testSentence = tests.unproven
+    ? input.tests.command
+      ? `Its test runner was invoked and found no tests (\`${input.tests.command}\`), so the ` +
+        'suite proved nothing either. That is stated here rather than presented as a pass.'
+      : 'This repository has no unit test suite, so nothing else ran — which is stated here ' +
+        'rather than presented as a pass.'
+    : "This repository's own test suite still passes.";
+
   const verified = [
-    gate.unproven
-      ? 'The patched tree builds. This repository has no unit test suite, so nothing else ran — ' +
-        'which is stated here rather than presented as a pass.'
-      : "The patched tree builds and this repository's own test suite still passes.",
+    `${buildSentence} ${testSentence}`,
     input.recheck.outcomes.length > 0
       ? `Each fixed criterion was then re-checked against the patched build: ${input.recheck.summary}`
       : '',
@@ -276,14 +295,17 @@ function criteriaSection(
 
 function verificationSection(input: ComposePullRequestInput): string {
   const gate = pullRequestGate(input.tests);
+  const build = buildGate(input.build);
   const lines = [
     '## Verification',
     '',
     '| Check | Result |',
     '| --- | --- |',
-    `| Build (4 CPU / 8 GB sandbox) | ${input.build.ok ? '✅ passed' : '❌ failed'} — ${oneLine(input.build.summary, 220)} |`,
+    `| Build (4 CPU / 8 GB sandbox) | ${
+      !input.build.ok ? '❌ failed' : build.unproven ? '➖ nothing to build' : '✅ passed'
+    } — ${oneLine(input.build.summary, 220)} |`,
     `| Target's own test suite | ${
-      input.tests.skipped ? '➖ none defined' : input.tests.ok ? '✅ passed' : '❌ failed'
+      input.tests.skipped ? '➖ nothing ran' : input.tests.ok ? '✅ passed' : '❌ failed'
     } — ${oneLine(input.tests.summary, 220)} |`,
     `| Criterion re-check | ${
       input.recheck.unresolvedFindingIds.length === 0 ? '✅' : '⚠️'
@@ -307,10 +329,22 @@ function verificationSection(input: ComposePullRequestInput): string {
     );
   }
 
-  if (gate.unproven) {
+  if (gate.unproven || build.unproven) {
+    const standing = build.unproven
+      ? 'Neither a compiler nor a test suite'
+      : 'Nothing but the build';
     lines.push(
-      '> **Read this before merging.** Nothing but the build stands behind these changes in this ' +
+      `> **Read this before merging.** ${standing} stands behind these changes in this ` +
         'repository. Give the diff the attention you would give an unverified change.',
+      '',
+    );
+  }
+
+  if (!input.build.installReproducible) {
+    lines.push(
+      '> Dependencies were installed with `npm install` rather than `npm ci`: this repository’s ' +
+        'lockfile has drifted from its `package.json`, so the tree that built is not the tree ' +
+        'the lockfile pins. That is a pre-existing condition, not something this diff changed.',
       '',
     );
   }
@@ -417,8 +451,14 @@ function footer(input: ComposePullRequestInput): string {
 
 export interface OpenVerifiedPullRequestInput extends ComposePullRequestInput {
   readonly repo: RepoLike;
-  /** The commit already pushed to the head branch. */
-  readonly commit?: CommitResult;
+  /**
+   * The commit already pushed to the head branch. Required: the build and the
+   * test suite were run against local patched files, and this is the only thing
+   * tying that evidence to what is actually on GitHub. Without it a pull request
+   * could be opened from a stale or unrelated branch tip while the body claims
+   * a verification that was performed on something else.
+   */
+  readonly commit: CommitResult;
   readonly draft?: boolean;
   readonly reviewers?: readonly string[];
   readonly labels?: readonly string[];
@@ -432,14 +472,23 @@ export interface OpenedPullRequest {
 /**
  * The only sanctioned path to `GitHubClient.openPullRequest`.
  *
- * Three gates, in order, and every one of them is a hard stop:
+ * Five gates, in order, and every one of them is a hard stop:
  *
  *  1. A6.4 — the target's own test suite must not have failed.
- *  2. A6.1 — the patched tree must have built.
- *  3. A7.1 — a human must have approved this exact request.
+ *  2. A6.1 — the patched tree must have built. A repository with no build script
+ *     is allowed through as unproven, but not alongside an unproven suite: if
+ *     nothing compiled *and* nothing tested, no evidence exists and the run has
+ *     nothing to stand a pull request on.
+ *  3. The commit under review must be the one that was verified — same branch,
+ *     same files.
+ *  4. A7.1 — a human must have approved this exact operation, compared field by
+ *     field rather than by request id.
+ *  5. The remote head must still be at that commit at the moment of writing.
  *
- * The approval is checked last on purpose: nobody should be asked to approve a
- * pull request that the run had already disqualified.
+ * The approval is checked late on purpose: nobody should be asked to approve a
+ * pull request that the run had already disqualified. The remote head check is
+ * checked later still, immediately before the create call, so nothing can move
+ * the branch between the check and the write.
  */
 export async function openVerifiedPullRequest(
   client: GitHubClient,
@@ -447,16 +496,27 @@ export async function openVerifiedPullRequest(
   approval: ApprovalRequest,
   decision: GateDecision | null | undefined,
 ): Promise<OpenedPullRequest> {
-  const gate = pullRequestGate(input.tests);
-  if (!gate.allowed) {
-    throw new GitHubError('openVerifiedPullRequest', gate.reason, undefined);
+  const tests = pullRequestGate(input.tests);
+  if (!tests.allowed) {
+    throw new GitHubError('openVerifiedPullRequest', tests.reason, undefined);
   }
-  if (!input.build.ok) {
+
+  const build = buildGate(input.build);
+  if (!build.allowed) {
     throw new GitHubError(
       'openVerifiedPullRequest',
-      `The patched tree did not build, so no pull request is opened. ${input.build.summary}`,
+      `${build.reason} No pull request is opened.`,
     );
   }
+  if (build.unproven && tests.unproven) {
+    throw new GitHubError(
+      'openVerifiedPullRequest',
+      'Nothing verified this patch: this repository defines neither a build script nor a unit ' +
+        'test suite, so no pull request is opened. ' +
+        `${build.reason} ${tests.reason}`,
+    );
+  }
+
   if (approval.action !== 'open-pull-request') {
     throw new GitHubError(
       'openVerifiedPullRequest',
@@ -464,19 +524,71 @@ export async function openVerifiedPullRequest(
     );
   }
 
-  // A7.1. Throws ApprovalRequiredError when there is no explicit yes.
-  assertApproved(approval, decision);
-
   const composition = composePullRequest(input);
-  const pullRequest = await client.openPullRequest(input.repo, {
-    head: composition.branch,
+
+  // The build and the tests ran over local files. This is where that evidence is
+  // tied to the bytes on GitHub: same branch, and the same file set the patches
+  // describe.
+  if (input.commit.branch !== composition.branch) {
+    throw new GitHubError(
+      'openVerifiedPullRequest',
+      `The verified commit is on "${input.commit.branch}", but the pull request would be ` +
+        `opened from "${composition.branch}".`,
+    );
+  }
+  const committed = [...input.commit.files].sort();
+  const patched = input.patches.map((patch) => patch.filePath).sort();
+  if (
+    committed.length !== patched.length ||
+    committed.some((path, index) => path !== patched[index])
+  ) {
+    throw new GitHubError(
+      'openVerifiedPullRequest',
+      `The commit on "${composition.branch}" carries ${committed.length} file(s), but this ` +
+        `pull request describes ${patched.length}. It is not the change that was verified.`,
+    );
+  }
+
+  const operation: ApprovalOperation = {
+    action: 'open-pull-request',
+    repoFullName: input.repoFullName,
+    branch: composition.branch,
     base: input.baseBranch,
     title: composition.title,
-    body: composition.body,
-    draft: input.draft ?? false,
-    ...(input.reviewers ? { reviewers: input.reviewers } : {}),
-    ...(input.labels ? { labels: input.labels } : { labels: ['accessibility'] }),
-  });
+    files: fileDigests(
+      input.patches.map((patch) => ({ path: patch.filePath, contents: patch.newContents })),
+    ),
+    commitSha: input.commit.commitSha,
+  };
+
+  // A7.1. Throws ApprovalRequiredError when there is no explicit yes, and when
+  // the yes on hand was given for some other repository, branch, title, commit
+  // or set of bytes.
+  assertApproved(approval, decision, operation);
+
+  const head = await client.getBranchSha(input.repo, composition.branch);
+  if (head !== input.commit.commitSha) {
+    throw new GitHubError(
+      'openVerifiedPullRequest',
+      `\`${composition.branch}\` is at ${head ?? 'no commit'}, not at the verified commit ` +
+        `${input.commit.commitSha}. Something moved the branch after it was checked, so the ` +
+        'pull request would not be the change that passed.',
+    );
+  }
+
+  const pullRequest = await client.openPullRequest(
+    input.repo,
+    {
+      head: composition.branch,
+      base: input.baseBranch,
+      title: composition.title,
+      body: composition.body,
+      draft: input.draft ?? false,
+      ...(input.reviewers ? { reviewers: input.reviewers } : {}),
+      ...(input.labels ? { labels: input.labels } : { labels: ['accessibility'] }),
+    },
+    { approval, decision },
+  );
 
   return { pullRequest, composition };
 }

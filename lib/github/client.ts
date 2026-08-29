@@ -11,9 +11,25 @@
  * than the contents endpoint, because a patch set is several files and a
  * per-file commit would leave the branch in a half-fixed state if the process
  * died between them. One commit, one ref update, or nothing.
+ *
+ * Every write here takes a `WriteAuthorization` and refuses without one (A7.1).
+ * A comment saying "callers should go through `openVerifiedPullRequest`" is a
+ * convention, and a convention is not a gate — anything holding a token could
+ * call straight past it. The three methods that change a repository therefore
+ * check the human's approval against the operation they are about to perform,
+ * at the boundary, where it cannot be skipped.
  */
 
 import { Octokit } from '@octokit/rest';
+
+import {
+  assertApproved,
+  fileDigests,
+  type ApprovalOperation,
+  type ApprovalRequest,
+  type GateDecision,
+  type WriteAction,
+} from '@/lib/fix/gate';
 
 /* -------------------------------------------------------------------------- */
 /* Types                                                                      */
@@ -86,6 +102,79 @@ export interface CommitFilesInput {
   readonly files: readonly CommitFile[];
   /** Commit onto this SHA instead of the branch tip. */
   readonly parentSha?: string;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Authorization (A7.1)                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The human's yes, carried to the write that needs it.
+ *
+ * Both halves are required: the request says what was asked, the decision says
+ * what was answered, and neither alone authorises anything.
+ */
+export interface WriteAuthorization {
+  readonly approval: ApprovalRequest;
+  readonly decision: GateDecision | null | undefined;
+}
+
+/**
+ * Refuse the write unless a human approved this exact operation.
+ *
+ * `expected` carries only the fields this particular call can establish from its
+ * own arguments; anything omitted is taken from the approval, and so compares
+ * equal. That is deliberate rather than a hole — `createBranch` cannot know
+ * which bytes a later commit will carry, so it binds the repository and the
+ * branch, and `commitFiles` binds the file digests where the bytes actually
+ * exist. Every field is checked by whichever call is in a position to check it.
+ */
+function authorize(
+  operation: string,
+  authorization: WriteAuthorization | undefined,
+  accepted: readonly WriteAction[],
+  expected: Partial<Omit<ApprovalOperation, 'action'>> & { readonly repoFullName: string },
+): void {
+  if (!authorization) {
+    throw new GitHubError(
+      operation,
+      'Refusing to write to a repository without a human approval (A7.1). ' +
+        'Build one with `lib/fix/gate.ts` and pass it here.',
+    );
+  }
+
+  const { approval, decision } = authorization;
+  if (!accepted.includes(approval.action)) {
+    throw new GitHubError(
+      operation,
+      `The approval on hand is for "${approval.action}", not for ${accepted
+        .map((action) => `"${action}"`)
+        .join(' or ')}.`,
+    );
+  }
+
+  const approved = approval.operation;
+  assertApproved(approval, decision, {
+    action: approval.action,
+    repoFullName: expected.repoFullName,
+    branch: expected.branch !== undefined ? expected.branch : approved.branch,
+    base: expected.base !== undefined ? expected.base : approved.base,
+    title: expected.title !== undefined ? expected.title : approved.title,
+    files: expected.files !== undefined ? expected.files : approved.files,
+    commitSha: expected.commitSha !== undefined ? expected.commitSha : approved.commitSha,
+  });
+}
+
+/** The digests `ApprovalOperation.files` carries, for a commit's file set. */
+function digestsOf(files: readonly CommitFile[]): string[] {
+  return fileDigests(
+    files.map((file) => ({ path: normalizePath(file.path), contents: file.contents })),
+  );
+}
+
+function repoFullNameOf(repo: RepoLike): string {
+  const { owner, repo: name } = asRepo(repo);
+  return `${owner}/${name}`;
 }
 
 /** Anything the GitHub API refused, with the status that says why. */
@@ -259,13 +348,23 @@ export class GitHubClient {
    *
    * Reuse rather than failure is deliberate: a run that was interrupted after
    * pushing but before opening the pull request has to be able to resume (A12).
+   *
+   * A7.1: a branch is a write, so it needs the human's yes for this repository
+   * and this branch name before anything reaches the remote.
    */
   async createBranch(
     repo: RepoLike,
     branch: string,
+    authorization: WriteAuthorization,
     fromRef?: string,
   ): Promise<BranchResult> {
     const { owner, repo: name } = asRepo(repo);
+    authorize('createBranch', authorization, ['push-branch'], {
+      repoFullName: repoFullNameOf(repo),
+      branch,
+      ...(fromRef === undefined ? {} : { base: fromRef }),
+    });
+
     const base = fromRef ?? (await this.getDefaultBranch(repo));
 
     const existing = await this.getBranchSha(repo, branch);
@@ -322,13 +421,28 @@ export class GitHubClient {
    * Blobs, then a tree layered on the parent commit's tree, then a commit, then
    * one ref update. Every file lands together or none of them do, so a branch
    * never carries half a fix.
+   *
+   * A7.1: this is the call that writes the bytes, so it is the call that binds
+   * them — the approval's file digests must match the contents about to be
+   * committed, not merely their paths or their count. A branch approval covers
+   * it, because its prose already says which files are going onto the branch.
    */
-  async commitFiles(repo: RepoLike, input: CommitFilesInput): Promise<CommitResult> {
+  async commitFiles(
+    repo: RepoLike,
+    input: CommitFilesInput,
+    authorization: WriteAuthorization,
+  ): Promise<CommitResult> {
     const { owner, repo: name } = asRepo(repo);
 
     if (input.files.length === 0) {
       throw new GitHubError('commitFiles', 'Refusing to create an empty commit.');
     }
+
+    authorize('commitFiles', authorization, ['commit-files', 'push-branch'], {
+      repoFullName: repoFullNameOf(repo),
+      branch: input.branch,
+      files: digestsOf(input.files),
+    });
 
     try {
       const parentSha = input.parentSha ?? (await this.requireBranchSha(repo, input.branch));
@@ -400,16 +514,25 @@ export class GitHubClient {
   /**
    * Open the pull request.
    *
-   * The last irreversible step in the run, and the one A7.1 pauses before.
-   * Nothing in this class enforces that pause — `lib/fix/gate.ts` does, and
-   * `openVerifiedPullRequest` in `./pr.ts` is the only call site that should
-   * reach this method.
+   * The last irreversible step in the run, and the one A7.1 pauses before. The
+   * pause is enforced here as well as in `openVerifiedPullRequest`: that
+   * function is the only path that also checks the build and the test suite,
+   * but this method must not be reachable without an approval either, or the
+   * gate would be a convention rather than a rule.
    */
   async openPullRequest(
     repo: RepoLike,
     input: OpenPullRequestInput,
+    authorization: WriteAuthorization,
   ): Promise<PullRequestResult> {
     const { owner, repo: name } = asRepo(repo);
+    authorize('openPullRequest', authorization, ['open-pull-request'], {
+      repoFullName: repoFullNameOf(repo),
+      branch: input.head,
+      base: input.base,
+      title: input.title,
+    });
+
     try {
       const { data } = await this.octokit.rest.pulls.create({
         owner,
@@ -527,27 +650,36 @@ export function getFileContents(
   return resolve(auth).getFileContents(repo, path, ref);
 }
 
+/*
+ * The three write forms take the human's approval as a required argument. It is
+ * not a convenience the caller may drop: the type is what makes "no repository
+ * write without a human" checkable at compile time rather than hoped for.
+ */
+
 export function createBranch(
   auth: GitHubAuth,
   repo: RepoLike,
   branch: string,
+  authorization: WriteAuthorization,
   fromRef?: string,
 ): Promise<BranchResult> {
-  return resolve(auth).createBranch(repo, branch, fromRef);
+  return resolve(auth).createBranch(repo, branch, authorization, fromRef);
 }
 
 export function commitFiles(
   auth: GitHubAuth,
   repo: RepoLike,
   input: CommitFilesInput,
+  authorization: WriteAuthorization,
 ): Promise<CommitResult> {
-  return resolve(auth).commitFiles(repo, input);
+  return resolve(auth).commitFiles(repo, input, authorization);
 }
 
 export function openPullRequest(
   auth: GitHubAuth,
   repo: RepoLike,
   input: OpenPullRequestInput,
+  authorization: WriteAuthorization,
 ): Promise<PullRequestResult> {
-  return resolve(auth).openPullRequest(repo, input);
+  return resolve(auth).openPullRequest(repo, input, authorization);
 }
