@@ -65,12 +65,13 @@ export default async function LandingPage() {
         <div className="landing-hero">
           <div className="landing-copy">
             <h1>
-              A blind user opens your menu.
+              Find and fix your
               <br />
-              <em>Their screen reader says nothing happened.</em>
+              <em>accessibility bugs.</em>
             </h1>
             <p className="landing-lede">
-              AccessiFix finds bugs like that, writes the fix, and opens a pull request.
+              Connect your repo. AccessiFix clicks through your site in 40 browsers, finds
+              what is broken for disabled users, and opens a pull request with the fix.
             </p>
 
             {/* Auth.js route handler, not an app route: a real navigation is required. */}
