@@ -7,47 +7,39 @@ import { BrandMark, Icon } from "@/components/Icon";
 export const metadata: Metadata = {
   title: "AccessiFix",
   description:
-    "Spins up a fleet of real browsers, clicks everything, and finds the accessibility bugs scanners cannot see.",
+    "Finds the accessibility bugs that break your site for blind users, fixes them, and opens a pull request.",
 };
 
 /**
- * Four cards, one line each.
- *
- * `code` is the only place a card carries evidence, and only card 2 has it:
- * the real Clearway finding, unedited. Everything else is one short sentence,
- * because a visitor decides in about four seconds and prose does not help.
+ * The four cards are the actual workflow, in order, in the user's words.
+ * One short sentence each. A visitor decides in about four seconds.
  */
 interface Step {
   readonly n: string;
   readonly title: string;
   readonly body: string;
-  /** Only card 3 carries evidence. */
-  readonly code?: readonly [string, string];
-  readonly dark?: boolean;
 }
 
 const STEPS: readonly Step[] = [
   {
     n: "1",
-    title: "Spins up 40 browsers",
-    body: "One real Chromium per interaction, all at once.",
+    title: "Connect your repo",
+    body: "Point it at your GitHub repository and your live site.",
   },
   {
     n: "2",
-    title: "Clicks everything",
-    body: "Reads what a screen reader is told, before and after.",
+    title: "It clicks through everything",
+    body: "40 real browsers at once, checking all 55 WCAG rules.",
   },
   {
     n: "3",
-    title: "Catches the lie",
-    code: ["menu opened: 98 new items", "button still says: closed"],
-    body: "A blind user is told nothing happened.",
-    dark: true,
+    title: "It writes the fix",
+    body: "Patches your code, then runs your own tests to prove nothing broke.",
   },
   {
     n: "4",
-    title: "Fixes it, asks you",
-    body: "Patches your code, runs your tests, opens a PR.",
+    title: "You approve the PR",
+    body: "Nothing reaches your repository until you say yes.",
   },
 ];
 
@@ -70,41 +62,50 @@ export default async function LandingPage() {
       </header>
 
       <main id="main-content" className="landing-main">
-        <div className="landing-copy">
-          <h1>
-            Scanners read one still page.
-            <br />
-            <em>We click everything.</em>
-          </h1>
-          <p className="landing-lede">
-            Most accessibility bugs only show up after an interaction. AccessiFix runs a
-            fleet of real browsers, drives your interface, and fixes what it finds.
-          </p>
+        <div className="landing-hero">
+          <div className="landing-copy">
+            <h1>
+              A blind user opens your menu.
+              <br />
+              <em>Their screen reader says nothing happened.</em>
+            </h1>
+            <p className="landing-lede">
+              AccessiFix finds bugs like that, writes the fix, and opens a pull request.
+            </p>
 
-          {/* Auth.js route handler, not an app route: a real navigation is required. */}
-          {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
-          <a className="button primary large" href="/api/auth/signin?callbackUrl=%2Fapp">
-            <Icon name="github" size={18} />
-            Sign in with GitHub
-          </a>
+            {/* Auth.js route handler, not an app route: a real navigation is required. */}
+            {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
+            <a className="button primary large" href="/api/auth/signin?callbackUrl=%2Fapp">
+              <Icon name="github" size={18} />
+              Sign in with GitHub
+            </a>
+          </div>
+
+          {/*
+            The real finding from a live SSDI benefits application. Not a mockup:
+            the menu grew by 98 nodes while the button kept reporting "closed".
+          */}
+          <figure className="landing-evidence">
+            <figcaption>Found on a real benefits site</figcaption>
+            <div className="evidence-row">
+              <span>menu opened</span>
+              <strong>98 new items</strong>
+            </div>
+            <div className="evidence-row is-bad">
+              <span>button still says</span>
+              <strong>closed</strong>
+            </div>
+            <p>WCAG 4.1.2 · Name, Role, Value</p>
+          </figure>
         </div>
 
         <ol className="landing-proof">
           {STEPS.map((step) => (
-            <li key={step.n} className={`proof-module${step.dark ? " is-dark" : ""}`}>
+            <li key={step.n} className="proof-module">
               <span className="proof-n" aria-hidden="true">
                 {step.n}
               </span>
               <h2>{step.title}</h2>
-              {step.code ? (
-                <p>
-                  <code>
-                    {step.code[0]}
-                    <br />
-                    {step.code[1]}
-                  </code>
-                </p>
-              ) : null}
               <p>{step.body}</p>
             </li>
           ))}
@@ -112,8 +113,7 @@ export default async function LandingPage() {
       </main>
 
       <footer className="landing-footer">
-        Every finding cites a numbered WCAG criterion and carries evidence. Never claims a
-        conformance level.
+        Every finding cites a numbered WCAG criterion and carries evidence.
       </footer>
     </div>
   );
