@@ -1,4 +1,7 @@
 import type { Metadata } from "next";
+import { redirect } from "next/navigation";
+
+import { auth } from "@/auth";
 import Link from "next/link";
 import { BrandMark, Icon } from "@/components/Icon";
 
@@ -6,7 +9,14 @@ export const metadata: Metadata = {
   title: { absolute: "AccessiFix — accessibility auditing that walks the state machine" },
 };
 
-export default function LandingPage() {
+export default async function LandingPage() {
+  /*
+   * A signed-in visitor asking for the landing page wants their workspace, not
+   * a pitch and a sign-in button they have already used.
+   */
+  const session = await auth();
+  if (session?.user) redirect("/app");
+
   return (
     <div className="landing-page">
       <header className="landing-header">
@@ -30,7 +40,7 @@ export default function LandingPage() {
           <div className="landing-actions">
             {/* Auth.js route handler, not an app route: a real navigation is required. */}
             {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
-            <a className="button primary large" href="/api/auth/signin">
+            <a className="button primary large" href="/api/auth/signin?callbackUrl=%2Fapp">
               <Icon name="github" size={18} />
               Sign in with GitHub
             </a>
