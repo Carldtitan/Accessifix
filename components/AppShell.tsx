@@ -4,6 +4,7 @@ import Link from "next/link";
 import { usePathname } from "next/navigation";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { BrandMark, Icon, type IconName } from "./Icon";
+import { signOutAction } from "@/app/(app)/actions";
 
 const navItems: ReadonlyArray<{ label: string; href: string; icon: IconName }> = [
   { label: "Overview", href: "/app", icon: "home" },
@@ -161,11 +162,12 @@ export function AppShell({
           </Link>
 
           {/*
-            A real POST, not a link. Sign-out changes server state, and Auth.js
-            requires the CSRF-protected POST route - a GET here would either be
-            prefetched by the router or fail the check.
+            A server action, not a hand-rolled POST to /api/auth/signout. That
+            route needs a CSRF token this client component cannot obtain, and
+            posting without it fails with MissingCSRF and redirects to the
+            sign-in page with an error - which reads as a broken sign-in.
           */}
-          <form action="/api/auth/signout" method="post" className="signout-form">
+          <form action={signOutAction} className="signout-form">
             <button className="signout-button" type="submit" onClick={closeMenu}>
               <Icon name="back" size={15} />
               <span>Sign out</span>
