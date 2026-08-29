@@ -185,7 +185,7 @@ async function ensureOneProvider(
       auth: { api_key: apiKey },
       models: [...wanted],
     };
-    const created = await createOrUpdate(client, manifest, options.signal);
+    const created = await createOrUpdate(client, manifest, wanted, apiKey, options.signal);
     return {
       provider: plan.type,
       action: created.action,
@@ -195,8 +195,7 @@ async function ensureOneProvider(
 
   // Already configured. Keep every model that is there and add only what the
   // roster is missing, so a hand-tuned provider is never clobbered.
-  const present = new Set(existing.manifest.models.map((model) => model.name));
-  const missing = wanted.filter((model) => !present.has(model.name));
+  const missing = missingModels(existing, wanted);
   const rotate = options.rotateKeys === true && apiKey.length > 0;
   if (missing.length === 0 && !rotate) {
     return { provider: plan.type, action: "unchanged", models: fqns(existing) };
@@ -213,13 +212,10 @@ async function ensureOneProvider(
     };
   }
 
-  const manifest: ModelProviderManifest = {
-    type: plan.type,
-    auth: { api_key: apiKey },
-    models: [...existing.manifest.models, ...missing],
-    ...(existing.manifest.base_url ? { base_url: existing.manifest.base_url } : {}),
-  };
-  const updated = await client.updateModelProvider(manifest, options.signal);
+  const updated = await client.updateModelProvider(
+    mergedManifest(existing, wanted, apiKey),
+    options.signal,
+  );
   const notes = [
     missing.length > 0 ? `added ${missing.map((model) => model.name).join(", ")}` : null,
     rotate ? `rotated the key from ${plan.envVar}` : null,
@@ -232,22 +228,69 @@ async function ensureOneProvider(
   };
 }
 
+/** Roster models the provider does not already carry. */
+function missingModels(
+  existing: ConfiguredModelProvider,
+  wanted: readonly ConfiguredModel[],
+): ConfiguredModel[] {
+  const present = new Set(existing.manifest.models.map((model) => model.name));
+  return wanted.filter((model) => !present.has(model.name));
+}
+
+/**
+ * The provider as it stands plus only the roster models it lacks. Spreading
+ * the stored manifest keeps `base_url` and any hand-tuned field the server
+ * reports, so an update never quietly narrows someone else's configuration.
+ */
+function mergedManifest(
+  existing: ConfiguredModelProvider,
+  wanted: readonly ConfiguredModel[],
+  apiKey: string,
+): ModelProviderManifest {
+  return {
+    ...existing.manifest,
+    auth: { ...existing.manifest.auth, api_key: apiKey },
+    models: [...existing.manifest.models, ...missingModels(existing, wanted)],
+  };
+}
+
 /**
  * POST, falling back to PUT on 409. Another process may have registered the
  * provider between our list and our create; that is a race, not an error.
+ *
+ * The loser of that race must not PUT the manifest it built before the race:
+ * PUT replaces, so the winner's extra models and `base_url` would be dropped.
+ * Re-read what the winner registered and merge into it, exactly as the
+ * ordinary existing-provider path does.
  */
 async function createOrUpdate(
   client: TrueForgeClient,
   manifest: ModelProviderManifest,
+  wanted: readonly ConfiguredModel[],
+  apiKey: string,
   signal?: AbortSignal,
 ): Promise<{ provider: ConfiguredModelProvider; action: ProviderAction }> {
   try {
     return { provider: await client.createModelProvider(manifest, signal), action: "created" };
   } catch (error) {
-    if (error instanceof TrueForgeError && error.status === 409) {
+    if (!(error instanceof TrueForgeError) || error.status !== 409) throw error;
+
+    const winner = (await client.listModelProviders(signal)).find(
+      (provider) => provider.manifest.type === manifest.type,
+    );
+    if (!winner) {
+      // It answered 409 and then did not list it. Nothing to preserve.
       return { provider: await client.updateModelProvider(manifest, signal), action: "updated" };
     }
-    throw error;
+    if (missingModels(winner, wanted).length === 0) {
+      // The winner already registered everything the roster needs. Writing
+      // now would only overwrite their key with ours for no gain.
+      return { provider: winner, action: "unchanged" };
+    }
+    return {
+      provider: await client.updateModelProvider(mergedManifest(winner, wanted, apiKey), signal),
+      action: "updated",
+    };
   }
 }
 
