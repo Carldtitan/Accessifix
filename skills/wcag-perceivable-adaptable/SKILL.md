@@ -14,9 +14,9 @@ Lanes: VIS and ACT. Both own all four, and they do different halves of the job.
 **ACT reproduces the condition and captures the artefact** - sets the viewport,
 applies the zoom or the CSS override, rotates the device, saves a screenshot to
 the sandbox and references it by path. **VIS judges the resulting screenshot.**
-If you are ACT and cannot reach the condition, report BLOCKED rather than
-reasoning about what would probably happen. If you are VIS and were handed no
-artefact taken under the condition, do not rule from the default screenshot.
+ACT that cannot reach the condition reports BLOCKED rather than reasoning about
+what would probably happen; VIS handed no artefact taken under the condition
+does not rule from the default screenshot.
 
 All four criteria are DECIDE.
 
@@ -36,13 +36,13 @@ are excluded.
 
 1. Set the viewport to 1280 x 1024 at device pixel ratio 1.
 2. Apply **text-only** zoom to 200%. Page zoom is a different criterion. Where
-   the browser offers no text-only zoom, reproduce it by doubling the root font
-   size and say in `detail` that you did:
+   the browser offers no text-only zoom, double the root font size and say in
+   `detail` that you did:
    ```css
    html { font-size: 200% !important; }
    ```
-   A page sized entirely in `px` will not respond at all, and that
-   non-response is itself the finding.
+   A page sized entirely in `px` will not respond at all, and that non-response
+   is itself the finding.
 3. Screenshot the full page, then each dense region - navigation, cards, tables,
    buttons, form labels, validation messages.
 4. Look for text clipped by a fixed `height` or `max-height`, `overflow: hidden`
@@ -59,7 +59,6 @@ are excluded.
 - A validation message truncated to "Enter a valid pos..." with no way to read
   the rest.
 - A modal with a fixed pixel height whose action buttons scroll out of reach.
-- Labels overlapping their inputs so the field cannot be identified.
 - A page that ignores text size entirely because every size is `px` in a fixed
   layout, so a user needing larger text gets none.
 
@@ -67,10 +66,8 @@ are excluded.
 
 - Vertical scrolling appearing or increasing. That is the expected result of
   larger text, not loss of content.
-- A responsive layout switching to its mobile arrangement at 200%. Reflow is
-  correct behaviour.
-- Longer wrapping, ragged edges, an orphan or a widow. Aesthetic, not content
-  loss.
+- A responsive layout switching to its mobile arrangement at 200%.
+- Longer wrapping, ragged edges, an orphan or a widow. Aesthetic, not loss.
 - Images not scaling with the text. This criterion covers text.
 - Captions over video, and images of text. Both excluded.
 - A data table gaining its own horizontal scrollbar while the page does not.
@@ -89,12 +86,10 @@ reverse. The exception is content genuinely requiring a two-dimensional layout.
 
 ### How to test it
 
-1. Reproduce it either way - the two are equivalent:
-   - viewport **320 x 256 CSS px**, or
-   - viewport **1280 x 1024** with **400% page zoom**.
-
-   Use `deviceScaleFactor: 1` and do not enable mobile emulation, which can serve
-   a different page and hide the failure.
+1. Reproduce it either way - the two are equivalent: viewport **320 x 256 CSS
+   px**, or viewport **1280 x 1024** with **400% page zoom**. Use
+   `deviceScaleFactor: 1` and do not enable mobile emulation, which can serve a
+   different page and hide the failure.
 2. Load, wait for layout to settle, screenshot the full page.
 3. Test for horizontal scroll by measurement, not by eye: compare
    `document.documentElement.scrollWidth` against `window.innerWidth`. More than
@@ -102,10 +97,9 @@ reverse. The exception is content genuinely requiring a two-dimensional layout.
 4. Identify the element causing the overflow - a fixed `width` in px, a
    `min-width`, a wide image, a long unbroken string, an absolutely positioned
    panel.
-5. Check that nothing was **lost** rather than merely rearranged. Navigation
-   collapsed into a menu button is fine when the menu opens with the same items.
-6. Open every disclosure, menu and dialog at this width. A dialog wider than the
-   viewport fails even when the page behind it is clean.
+5. Check that nothing was **lost** rather than merely rearranged, and open every
+   disclosure, menu and dialog at this width. A dialog wider than the viewport
+   fails even when the page behind it is clean.
 
 ### Genuine failure
 
@@ -113,11 +107,10 @@ reverse. The exception is content genuinely requiring a two-dimensional layout.
 - A fixed 280px sidebar pushing the main column off-screen.
 - A pricing layout on fixed pixel grid columns that overflows and is not a data
   table.
-- A long unbroken string - an API key, a URL - with no `overflow-wrap`, extending
-  the document's scroll width.
+- A long unbroken string - an API key, a URL - with no `overflow-wrap`,
+  extending the document's scroll width.
 - A cookie banner or chat widget with a fixed width wider than the viewport.
 - A form whose inputs carry `width: 400px`.
-- A modal dialog overflowing horizontally while the page beneath reflows.
 
 ### False positive - do not report
 
@@ -129,8 +122,7 @@ reverse. The exception is content genuinely requiring a two-dimensional layout.
 - A toolbar in a code editor or similar authoring interface, where the
   two-dimensional arrangement is required for use.
 - Navigation collapsing into a menu button, when the menu opens and nothing is
-  lost.
-- Content behind a working "Show more" control at narrow widths.
+  lost, or content behind a working "Show more" control.
 - A one or two pixel `scrollWidth` overhang from rounding or a scrollbar.
   Confirm the overflow is real before reporting it.
 
@@ -166,7 +158,7 @@ the font size. The page need not apply these values. It must survive them.
 4. Inspect the usual victims: fixed-height buttons, single-line nav items,
    badges and pills, table cells, tab strips, titles capped with
    `-webkit-line-clamp`, containers with `height` rather than `min-height`.
-5. Confirm the override applied. Text that did not move at all usually means the
+5. Confirm the override applied. Text that did not move usually means the
    injection was blocked by specificity or a Shadow DOM boundary - say so rather
    than reporting a pass.
 
@@ -178,7 +170,6 @@ the font size. The page need not apply these values. It must survive them.
 - A card title with `-webkit-line-clamp: 2` now hiding essential text.
 - Table cells whose content overlaps the row beneath.
 - A badge whose text overflows its rounded background into neighbouring text.
-- A fixed-height footer whose last row of links is cut off.
 - A tab strip whose labels overlap and become unclickable.
 
 ### False positive - do not report
@@ -205,10 +196,9 @@ orientation, portrait or landscape, unless a specific orientation is
 
 1. Load in portrait at 390 x 844 CSS px, then in landscape at 844 x 390 CSS px.
    Screenshot both.
-2. Look for an explicit lock in the CSS - an
-   `@media screen and (orientation: portrait)` block used to hide content or show
-   a "please rotate your device" interstitial, or a `transform: rotate(90deg)`
-   applied to the whole page.
+2. Look for an explicit lock: an `@media screen and (orientation: portrait)`
+   block used to hide content or show a "please rotate your device"
+   interstitial, or a `transform: rotate(90deg)` on the whole page.
 3. Check the web app manifest for `"orientation": "portrait"` or `"landscape"`,
    and the source for `screen.orientation.lock()`.
 4. In each orientation confirm the same content and controls are present and
@@ -222,8 +212,8 @@ orientation, portrait or landscape, unless a specific orientation is
 - A manifest declaring `"orientation": "portrait"` for an ordinary content or
   transactional site.
 - `screen.orientation.lock("landscape")` called on load.
-- Landscape CSS hiding the main navigation entirely, so a user with a
-  wheelchair-mounted device fixed in landscape cannot navigate.
+- Landscape CSS hiding the main navigation, so a user with a wheelchair-mounted
+  device fixed in landscape cannot navigate.
 - A checkout step that renders its payment form only in portrait.
 
 ### False positive - do not report
@@ -251,14 +241,11 @@ orientation, portrait or landscape, unless a specific orientation is
   button unreachable at 320px, a payment form that will not render in landscape -
   is `critical`. A clipped validation message is `serious`. A truncated card
   title in a marketing grid is `moderate`. A clipped footer link is `minor`.
-- Evidence discipline: reference the screenshot you actually captured by its
-  sandbox path and name the CSS declaration causing the failure when you have the
-  styles. Never invent a selector, and never describe a condition you did not
-  reproduce.
+- Evidence discipline: reference the screenshot you captured by its sandbox path
+  and name the CSS declaration causing the failure when you have the styles.
+  Never invent a selector, and never describe a condition you did not reproduce.
 - Verdict: DECIDE when the artefact taken under the condition shows the loss.
   FLAG when the override plainly did not apply, when only part of the page could
   be captured, or when the essential-orientation judgement is arguable. BLOCKED
   when the condition could not be reached - zoom refused, the viewport could not
-  be set, the page would not load at 320px - and say which in `detail`.
-- ACT never rules from imagination and VIS never rules from the default
-  screenshot. With no artefact for the condition, there is no finding to make.
+  be set, the page would not load at 320px.

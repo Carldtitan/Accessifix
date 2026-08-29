@@ -44,7 +44,6 @@ The alternative must be labelled and discoverable from the media itself.
 4. Compare item by item and name what is missing.
 5. Check discoverability. A link next to the player or a disclosure below it
    counts; a file on the server that nothing links to does not.
-6. For video-only, either a transcript or a described audio track satisfies it.
 
 ### Genuine failure
 
@@ -58,7 +57,7 @@ The alternative must be labelled and discoverable from the media itself.
 
 ### False positive - do not report
 
-- A **transcript on a separate linked page**. Acceptable when it is discoverable
+- **A transcript on a separate linked page.** Acceptable when it is discoverable
   and linked from the media; it does not have to be inline.
 - **Decorative background video with no audio and no information** - an abstract
   loop behind a hero heading. Nothing is conveyed, so nothing is owed.
@@ -77,7 +76,7 @@ The alternative must be labelled and discoverable from the media itself.
 Captions for all prerecorded audio content in synchronised media. Captions are
 not a transcript: they are time-synchronised, they identify who is speaking, and
 they label significant non-speech sound. Judge accuracy against what is actually
-said, then speaker identification, then non-speech sound.
+said, then speaker identification, then significant non-speech sound.
 
 ### How to test it
 
@@ -175,10 +174,10 @@ Where that is the situation, report the 1.2.5 finding and not a 1.2.3 one.
 
 1. Reuse the list of visually conveyed information from 1.2.3.
 2. Look specifically for a described audio track - a second track in the player,
-   a described version linked separately, or descriptions already fitted into the
-   original narration.
-3. Play the described track and confirm it covers the visual information and fits
-   the natural pauses.
+   a described version linked separately, or descriptions already fitted into
+   the original narration.
+3. Play the described track and confirm it covers the visual information and
+   fits the natural pauses.
 4. Where the only remedy is a text alternative, that is a 1.2.5 failure even
    though 1.2.3 is satisfied. Say exactly that in `detail` so the reviewer does
    not read it as a duplicate.
