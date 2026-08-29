@@ -390,15 +390,22 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     }
 
     /* ---- 6. Pull request, then the final score -------------------------- */
-    const approved = await pullRequestGate(context, verification.reason);
-    if (!approved) {
+    const gate = await pullRequestGate(context, verification.reason);
+    if (!gate.approved || !gate.requestId) {
       await transition(runId, 'done', {
         reason: 'The pull request was declined. Patches are recorded but nothing was pushed.',
       });
       return;
     }
 
-    await prPhase(context, token, proposed, verification.criteriaFixed);
+    await prPhase(
+      context,
+      token,
+      proposed,
+      verification.criteriaFixed,
+      verification.evidence,
+      gate.requestId,
+    );
     await finalAuditPhase(context, verification.previewUrl ?? context.deployedUrl);
 
     await transition(runId, 'done');
@@ -1040,6 +1047,21 @@ interface VerifyOutcome {
   reason: string;
   criteriaFixed: string[];
   previewUrl: string | null;
+  /**
+   * The evidence `openVerifiedPullRequest` gates on. Carried explicitly rather
+   * than recomputed, because the gates must read what VERIFY actually observed
+   * - and because `passed` and `ran` are different facts. A repository with no
+   * test suite has not failed; it has proven nothing, and conflating the two
+   * would either reject a good patch or open a pull request on no evidence.
+   */
+  evidence: {
+    buildPassed: boolean;
+    buildRan: boolean;
+    testsPassed: boolean;
+    testsRan: boolean;
+    testCommand: string;
+    testSummary: string;
+  };
 }
 
 /**
@@ -1065,6 +1087,17 @@ async function verifyPhase(
       criteriaFixed: Array.isArray(previous.result.criteriaFixed)
         ? (previous.result.criteriaFixed as string[])
         : [],
+      // Recovered from the job row rather than re-derived. `buildRan`/`testsRan`
+      // default true because only a caller that explicitly recorded a step as
+      // not-run should get the softer 'unproven' reading (A6.4).
+      evidence: {
+        buildPassed: Boolean(previous.result.buildPassed),
+        buildRan: previous.result.buildRan !== false,
+        testsPassed: Boolean(previous.result.testsPassed),
+        testsRan: previous.result.testsRan !== false,
+        testCommand: String(previous.result.testCommand ?? ''),
+        testSummary: String(previous.result.testSummary ?? ''),
+      },
       previewUrl:
         typeof previous.result.previewUrl === 'string' ? previous.result.previewUrl : null,
     };
@@ -1136,6 +1169,10 @@ async function verifyPhase(
       result: {
         buildPassed: outcome.buildPassed,
         testsPassed: outcome.testsPassed,
+        buildRan: outcome.buildRan ?? outcome.buildPassed,
+        testsRan: outcome.testsRan ?? outcome.testsPassed,
+        testCommand: outcome.testCommand,
+        testSummary: outcome.testSummary,
         recommendation: outcome.recommendation,
         criteriaFixed,
         previewUrl: outcome.previewUrl ?? null,
@@ -1149,6 +1186,14 @@ async function verifyPhase(
         : `The target's own test suite did not pass (${outcome.testCommand}), so no pull request was opened (A6.4). ${outcome.testSummary}`,
       criteriaFixed,
       previewUrl: outcome.previewUrl ?? null,
+      evidence: {
+        buildPassed: outcome.buildPassed,
+        buildRan: outcome.buildRan ?? outcome.buildPassed,
+        testsPassed: outcome.testsPassed,
+        testsRan: outcome.testsRan ?? outcome.testsPassed,
+        testCommand: outcome.testCommand,
+        testSummary: outcome.testSummary,
+      },
     };
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
@@ -1161,6 +1206,14 @@ async function verifyPhase(
       reason: `Verification could not run: ${reason}. The baseline score stands; no pull request was opened.`,
       criteriaFixed: [],
       previewUrl: null,
+      evidence: {
+        buildPassed: false,
+        buildRan: false,
+        testsPassed: false,
+        testsRan: false,
+        testCommand: '',
+        testSummary: '',
+      },
     };
   }
 }
@@ -1183,7 +1236,7 @@ async function verifyPhase(
 async function pullRequestGate(
   context: PipelineContext,
   verificationSummary: string,
-): Promise<boolean> {
+): Promise<{ approved: boolean; requestId: string | null }> {
   const previous = await findJob(context.runId, 'pr', 'approval');
 
   // The decision was already reached and recorded. Nothing to ask again.
@@ -1199,7 +1252,7 @@ async function pullRequestGate(
       detail: 'Recovered from the ledger rather than asking a second time (A12.2).',
       data: { handoffId: previous.handoffId, resumed: true },
     });
-    return approved;
+    return { approved, requestId: previous.handoffId ?? null };
   }
 
   // A card is already up for this run. Re-enter its wait.
@@ -1271,7 +1324,7 @@ async function pullRequestGate(
     else await skipJob(jobId, decision.response ?? 'Declined by the user.');
   }
 
-  return decision.approved;
+  return { approved: decision.approved, requestId: handoff.id };
 }
 
 async function prPhase(
@@ -1279,6 +1332,8 @@ async function prPhase(
   token: string,
   proposed: StoredPatch[],
   criteriaFixed: string[],
+  evidence: VerifyOutcome['evidence'],
+  approvalRequestId: string,
 ): Promise<void> {
   await runJob(
     { runId: context.runId, phase: 'pr', jobKey: 'open', agent: 'APP' },
@@ -1295,6 +1350,10 @@ async function prPhase(
         // pull request reviewable by Qodo.
         body: buildPullRequestBody(context, proposed, criteria, criteriaFixed),
         patches: proposed.map((patch) => ({ filePath: patch.filePath, diff: patch.diff })),
+        // The gates read this rather than taking the conductor's word (A6.4).
+        verification: evidence,
+        // A7.1: the human decision, bound by id to the request they answered.
+        approval: { requestId: approvalRequestId, approved: true },
       });
 
       await db

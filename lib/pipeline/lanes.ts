@@ -166,7 +166,16 @@ export type VerifyPatches = (input: {
   patches: readonly { id: string; filePath: string; diff: string }[];
 }) => Promise<{
   buildPassed: boolean;
+  /**
+   * Whether a build command actually ran. `buildPassed` cannot carry this on
+   * its own: a repository with no build script fails nothing and compiles
+   * nothing, and "unproven" has to stay distinguishable from "failed" all the
+   * way to the pull-request gate, which treats the two differently.
+   */
+  buildRan: boolean;
   testsPassed: boolean;
+  /** Whether any test actually ran. A missing suite is unproven, never a pass. */
+  testsRan: boolean;
   /** The exact command that was run, e.g. `npm test`. */
   testCommand: string;
   /** Trimmed tail of the output. The full log stays in the sandbox (A9.2). */
@@ -192,6 +201,28 @@ export type OpenPullRequest = (input: {
   title: string;
   body: string;
   patches: readonly { filePath: string; diff: string }[];
+  /**
+   * Verification evidence. The gates in `openVerifiedPullRequest` read this
+   * rather than taking the conductor's word: a failing suite is a hard stop,
+   * and an unproven build plus an unproven suite is no evidence at all.
+   */
+  verification?: {
+    buildPassed: boolean;
+    /**
+     * False when no build script ran. Omitted, it is inferred from
+     * `buildPassed`, which cannot tell an absent build from a failed one — so a
+     * caller with the fact should say so and let the gate read it correctly.
+     */
+    buildRan?: boolean;
+    testsPassed: boolean;
+    /** False when no suite ran, or one ran and found nothing. Unproven, not a pass. */
+    testsRan?: boolean;
+    testCommand?: string;
+    testSummary?: string;
+  };
+  /** A7.1: the human decision. Absent or unapproved means refuse. */
+  approval?: { requestId: string; approved: boolean };
+  signal?: AbortSignal;
 }) => Promise<{ url: string; number: number; branch: string }>;
 
 /* -------------------------------------------------------------------------- */
@@ -218,10 +249,30 @@ import { enumerateInteractionPaths as enumeratePathsImpl } from '@/lib/paths';
 import { extractVisionCandidates as extractVisionCandidatesImpl } from '@/lib/vision';
 import { writePatches as writePatchesImpl } from '@/lib/fix';
 import { verifyPatches as verifyPatchesImpl } from '@/lib/verify';
-import { openPullRequest as openPullRequestImpl } from '@/lib/github';
+import { openPullRequestForRun as openPullRequestImpl } from '@/lib/github/open-pr';
 
-/** Deterministic: axe-core and the tree, no sandbox and no model (A3.2). */
-export const runTreeLane: PerPageLane = treeLane;
+/**
+ * Deterministic: axe-core and the tree, no sandbox and no model (A3.2).
+ *
+ * TREE takes `axeRan` as its own argument because a `PageCapture` alone cannot
+ * answer it in general — the browser result schema defaults `axeViolations` to
+ * `[]`, so a page axe swept clean and a page axe never reached arrive looking
+ * identical, and reading the second as the first is how contrast came to pass
+ * untested. The capture the crawl produces *does* carry the answer: the browser
+ * script reports whether `axe.run` actually completed, and `capturePage` puts
+ * that boolean on the capture.
+ *
+ * So the seam forwards that recorded fact and invents nothing. `axeRan` stays
+ * true only on positive evidence: an outage, a blocked injection or a capture
+ * predating the flag all leave it false, which sends every axe-dependent
+ * criterion to inconclusive — the honest answer — rather than to a pass.
+ */
+export const runTreeLane: PerPageLane = (input) =>
+  treeLane({
+    pageUrl: input.pageUrl,
+    capture: input.capture,
+    axeRan: input.capture.axeRan === true,
+  });
 export const runVisLane: PerPageLane = visLane;
 export const runActLane: ActLane = actLane;
 export const runMediaLane: PerPageLane = mediaLane;
