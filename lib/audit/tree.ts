@@ -134,6 +134,13 @@ export interface FormFieldFact {
    * cannot establish scope, so TREE reads a purpose off the type alone only
    * when this flag says the field is about the user; otherwise the field's own
    * name, id, label or placeholder has to name the purpose.
+   *
+   * The three states are distinct and all three mean something. `true` puts the
+   * field in scope. `undefined` is a gap, and the name, label and type decide.
+   * `false` is a settled answer that takes the field out of 1.3.5 entirely -
+   * ahead of its name, its label and its type - so a box called "Recipient
+   * email" is not failed for the word *email* after the harness has already
+   * said whose address it is.
    */
   readonly aboutUser?: boolean;
 }
@@ -363,6 +370,37 @@ const GENERIC_LINK_NAMES: ReadonlySet<string> = new Set([
   '>',
   '...',
 ]);
+
+/** Built on first use: `normaliseText` closes over a `const` declared below. */
+let genericLinkNamesNormalised: ReadonlySet<string> | null = null;
+
+/**
+ * True when a link's accessible name says nothing about where the link goes.
+ *
+ * Terminal punctuation is not a destination. "Read more!", "Details?" and
+ * "Click here:" are exactly as contextless as the bare phrases, so membership is
+ * decided through `normaliseText` - the module's own answer to "punctuation is
+ * not significant" - rather than by stripping full stops and ellipses and
+ * leaving every other mark in place.
+ *
+ * Some entries in the set are punctuation and nothing else (`>>`, `...`), and
+ * those normalise away to the empty string. That is not a hole: a name that
+ * survives normalisation as nothing named no destination either, so it is
+ * generic on its own terms, which covers those entries and their unlisted
+ * cousins alike. A link with no name at all is a different finding
+ * (`axe:link-name`) and is filtered out before this is asked.
+ */
+function isGenericLinkName(name: string): boolean {
+  if (collapse(name) === '') return false;
+  const normalised = normaliseText(name);
+  if (normalised === '') return true;
+  if (!genericLinkNamesNormalised) {
+    genericLinkNamesNormalised = new Set(
+      [...GENERIC_LINK_NAMES].map(normaliseText).filter((entry) => entry !== ''),
+    );
+  }
+  return genericLinkNamesNormalised.has(normalised);
+}
 
 /**
  * Instructions that rely on shape, size or position alone (1.3.3).
@@ -1035,20 +1073,32 @@ function passwordPurpose(haystack: string): InputPurpose {
 /**
  * The autocomplete purpose a field should carry, or null when TREE cannot say.
  *
- * The field's own metadata is read first and the `type` second, because 1.3.5
- * covers only fields collecting information about the *user*. A `type="email"`
- * box named `recipient` on an invitation form has a taxonomy purpose and is
- * still outside the criterion, so a bare type never decides on its own:
- * `INPUT_PURPOSES` matching the name, id, label or placeholder is what
- * establishes the field is about the user, and `aboutUser` is how the harness
- * says so when the name does not.
+ * An explicit `aboutUser: false` is read before anything else, because it is a
+ * settled answer rather than a gap: the harness looked and established that this
+ * box collects somebody else's information, and 1.3.5 covers only the user's
+ * own. Reading the name first would fail an invitation form's "Recipient email"
+ * on the strength of the word *email* - the exact false positive the flag exists
+ * to prevent - and `purposeUndetermined` never sees the field, because a purpose
+ * was already returned.
+ *
+ * Where the flag is absent nothing is settled, and the field's own metadata is
+ * read first and the `type` second, because a `type="email"` box named
+ * `recipient` has a taxonomy purpose and is still outside the criterion. A bare
+ * type therefore never decides on its own: `INPUT_PURPOSES` matching the name,
+ * id, label or placeholder is what establishes the field is about the user, and
+ * `aboutUser: true` is how the harness says so when the name does not.
  */
 function inferPurpose(field: FormFieldFact): InputPurpose | null {
+  if (field.aboutUser === false) return null;
+
   const type = (field.type ?? '').toLowerCase();
   const haystack = [field.name, field.id, field.label, field.placeholder]
     .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
     .join(' ');
 
+  // `type="password"` still settles scope on its own where `aboutUser` is
+  // simply absent - no form legitimately collects a third party's password -
+  // but it does not overrule a harness that looked and said otherwise.
   if (type === 'password') return passwordPurpose(haystack);
 
   if (haystack) {
@@ -1555,7 +1605,7 @@ export function checkLinkPurpose(ctx: TreeContext): CheckResult {
       if (findings.length >= MAX_STRUCTURAL_FINDINGS) break;
       const name = collapse(link.name);
       if (name === '') continue; // a nameless link is `axe:link-name`, already filed
-      if (!GENERIC_LINK_NAMES.has(name.toLowerCase().replace(/[.…]+$/, ''))) continue;
+      if (!isGenericLinkName(name)) continue;
       if (link.context === undefined) {
         contextUnknown += 1;
         continue;
@@ -1646,7 +1696,7 @@ export function checkLinkPurpose(ctx: TreeContext): CheckResult {
       if (node.ignored || node.role !== 'link') continue;
       const name = collapse(node.name ?? '');
       if (name === '') continue;
-      if (!GENERIC_LINK_NAMES.has(name.toLowerCase().replace(/[.…]+$/, ''))) continue;
+      if (!isGenericLinkName(name)) continue;
       contextUnknown += 1;
     }
   }
