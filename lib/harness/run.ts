@@ -172,7 +172,16 @@ export async function waitForTurn(
   options: Omit<RunAgentOptions, "schema" | "sessionId" | "previousTurnId"> = {},
 ): Promise<Turn> {
   const client = options.client ?? getTrueForgeClient();
-  const deadline = Date.now() + (options.timeoutMs ?? 600_000);
+  /*
+   * 45 minutes, not 10.
+   *
+   * A FIX turn on a 1300-line component took six minutes of real work. A
+   * timeout that sits four minutes above the observed cost is not a safety
+   * net, it is a coin flip - and losing it throws away a patch the model
+   * already wrote and we already paid for. Waiting costs nothing; killing
+   * good work costs the run.
+   */
+  const deadline = Date.now() + (options.timeoutMs ?? 2_700_000);
   let interval = options.pollIntervalMs ?? 1_500;
   const maxInterval = options.maxPollIntervalMs ?? 8_000;
 
@@ -183,7 +192,7 @@ export async function waitForTurn(
     if (Date.now() >= deadline) {
       throw new AgentRunError({
         reason: "timeout",
-        message: `Turn ${turnId} was still running after ${options.timeoutMs ?? 600_000}ms`,
+        message: `Turn ${turnId} was still running after ${options.timeoutMs ?? 2_700_000}ms`,
         sessionId,
         turnId,
         target: sessionId,

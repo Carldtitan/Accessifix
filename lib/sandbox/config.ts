@@ -132,9 +132,19 @@ export const CHROMIUM_LAUNCH_ARGS = [
 export const SANDBOX_WORK_DIR = '/workspace/accessifix';
 
 /** Timeouts, in seconds, for the host side of a sandbox interaction. */
-export const SANDBOX_CREATE_TIMEOUT_SEC = 180;
-export const SANDBOX_COMMAND_TIMEOUT_SEC = 300;
-export const SANDBOX_FILE_TIMEOUT_SEC = 120;
+/*
+ * Generous on purpose.
+ *
+ * Every one of these kills work that is already in flight and already paid
+ * for. `npm install` on a large repository, a cold Playwright image pull, a
+ * screenshot upload on a slow link - none of them are wrong just because they
+ * are slow, and a run that dies at minute five has to start again from zero.
+ *
+ * Waiting is cheap. Abandoning a half-finished audit is not.
+ */
+export const SANDBOX_CREATE_TIMEOUT_SEC = 600;
+export const SANDBOX_COMMAND_TIMEOUT_SEC = 1_800;
+export const SANDBOX_FILE_TIMEOUT_SEC = 600;
 
 /**
  * Lifecycle guards. A leaked sandbox burns the pool quota, so every sandbox is
