@@ -69,6 +69,21 @@ export interface BuildResult {
    * problem with a different fix: raise the sandbox, do not touch the patch.
    */
   readonly oomKilled: boolean;
+  /**
+   * Whether a build command actually ran and compiled something.
+   *
+   * False when the repository defines no `build` script. `ok` is true in that
+   * case — nothing failed — but nothing was compiled either, and a gate that
+   * reads `ok` alone would treat "there was no build" as "the build passed".
+   * The two are different facts and this is the one that says which.
+   */
+  readonly buildRan: boolean;
+  /**
+   * False when `npm ci` was refused for lockfile drift and the run fell back to
+   * `npm install`. The tree that built is then not the tree the repository
+   * pins, so the build proves less than it appears to.
+   */
+  readonly installReproducible: boolean;
   /** Compiler and bundler errors pulled out of the log, for the handoff card. */
   readonly compileErrors: readonly string[];
   /** Absolute path of the clone inside the sandbox. */
@@ -134,6 +149,12 @@ const STEP_OUTPUT_TAIL = 8_000;
  * killer sends. V8's own message appears when the heap limit is hit before the
  * kernel intervenes. Both mean the same thing to a human: the sandbox was too
  * small.
+ *
+ * 139 is *not* on that list. It is 128+11, SIGSEGV — a crash in the compiler or
+ * a native module, which is a real defect somebody has to look at. Reporting it
+ * as "the sandbox was too small" would suppress the compile diagnostics and send
+ * a human to resize a machine that is the right size. A 139 that genuinely ran
+ * out of memory says so in its output and is caught by the patterns below.
  */
 const OOM_PATTERNS: readonly RegExp[] = [
   /JavaScript heap out of memory/i,
@@ -155,10 +176,37 @@ const COMPILE_ERROR_PATTERNS: readonly RegExp[] = [
   /^Error:\s+.*$/gm,
 ];
 
-/** True when the output is a kill rather than a compile failure. */
+/**
+ * True when the output is an out-of-memory kill rather than a compile failure.
+ *
+ * Only SIGKILL/137 is unconditional. Every other exit code has to carry an
+ * explicit OOM signature in its output before this claims memory was the cause.
+ */
 export function detectOom(output: string, exitCode: number): boolean {
-  if (exitCode === 137 || exitCode === 139) return true;
+  if (exitCode === 137) return true;
   return OOM_PATTERNS.some((pattern) => pattern.test(output));
+}
+
+/**
+ * `npm ci` refusing a lockfile that has drifted from `package.json`, as opposed
+ * to failing for any of the dozen other reasons an install fails.
+ *
+ * The distinction matters because the drift case is a property of the
+ * repository — nothing the patch did — while a registry outage, an engine
+ * mismatch or a failing lifecycle script is a real failure that an `npm install`
+ * retry would paper over, silently validating a dependency tree the repository
+ * does not pin.
+ */
+const LOCKFILE_DRIFT_PATTERNS: readonly RegExp[] = [
+  /can only install packages when your package\.json and package-lock\.json[\s\S]{0,120}?in sync/i,
+  /can only install with an existing package-lock\.json/i,
+  /^\s*npm (?:ERR!|error)\s+Invalid: lock file's /im,
+  /^\s*npm (?:ERR!|error)\s+Missing: [^\n]* from lock file/im,
+  /lock ?file (?:is )?out of (?:date|sync)/i,
+];
+
+export function isLockfileDrift(output: string): boolean {
+  return LOCKFILE_DRIFT_PATTERNS.some((pattern) => pattern.test(output));
 }
 
 /** Compiler and bundler errors, deduplicated, for the handoff card. */
@@ -248,7 +296,12 @@ async function buildIn(sandbox: Sandbox, options: BuildOptions): Promise<BuildRe
 
   const finish = (
     failedStage: BuildStage | null,
-    extras: { commitSha?: string | null; envCopied?: boolean } = {},
+    extras: {
+      commitSha?: string | null;
+      envCopied?: boolean;
+      buildRan?: boolean;
+      installReproducible?: boolean;
+    } = {},
   ): BuildResult => {
     const transcript = redact(log.join('\n'));
     const failedStep = failedStage ? steps.find((s) => s.stage === failedStage && !s.ok) : undefined;
@@ -257,6 +310,8 @@ async function buildIn(sandbox: Sandbox, options: BuildOptions): Promise<BuildRe
       : false;
     const compileErrors =
       failedStep && !oomKilled ? extractCompileErrors(failedStep.output) : [];
+    const buildRan = extras.buildRan ?? false;
+    const installReproducible = extras.installReproducible ?? true;
 
     return {
       ok: failedStage === null,
@@ -264,12 +319,22 @@ async function buildIn(sandbox: Sandbox, options: BuildOptions): Promise<BuildRe
       steps,
       failedStage,
       oomKilled,
+      buildRan,
+      installReproducible,
       compileErrors,
       repoDir,
       commitSha: extras.commitSha ?? null,
       envCopied: extras.envCopied ?? false,
       durationMs: Date.now() - started,
-      summary: summarise(failedStage, oomKilled, compileErrors, Date.now() - started),
+      summary: summarise({
+        failedStage,
+        oomKilled,
+        compileErrors,
+        exitCode: failedStep?.exitCode ?? null,
+        buildRan,
+        installReproducible,
+        durationMs: Date.now() - started,
+      }),
     };
   };
 
@@ -399,8 +464,18 @@ async function buildIn(sandbox: Sandbox, options: BuildOptions): Promise<BuildRe
 
   // `npm ci` refuses a lockfile that has drifted from package.json. That is a
   // property of the repository, not of the patch, so fall back rather than
-  // reporting the run as broken.
-  if (!install.ok && !options.installCommand && hasLockfile) {
+  // reporting the run as broken — but only for that specific refusal. A
+  // registry outage, an engine mismatch or a failing lifecycle script is a real
+  // failure, and retrying it with `npm install` would hide it behind a
+  // dependency tree the repository does not pin.
+  let installReproducible = true;
+  if (
+    !install.ok &&
+    !options.installCommand &&
+    hasLockfile &&
+    isLockfileDrift(install.output)
+  ) {
+    installReproducible = false;
     install = await run(
       'install',
       withEnv('npm install --no-audit --no-fund', options.env),
@@ -408,21 +483,26 @@ async function buildIn(sandbox: Sandbox, options: BuildOptions): Promise<BuildRe
       options.installTimeoutSec ?? DEFAULT_INSTALL_TIMEOUT_SEC,
     );
   }
-  if (!install.ok) return finish('install', { commitSha, envCopied });
+  if (!install.ok) return finish('install', { commitSha, envCopied, installReproducible });
 
   /* -- build ------------------------------------------------------------- */
 
   const scripts = await readScripts(sandbox, repoDir);
   if (!options.buildCommand && !scripts.build) {
+    // Nothing failed, so this is not a failure — but nothing compiled either.
+    // `buildRan: false` is what stops a later gate from reading "install
+    // succeeded" as "the patched tree builds".
     record({
       stage: 'build',
-      command: 'npm run build',
+      command: '(no build script)',
       exitCode: 0,
       ok: true,
       durationMs: 0,
-      output: 'No `build` script in package.json. Nothing to build; install succeeded.',
+      output:
+        'No `build` script in package.json. Nothing was compiled; the install succeeded and ' +
+        'that is the whole of what this step proves.',
     });
-    return finish(null, { commitSha, envCopied });
+    return finish(null, { commitSha, envCopied, buildRan: false, installReproducible });
   }
 
   const build = await run(
@@ -432,7 +512,66 @@ async function buildIn(sandbox: Sandbox, options: BuildOptions): Promise<BuildRe
     options.buildTimeoutSec ?? DEFAULT_BUILD_TIMEOUT_SEC,
   );
 
-  return finish(build.ok ? null : 'build', { commitSha, envCopied });
+  return finish(build.ok ? null : 'build', {
+    commitSha,
+    envCopied,
+    buildRan: true,
+    installReproducible,
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/* The build gate (A6.1)                                                      */
+/* -------------------------------------------------------------------------- */
+
+export interface BuildGate {
+  /** False stops the run before a pull request exists. */
+  readonly allowed: boolean;
+  /** True when nothing failed but no compilation happened either. */
+  readonly unproven: boolean;
+  /** Why, in a sentence a human reads on the approval card. */
+  readonly reason: string;
+}
+
+/**
+ * A6.1, stated once: a failed build is a stop, and an *absent* build is not a
+ * pass.
+ *
+ * The second half is the one worth writing down. A repository with no `build`
+ * script produces `ok: true` because nothing failed, and a gate that reads that
+ * boolean alone would tell a human "the patched tree builds" on the strength of
+ * an install. It is allowed — a library with no build step is an ordinary
+ * repository — but it is `unproven`, and every surface that renders it has to
+ * say so rather than print a tick.
+ */
+export function buildGate(result: BuildResult): BuildGate {
+  if (!result.ok) {
+    return {
+      allowed: false,
+      unproven: false,
+      reason: `The patched tree did not build. ${result.summary}`,
+    };
+  }
+  if (!result.buildRan) {
+    return {
+      allowed: true,
+      unproven: true,
+      reason:
+        'This repository defines no build script, so nothing was compiled. The install ' +
+        'succeeded and that is all this step proves.',
+    };
+  }
+  if (!result.installReproducible) {
+    return {
+      allowed: true,
+      unproven: false,
+      reason:
+        `${result.summary} The lockfile had drifted from package.json, so dependencies came ` +
+        'from `npm install` rather than `npm ci` — the tree that built is not the one the ' +
+        'repository pins.',
+    };
+  }
+  return { allowed: true, unproven: false, reason: result.summary };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -516,14 +655,32 @@ function tail(text: string, max: number): string {
   return `…(${text.length - max} earlier characters omitted)\n${text.slice(-max)}`;
 }
 
-function summarise(
-  failedStage: BuildStage | null,
-  oomKilled: boolean,
-  compileErrors: readonly string[],
-  durationMs: number,
-): string {
+function summarise(facts: {
+  failedStage: BuildStage | null;
+  oomKilled: boolean;
+  compileErrors: readonly string[];
+  exitCode: number | null;
+  buildRan: boolean;
+  installReproducible: boolean;
+  durationMs: number;
+}): string {
+  const { failedStage, oomKilled, compileErrors, exitCode, durationMs } = facts;
   const seconds = (durationMs / 1000).toFixed(1);
-  if (failedStage === null) return `Build succeeded in ${seconds}s.`;
+
+  if (failedStage === null) {
+    const drift = facts.installReproducible
+      ? ''
+      : ' Dependencies came from `npm install` rather than `npm ci`, because the lockfile had ' +
+        'drifted from package.json.';
+    if (!facts.buildRan) {
+      return (
+        `Install succeeded in ${seconds}s. This repository defines no build script, so nothing ` +
+        `was compiled.${drift}`
+      );
+    }
+    return `Build succeeded in ${seconds}s.${drift}`;
+  }
+
   if (oomKilled) {
     return (
       `The ${failedStage} step was killed for running out of memory after ${seconds}s. ` +
@@ -533,6 +690,16 @@ function summarise(
   }
   if (compileErrors.length > 0) {
     return `The ${failedStage} step failed to compile after ${seconds}s: ${compileErrors[0]}`;
+  }
+  // 128+N is a termination by signal. Naming it keeps a segfault in a native
+  // module from being read as an ordinary non-zero exit.
+  if (exitCode !== null && exitCode > 128 && exitCode < 160) {
+    const signal = exitCode - 128;
+    const name = signal === 11 ? ' (SIGSEGV, a crash)' : signal === 9 ? ' (SIGKILL)' : '';
+    return (
+      `The ${failedStage} step was terminated by signal ${signal}${name} after ${seconds}s, ` +
+      'with no out-of-memory signature in its output.'
+    );
   }
   return `The ${failedStage} step failed after ${seconds}s.`;
 }

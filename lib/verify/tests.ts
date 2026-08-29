@@ -82,7 +82,13 @@ const E2E_SCRIPTS = ['test:e2e', 'e2e', 'test:playwright', 'playwright'] as cons
  */
 export function detectTestCommand(pkg: PackageJsonLike | null | undefined): TestDetection {
   const scripts = pkg?.scripts ?? {};
-  const e2eScript = E2E_SCRIPTS.find((name) => typeof scripts[name] === 'string') ?? null;
+  const namedE2e = E2E_SCRIPTS.find((name) => typeof scripts[name] === 'string') ?? null;
+
+  // A `test` script that turns out to be Playwright is an end-to-end suite that
+  // happens to be called `test`. Running it here would launch a browser against
+  // an application nothing has served, and reject a good patch on a failure that
+  // is about the environment. It is reported as e2e and the search continues.
+  let e2eFromScript: string | null = null;
 
   for (const { script, source } of SCRIPT_PREFERENCE) {
     const body = scripts[script];
@@ -90,20 +96,37 @@ export function detectTestCommand(pkg: PackageJsonLike | null | undefined): Test
     if (script === 'test' && NO_TEST_PLACEHOLDER.test(body)) continue;
 
     const framework = frameworkOf(body);
+    if (framework === 'playwright') {
+      e2eFromScript ??= script;
+      continue;
+    }
+
     return {
       script,
       command: buildCommand(script, framework),
       framework,
       source,
       scriptBody: body,
-      e2eScript,
-      reason: `The repository defines \`npm run ${script}\` as \`${body}\`, so that is what ran.`,
+      e2eScript: namedE2e ?? e2eFromScript,
+      reason:
+        `The repository defines \`npm run ${script}\` as \`${body}\`, so that is what ran.` +
+        (e2eFromScript
+          ? ` Its \`${e2eFromScript}\` script is Playwright and was left alone — an end-to-end ` +
+            'suite needs a served application and is a different gate.'
+          : ''),
     };
   }
 
   // No script, but the runner is installed. Common in repositories that rely on
   // an IDE integration or a CI-only invocation.
+  //
+  // `--passWithNoTests` stays: without it a repository that has vitest installed
+  // and no test files exits non-zero, and a *missing* suite would block the pull
+  // request as though it had failed. The zero-test case is separated afterwards,
+  // from the runner's own output, and reported as unproven rather than as a pass.
   const deps = { ...(pkg?.devDependencies ?? {}), ...(pkg?.dependencies ?? {}) };
+  const e2eScript = namedE2e ?? e2eFromScript;
+
   if (typeof deps['vitest'] === 'string') {
     return {
       script: null,
@@ -135,10 +158,34 @@ export function detectTestCommand(pkg: PackageJsonLike | null | undefined): Test
     source: 'none',
     scriptBody: null,
     e2eScript,
-    reason:
-      'This repository defines no unit test suite, so there was nothing to run. The patch is ' +
-      'backed by the build and the criterion re-check only.',
+    reason: e2eFromScript
+      ? `This repository's \`${e2eFromScript}\` script is a Playwright end-to-end suite, which ` +
+        'needs a served application and is a different gate. It defines no unit test suite, so ' +
+        'nothing ran here. The patch is backed by the build and the criterion re-check only.'
+      : 'This repository defines no unit test suite, so there was nothing to run. The patch is ' +
+        'backed by the build and the criterion re-check only.',
   };
+}
+
+/**
+ * Output that says the runner started, found nothing, and exited zero anyway.
+ *
+ * `--passWithNoTests` keeps an empty suite from looking like a failure; this
+ * keeps it from looking like a pass. A6.4 draws the line between "the suite
+ * passed" and "there was no suite", and an exit code cannot tell them apart.
+ */
+const NO_TESTS_PATTERNS: readonly RegExp[] = [
+  /No test files found/i,
+  /No tests? found/i,
+  /No test suites? found/i,
+  /\bTests:\s+0 total\b/i,
+  /\bTest Files\s+no tests\b/i,
+  /\bno tests\b[^\n]*\bexiting with code 0\b/i,
+];
+
+/** True when a zero-exit run in fact executed no tests at all. */
+export function ranZeroTests(output: string): boolean {
+  return NO_TESTS_PATTERNS.some((pattern) => pattern.test(output));
 }
 
 function frameworkOf(body: string): TestFramework {
@@ -176,7 +223,11 @@ export interface TestRunResult {
   /** The command executed, or null when nothing ran. */
   readonly command: string | null;
   readonly exitCode: number | null;
-  /** True when there was no suite to run. `ok` is true but nothing was proven. */
+  /**
+   * True when no test actually ran — either there was no suite to invoke, or the
+   * runner was invoked and found nothing. `ok` is true alongside it, because
+   * nothing failed, and nothing was proven either.
+   */
   readonly skipped: boolean;
   readonly detection: TestDetection;
   readonly durationMs: number;
@@ -240,21 +291,28 @@ export async function runTargetTests(
   const output = tail(result.stdout, options.outputTail ?? DEFAULT_OUTPUT_TAIL);
   const ok = result.exitCode === 0;
 
+  // A runner that exited zero because it found nothing to run has proven
+  // nothing. `skipped` puts it where an absent suite already sits — allowed,
+  // unproven — instead of reporting an empty run as a passing one.
+  const zeroTests = ok && ranZeroTests(output);
+
   return {
     ok,
     output,
     framework: detection.framework,
     command,
     exitCode: result.exitCode,
-    skipped: false,
+    skipped: zeroTests,
     detection,
     durationMs,
-    summary: ok
-      ? `\`${command}\` passed in ${(durationMs / 1000).toFixed(1)}s${
-          detection.framework === 'none' ? '' : ` (${detection.framework})`
-        }.`
-      : `\`${command}\` failed with exit code ${result.exitCode}. ` +
-        `${firstFailureLine(output) ?? 'See the attached log.'}`,
+    summary: zeroTests
+      ? `\`${command}\` ran and found no tests, so nothing was verified by the suite.`
+      : ok
+        ? `\`${command}\` passed in ${(durationMs / 1000).toFixed(1)}s${
+            detection.framework === 'none' ? '' : ` (${detection.framework})`
+          }.`
+        : `\`${command}\` failed with exit code ${result.exitCode}. ` +
+          `${firstFailureLine(output) ?? 'See the attached log.'}`,
   };
 }
 
@@ -293,9 +351,11 @@ export function pullRequestGate(result: TestRunResult): PullRequestGate {
     return {
       allowed: true,
       unproven: true,
-      reason:
-        'This repository has no unit test suite, so nothing ran. The patch is backed by a ' +
-        'successful build and the criterion re-check, and by nothing else.',
+      reason: result.command
+        ? `${result.summary} The patch is backed by a successful build and the criterion ` +
+          're-check, and by nothing else.'
+        : 'This repository has no unit test suite, so nothing ran. The patch is backed by a ' +
+          'successful build and the criterion re-check, and by nothing else.',
     };
   }
   return {
