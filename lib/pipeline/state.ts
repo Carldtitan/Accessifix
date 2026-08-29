@@ -28,7 +28,7 @@ import { eq } from 'drizzle-orm';
 import { db } from '@/lib/db';
 import { runs, RUN_STATUSES, type Run, type RunPhase, type RunStatus } from '@/lib/db/schema';
 
-import { emitEvent, lastStateEvent, stateBeforePause } from './events';
+import { emitEvent, stateBeforePause } from './events';
 
 /* -------------------------------------------------------------------------- */
 /* States                                                                     */
@@ -60,6 +60,22 @@ export const RESUMABLE_STATES: readonly PipelineState[] = [
   'verifying',
   'awaiting_approval',
 ];
+
+/**
+ * The statuses the boot sweep picks up (A12.2).
+ *
+ * Derived from `RESUMABLE_STATES` rather than restated, because a hand-written
+ * copy is exactly how `scoring` came to be missing from it: the state machine
+ * gained a state, the sweep did not, and a run interrupted while scoring was
+ * stranded until someone noticed.
+ *
+ * `awaiting_approval` is deliberately excluded. Those runs are not stuck, they
+ * are waiting on a human, and the approve route restarts them when one answers
+ * - see `runsAwaitingApproval()`.
+ */
+export const SWEEPABLE_STATES: readonly PipelineState[] = RESUMABLE_STATES.filter(
+  (state) => state !== 'awaiting_approval',
+);
 
 /**
  * The legal transition table. Anything not listed here throws.
@@ -139,27 +155,34 @@ export class RunNotFoundError extends Error {
 /* -------------------------------------------------------------------------- */
 
 /**
- * `runs.status` is a Postgres enum. If the deployed enum does not yet carry
- * `scoring`, writing it would throw at runtime and take the run down, so the
- * value is folded into `auditing` for storage only. The *true* pipeline state
- * always goes to the event log as text, and `readState()` prefers that, so
- * nothing downstream loses the distinction.
+ * `runs.status` is a Postgres enum, and it now carries every pipeline state:
+ * `'scoring'` was added to `RUN_STATUSES` in `lib/db/schema.ts`, so the column
+ * is lossless and nothing is folded on the way in or out.
  *
- * SCHEMA OWNER: adding `'scoring'` to `RUN_STATUSES` in `lib/db/schema.ts`
- * (between `'auditing'` and `'fixing'`) removes this fallback entirely — the
- * check below is a runtime membership test, so no other change is needed.
+ * The assertion below is checked at build time rather than trusted: if the two
+ * lists ever drift apart again, this stops compiling instead of silently
+ * writing a value the enum will reject at runtime.
  */
-const DB_SUPPORTS_SCORING = (RUN_STATUSES as readonly string[]).includes('scoring');
+/* eslint-disable @typescript-eslint/no-unused-vars */
+// Containment in both directions. Either list gaining a member the other lacks
+// is a compile error here rather than a runtime enum violation in production.
+const _everyStateIsStorable: readonly RunStatus[] = PIPELINE_STATES;
+const _everyStatusIsAState: readonly PipelineState[] = RUN_STATUSES;
+/* eslint-enable @typescript-eslint/no-unused-vars */
 
 /** Map a pipeline state onto a value the `run_status` enum will accept. */
 export function toRunStatus(state: PipelineState): RunStatus {
-  if (state === 'scoring' && !DB_SUPPORTS_SCORING) return 'auditing';
-  return state as RunStatus;
+  return state;
 }
 
-/** True when `runs.status` can represent every pipeline state losslessly. */
+/**
+ * True when `runs.status` can represent every pipeline state losslessly.
+ *
+ * Kept as a runtime check rather than a constant `true`: a database whose enum
+ * predates the schema change would still answer honestly.
+ */
 export function statusColumnIsLossless(): boolean {
-  return DB_SUPPORTS_SCORING;
+  return PIPELINE_STATES.every((state) => (RUN_STATUSES as readonly string[]).includes(state));
 }
 
 /* -------------------------------------------------------------------------- */
@@ -188,21 +211,14 @@ export async function requireRun(runId: string): Promise<Run> {
 /**
  * The authoritative current state.
  *
- * The event log wins over `runs.status` when the two disagree, because the log
- * is written with the full vocabulary while the column may be narrower (see
- * `toRunStatus`). They are written in the same call, so a disagreement only
- * ever means "the column could not hold this value".
+ * `runs.status` is authoritative: the column and the event log carry the same
+ * vocabulary, and both are written in the same call. An unrecognised value can
+ * only come from a database older than this code, and `queued` is the safe
+ * reading of it - a run that has not started.
  */
 export async function readState(runId: string): Promise<RunState> {
   const run = await requireRun(runId);
-  const stored: PipelineState = isPipelineState(run.status) ? run.status : 'queued';
-
-  let state: PipelineState = stored;
-  if (!DB_SUPPORTS_SCORING && stored === 'auditing') {
-    // The column folded `scoring` into `auditing`; the log did not.
-    const last = await lastStateEvent(runId);
-    if (last?.data?.to === 'scoring') state = 'scoring';
-  }
+  const state: PipelineState = isPipelineState(run.status) ? run.status : 'queued';
 
   const pausedFrom =
     state === 'awaiting_approval'

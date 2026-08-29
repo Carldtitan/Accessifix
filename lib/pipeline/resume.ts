@@ -19,18 +19,35 @@
  */
 import { and, eq, inArray } from 'drizzle-orm';
 
-import { getTrueForgeClient, requiredActionsOf } from '@/lib/harness/client';
+import { getTrueForgeClient, messageText, requiredActionsOf, type Turn } from '@/lib/harness/client';
 import { waitForTurn } from '@/lib/harness/run';
+import { FindingsResponseSchema } from '@/lib/harness/schemas';
 import { db } from '@/lib/db';
-import { findings, handoffs, pages, runs, targets, type Handoff, type Page, type Run, type Target } from '@/lib/db/schema';
+import {
+  AGENT_NAMES,
+  RUN_PHASES,
+  findings,
+  handoffs,
+  pages,
+  runs,
+  targets,
+  type AgentName,
+  type Handoff,
+  type Page,
+  type Run,
+  type RunPhase,
+  type Target,
+} from '@/lib/db/schema';
 
 import { emitEvent } from './events';
-import { failJob, listJobs } from './jobs';
+import { completeJob, failJob, listJobs } from './jobs';
+import { recordFindings, type FindingClaim } from './ledger';
 import { isRunning, startRun, type RunPipelineOptions } from './orchestrate';
 import {
   isTerminal,
   readState,
   RESUMABLE_STATES,
+  SWEEPABLE_STATES,
   stateRank,
   type PipelineState,
 } from './state';
@@ -146,6 +163,115 @@ export interface ReattachOutcome {
    *  `gone` the harness no longer knows the session, `running` still working. */
   status: 'finished' | 'paused' | 'running' | 'gone';
   detail: string;
+  /** For a `finished` turn: whether its answer was recovered into the ledger. */
+  recovered?: { findings: number; rejected: number } | null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Recovering a finished turn                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Phases whose harness answer can be replayed into the ledger from the turn
+ * alone.
+ *
+ * The per-page audit lanes qualify because everything needed to place a claim
+ * is recoverable: the page URL is in the job key, the lane is in `agent`, and
+ * the claims themselves are `FindingsResponseSchema`.
+ *
+ * `pages` and `paths` do not. PAGES spans the whole crawl and its claims carry
+ * a page URL the lane attached from context the turn does not contain; path
+ * enumeration returns a different shape entirely. `fix`, `verify` and `pr` are
+ * excluded on purpose — replaying a patch set or a pull request from a
+ * half-remembered turn is exactly the kind of guess this pipeline must not
+ * make. Those phases re-run, guarded by their own idempotence checks.
+ */
+const REPLAYABLE_PHASES = new Set<PipelinePhase>(['tree', 'vis', 'act', 'media', 'code']);
+
+const AGENT_SET = new Set<string>(AGENT_NAMES);
+const RUN_PHASE_SET = new Set<string>(RUN_PHASES);
+
+/** Pull a JSON object out of an agent's reply, fenced or bare. */
+function extractJson(text: string): unknown {
+  const trimmed = text.trim();
+  if (!trimmed) return undefined;
+
+  const fenced = /```(?:json)?\s*([\s\S]*?)```/i.exec(trimmed);
+  const candidate = fenced ? fenced[1].trim() : trimmed;
+
+  try {
+    return JSON.parse(candidate);
+  } catch {
+    // A model that prefixed prose still usually emitted one complete object.
+    const start = candidate.indexOf('{');
+    const end = candidate.lastIndexOf('}');
+    if (start === -1 || end <= start) return undefined;
+    try {
+      return JSON.parse(candidate.slice(start, end + 1));
+    } catch {
+      return undefined;
+    }
+  }
+}
+
+/** `${runPhase}:${pageUrl}` — the key `laneOverPages` writes. */
+function splitLaneJobKey(jobKey: string): { phase: RunPhase; pageUrl: string } | null {
+  const separator = jobKey.indexOf(':');
+  if (separator === -1) return null;
+
+  const phase = jobKey.slice(0, separator);
+  const pageUrl = jobKey.slice(separator + 1);
+  if (!RUN_PHASE_SET.has(phase) || !pageUrl) return null;
+
+  return { phase: phase as RunPhase, pageUrl };
+}
+
+/**
+ * Turn a finished TrueForge turn back into ledger rows.
+ *
+ * This is the half that was missing. Labelling a turn `finished` and moving on
+ * recovered nothing: the job row stayed `running`, the conductor reclaimed it,
+ * and the work the reattachment was supposed to save was paid for twice.
+ *
+ * Note what this does *not* do: it does not write to `findings`. It hands the
+ * recovered claims to `recordFindings()` like any lane would, so a resumed run
+ * is validated by exactly the same gate as a fresh one (A13.6).
+ */
+async function recoverFinishedTurn(
+  runId: string,
+  session: ReattachableSession,
+  turn: Turn,
+): Promise<{ findings: number; rejected: number } | null> {
+  if (!REPLAYABLE_PHASES.has(session.phase)) return null;
+  if (!session.agent || !AGENT_SET.has(session.agent)) return null;
+
+  const key = splitLaneJobKey(session.jobKey);
+  if (!key) return null;
+
+  const output = turn.state.status === 'done' ? turn.state.output : null;
+  const parsed = FindingsResponseSchema.safeParse(extractJson(messageText(output)));
+  if (!parsed.success) return null;
+
+  const claims: FindingClaim[] = parsed.data.findings.map((finding) => ({
+    criterion: finding.criterion,
+    severity: finding.severity,
+    summary: finding.summary,
+    detail: finding.detail,
+    selector: finding.selector ?? null,
+    sourcePath: finding.sourcePath ?? null,
+    verdict: finding.verdict,
+    pageUrl: key.pageUrl,
+  }));
+
+  const recorded = await recordFindings({
+    runId,
+    phase: key.phase,
+    agent: session.agent as AgentName,
+    sessionId: session.sessionId,
+    claims,
+  });
+
+  return { findings: recorded.inserted.length, rejected: recorded.rejected.length };
 }
 
 /**
@@ -211,11 +337,47 @@ export async function reattachSessions(
         );
       }
 
+      /*
+       * A finished turn is the whole point of reattaching, and until now it was
+       * the case that did the least: the outcome said `finished` while the job
+       * row stayed `running`, so the conductor reclaimed it and paid for the
+       * turn a second time.
+       *
+       * Collect the answer, put it through the ledger's gate, and complete the
+       * row with a result shaped exactly like the one `laneOverPages` stores —
+       * that is what `runJob`'s `fromResult` rehydrates from, and it is what
+       * makes the resumed conductor skip the work instead of redoing it.
+       */
+      let recovered: { findings: number; rejected: number } | null = null;
+
+      if (status === 'finished') {
+        recovered = await recoverFinishedTurn(runId, session, turn).catch(() => null);
+
+        if (recovered) {
+          await completeJob(session.jobId, {
+            sessionId: session.sessionId,
+            turnId: session.turnId,
+            result: { recorded: recovered.findings, rejected: recovered.rejected },
+          });
+        } else {
+          // The turn finished but its answer cannot be replayed from the turn
+          // alone (FIX, VERIFY, PR, PAGES, path enumeration, or output that no
+          // longer parses). Say so and let the phase re-run under its own
+          // idempotence guard rather than silently losing the work.
+          await failJob(
+            session.jobId,
+            `The turn finished but its ${session.phase} result could not be recovered from the ` +
+              'harness alone; the job will be re-run.',
+          );
+        }
+      }
+
       outcomes.push({
         jobId: session.jobId,
         sessionId: session.sessionId,
         status,
         detail: `Turn ${session.turnId} is ${turn.state.status}${actions.length > 0 ? `, waiting on ${actions.length} action(s)` : ''}.`,
+        recovered,
       });
 
       await emitEvent({
@@ -224,8 +386,17 @@ export async function reattachSessions(
         agent: session.agent ?? 'APP',
         capability: 'subagent',
         summary: `Reattached to TrueForge session ${session.sessionId.slice(0, 8)} for ${session.phase}.`,
-        detail: `Turn ${session.turnId} is ${turn.state.status}. The run resumed rather than restarting (A12.1).`,
-        data: { jobId: session.jobId, sessionId: session.sessionId, phase: session.phase },
+        detail:
+          `Turn ${session.turnId} is ${turn.state.status}. ` +
+          (recovered
+            ? `${recovered.findings} finding(s) recovered into the ledger without re-running the turn (A12.1).`
+            : 'The run resumed rather than restarting (A12.1).'),
+        data: {
+          jobId: session.jobId,
+          sessionId: session.sessionId,
+          phase: session.phase,
+          recovered,
+        },
       });
     } catch (error) {
       const reason = error instanceof Error ? error.message : String(error);
@@ -320,10 +491,23 @@ export async function resumeRun(
 
   const reattached = await reattachSessions(runId, snapshot.reattachable, options);
 
-  // Release anything the dead process left mid-flight and did not reattach.
+  /*
+   * Release anything the dead process left mid-flight and did not reattach.
+   *
+   * `finished` rows were completed above and must not be reopened. `running`
+   * rows are live turns on the harness — resetting one to `pending` is how the
+   * conductor comes to start a second turn beside a first that is still being
+   * paid for.
+   */
+  const keptAlive = new Set(
+    reattached
+      .filter((outcome) => outcome.status === 'finished' || outcome.status === 'running')
+      .map((outcome) => outcome.jobId),
+  );
+
   const stranded = snapshot.inFlight
     .filter((job) => job.status === 'running')
-    .filter((job) => !reattached.some((outcome) => outcome.jobId === job.id && outcome.status === 'finished'))
+    .filter((job) => !keptAlive.has(job.id))
     .map((job) => job.id);
 
   if (stranded.length > 0) {
@@ -336,15 +520,13 @@ export async function resumeRun(
       .where(inArray(pipelineJobs.id, stranded));
   }
 
-  const { started } = startRun(runId, options);
+  const { started, reason } = await startRun(runId, options);
 
   return {
     runId,
     resumed: started,
     state: snapshot.state,
-    reason: started
-      ? `Resumed at "${snapshot.state}".`
-      : 'Another conductor claimed the run first.',
+    reason: started ? `Resumed at "${snapshot.state}".` : `Not resumed: ${reason}`,
     reattached,
   };
 }
@@ -358,12 +540,15 @@ export async function resumeRun(
 export async function resumeInterruptedRuns(
   options: RunPipelineOptions = {},
 ): Promise<ResumeResult[]> {
+  /*
+   * Derived from the state machine, never restated. A hand-written copy is how
+   * `scoring` came to be missing here: the pipeline gained a state, this list
+   * did not, and a run interrupted mid-score was stranded with no way back.
+   */
   const stuck = await db
     .select({ id: runs.id })
     .from(runs)
-    .where(
-      inArray(runs.status, ['queued', 'crawling', 'auditing', 'fixing', 'verifying']),
-    );
+    .where(inArray(runs.status, [...SWEEPABLE_STATES]));
 
   const results: ResumeResult[] = [];
   for (const run of stuck) {
