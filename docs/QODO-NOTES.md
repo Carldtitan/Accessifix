@@ -56,3 +56,21 @@ pushes are rejected for everyone including the repository owner.
   - Findings page now derives both numbers and labels the excerpt as a subset, so it no longer contradicts the criterion matrix beside it.
   - `failed` badge given its own deeper red ground plus a ring, so it differs from `live` by shape as well as hue rather than by colour alone. 8.5:1 composited, recorded in the contrast ledger.
 - **We dismissed:** Nothing. All five were genuine.
+
+---
+
+## PR #6 — Task 7: FIX, VERIFY and the GitHub PR layer
+
+- **Link:** https://github.com/Carldtitan/Accessifix/pull/6
+- **Qodo found:** 15 bugs — approval payload unbound; PR head unverified; write APIs bypass approval; missing attribution becomes all findings; diff hides byte changes; missing build falsely passes; zero tests reported as passed; axe outage becomes resolution; wrong page proves fixes; criterion fallback conflates findings; duplicate patches escape parsing; escaping paths retarget files; every `npm ci` failure falls back; Playwright `test` script blocks patches; segfault misreported as OOM.
+- **We changed:**
+  - **The approval gate was unbound — the worst of the fifteen.** An `ApprovalRequest` carried no binding to what would actually run, so a decision could be replayed against a different payload: approve a one-line label fix, get a rewrite. Every request now carries an `ApprovalOperation` — repo, branch, base, title, commitSha, and a **digest of each file's contents** — compared field by field, with the operation fingerprint folded into the request id.
+  - The write APIs bypassed the gate when called directly. `createBranch`, `commitFiles` and `openPullRequest` now require a `WriteAuthorization` on the **class methods**, not just the wrappers, so it cannot be sidestepped.
+  - The PR head is verified: the commit's branch and file set must match what was composed, and the branch SHA is re-checked immediately before `pulls.create`.
+  - **Three separate false-pass paths closed.** A repo with no build script reported success; a suite that ran zero tests reported as passing; and an axe-core outage made every finding look resolved because the violation list came back empty. Each now reports *unproven* or *inconclusive*, and build-unproven plus tests-unproven together is a hard stop — that is no evidence at all.
+  - Findings were rechecked against whatever page happened to be loaded; now grouped by URL and captured per route, with overflow reported unproven rather than assumed fixed.
+  - A patch naming no finding was credited with all of the group's findings, making the "named no finding" skip unreachable.
+  - The diff normalised CRLF, so a line-ending-only change showed as no change.
+  - A path escaping the repo was silently rewritten, so `../src/Nav.tsx` could retarget a real in-repo file.
+  - `npm ci` fallback now requires an actual lockfile-drift signature, and records `installReproducible: false` in the PR body when it fires. Exit 139 needs an explicit OOM signature before being called OOM, so a segfault no longer suppresses compile diagnostics.
+- **We dismissed:** Nothing. Two readings worth recording: on the missing build script we mirrored the tests precedent (allowed-but-unproven, stated honestly) rather than blocking outright, because a hard block would stop AccessiFix ever opening a PR against a build-script-less repo — with the added rule that unproven build *and* unproven tests together is a stop. And we deliberately kept `--passWithNoTests`, since removing it as the literal wording suggested would turn a *missing* suite into exit 1 and block the PR, the opposite of the invariant.
