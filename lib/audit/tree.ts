@@ -124,6 +124,18 @@ export interface FormFieldFact {
   readonly placeholder?: string | null;
   readonly autocomplete?: string | null;
   readonly required?: boolean;
+  /**
+   * True when the harness established that this field collects information
+   * about the user filling the form rather than about somebody or something
+   * else.
+   *
+   * WCAG 1.3.5 is scoped to the former only: the recipient box on an invitation
+   * form is `type="email"` and sits outside the criterion. An input `type`
+   * cannot establish scope, so TREE reads a purpose off the type alone only
+   * when this flag says the field is about the user; otherwise the field's own
+   * name, id, label or placeholder has to name the purpose.
+   */
+  readonly aboutUser?: boolean;
 }
 
 /** A measured pointer target, in CSS pixels. */
@@ -133,7 +145,15 @@ export interface TargetFact {
   readonly name?: string | null;
   readonly width: number;
   readonly height: number;
-  /** Distance to the nearest neighbouring target, when measured. */
+  /**
+   * Distance to the nearest neighbouring target, in CSS pixels.
+   *
+   * Null or absent means "not measured", never "no clearance". 2.5.8 excuses an
+   * undersized target whose 24px circle overlaps no other target, so an
+   * unmeasured target cannot be failed - the exception has not been tested. A
+   * target with no neighbour at all should be reported with a spacing at or
+   * above `MIN_TARGET_PX`, not with null.
+   */
   readonly spacing?: number | null;
   /** True for a target inline in a sentence - a 2.5.8 exception. */
   readonly inline?: boolean;
@@ -153,6 +173,17 @@ export interface LinkFact {
   readonly selector?: string;
   readonly name: string;
   readonly href: string;
+  /**
+   * The programmatically determined context WCAG 2.4.4 allows a link's purpose
+   * to be read from: the enclosing sentence, paragraph, list item, table cell
+   * or table header, plus anything `aria-describedby` contributes.
+   *
+   * Null means the harness looked and the link stands alone. Undefined means it
+   * did not look - and then TREE cannot decide 2.4.4 from the link text, because
+   * "Read more" inside a descriptive paragraph conforms, and so does "Details"
+   * in two separately labelled rows.
+   */
+  readonly context?: string | null;
 }
 
 /** An element carrying a `lang` attribute somewhere inside the document. */
@@ -192,6 +223,19 @@ export interface TreePageInput {
   readonly title?: string | null;
   readonly axTree?: AxTreeLike;
   readonly axeViolations?: readonly AxeViolationLike[];
+  /**
+   * Whether axe-core actually executed on this page.
+   *
+   * `axeViolations` cannot answer this. `PageCapture` always carries the array -
+   * the browser result schema defaults it to `[]` - and a caller can turn the
+   * engine off with `job: { axe: false }`, so an empty list means "axe found
+   * nothing" and "axe never ran" alike. Reading the second as the first passes
+   * contrast without testing it. TREE therefore treats axe as having run only
+   * when this says so, when `axePasses` or `axeIncomplete` are supplied, or when
+   * at least one violation came back; short of that every axe-dependent
+   * criterion is inconclusive rather than clean.
+   */
+  readonly axeRan?: boolean;
   /** axe results the engine could not settle. Turns a pass into inconclusive. */
   readonly axeIncomplete?: readonly AxeViolationLike[];
   /** axe results that passed. When supplied, TREE knows exactly which rules ran. */
@@ -373,13 +417,31 @@ const INPUT_PURPOSES: readonly { readonly re: RegExp; readonly token: string; re
   { re: /\b(website|homepage|url)\b/i, token: 'url', label: 'a URL' },
 ];
 
-/** Input `type` values that declare their own purpose. */
+/**
+ * Input `type` values that name a purpose in the autocomplete taxonomy.
+ *
+ * A type is not on its own evidence that the field collects information about
+ * the *user*, which is the only thing 1.3.5 covers. TREE reads this table only
+ * when `FormFieldFact.aboutUser` settles the scope question; otherwise the
+ * field's own metadata has to name the purpose (`INPUT_PURPOSES`).
+ *
+ * `password` is deliberately absent - see `passwordPurpose`, which has to
+ * choose between two tokens rather than assert one.
+ */
 const TYPE_PURPOSES: Readonly<Record<string, { token: string; label: string }>> = {
   email: { token: 'email', label: 'an email address' },
   tel: { token: 'tel', label: 'a telephone number' },
   url: { token: 'url', label: 'a URL' },
-  password: { token: 'current-password', label: 'a password' },
 };
+
+/**
+ * Metadata that says whether a password box takes an existing secret or a new
+ * one. `type="password"` says neither.
+ */
+const NEW_PASSWORD_HINT =
+  /\b(new|confirm|confirmation|repeat|re[-_ ]?type|re[-_ ]?enter|verify|verification|create|creation|choose|register|registration|sign[-_ ]?up|signup|change|reset)\b/i;
+const CURRENT_PASSWORD_HINT =
+  /\b(current|old|existing|sign[-_ ]?in|signin|log[-_ ]?in|login|authenticate)\b/i;
 
 /**
  * Chrome's AX role names, normalised onto ARIA role names.
@@ -607,6 +669,19 @@ export function buildContext(input: TreePageInput): TreeContext {
     for (const id of incompleteRules) ranRules.add(id);
   }
 
+  /*
+   * An empty `axeViolations` array is not evidence that axe ran: the browser
+   * result schema defaults the field to `[]`, and the job can be started with
+   * `axe: false`. Only an explicit flag, a supplied pass or incomplete set, or a
+   * violation that actually came back proves execution. Anything short of that
+   * and the axe-dependent checks report inconclusive instead of clean.
+   */
+  const axeRan =
+    input.axeRan ??
+    (input.axePasses !== undefined ||
+      input.axeIncomplete !== undefined ||
+      (input.axeViolations ?? []).length > 0);
+
   const rawTree = input.axTree ?? {};
   const nodes: TreeNode[] = Object.values(rawTree).map((node) => ({
     nodeId: node.nodeId,
@@ -622,7 +697,7 @@ export function buildContext(input: TreePageInput): TreeContext {
     pageUrl: input.url,
     finalUrl: input.finalUrl ?? input.url,
     title: input.title ?? input.document?.title ?? null,
-    axeRan: input.axeViolations !== undefined,
+    axeRan,
     violationsByRule,
     violationsByCriterion,
     incompleteRules,
@@ -636,7 +711,14 @@ export function buildContext(input: TreePageInput): TreeContext {
   };
 }
 
-/** Did this axe rule actually execute on this page? */
+/**
+ * Did this axe rule actually execute on this page?
+ *
+ * The last line is an assumption - that a run with the default configuration ran
+ * the default rule set - and it is reached only once `ctx.axeRan` has
+ * established that axe ran at all. Supply `axePasses` and the assumption is
+ * replaced by the rule set axe itself reported.
+ */
 function axeRuleRan(ctx: TreeContext, ruleId: string): boolean {
   if (!ctx.axeRan) return false;
   if (ctx.ranRules) return ctx.ranRules.has(ruleId);
@@ -810,6 +892,16 @@ export interface CheckResult {
   readonly findings: readonly AuditFinding[];
   /** Set when the check could not gather the evidence it needed. */
   readonly inconclusive?: string;
+  /**
+   * Findings this check proved for a criterion other than the one it is
+   * registered under.
+   *
+   * They join the page's findings but say nothing about the check's own
+   * criterion. A locked viewport is decisive for 1.4.4 Resize Text and merely
+   * suggestive for 1.4.10 Reflow; folding the two together is exactly what
+   * turns a suggestion into a false failure.
+   */
+  readonly related?: readonly AuditFinding[];
 }
 
 /* -------------------------------------------------------------------------- */
@@ -899,20 +991,92 @@ export function checkSensoryCharacteristics(ctx: TreeContext): CheckResult {
 /* 1.3.5 Identify Input Purpose - decides                                     */
 /* -------------------------------------------------------------------------- */
 
-function inferPurpose(field: FormFieldFact): { token: string; label: string } | null {
-  const type = (field.type ?? '').toLowerCase();
-  const byType = TYPE_PURPOSES[type];
-  if (byType) return byType;
+/**
+ * What TREE requires of one field once its purpose is established.
+ *
+ * `accepted` is the set of autocomplete tokens that satisfy 1.3.5 for the
+ * field. It is one token for most fields and two for a password, because
+ * `current-password` and `new-password` both satisfy the criterion and only the
+ * form around the box says which one belongs. `token` is the one to recommend
+ * when nothing is declared at all.
+ */
+interface InputPurpose {
+  readonly token: string;
+  readonly label: string;
+  readonly accepted: readonly string[];
+}
 
+/**
+ * The purpose of a password box, with the ambiguity left in when it is real.
+ *
+ * `type="password"` does establish that the value is the user's own credential -
+ * no form legitimately collects somebody else's password - so 1.3.5 is in scope.
+ * What it does not establish is whether the box takes the existing secret or a
+ * new one. Assuming `current-password` reports every correctly marked
+ * account-creation field as a mismatch, so where the metadata does not settle
+ * it, both tokens are accepted and neither is asserted.
+ */
+function passwordPurpose(haystack: string): InputPurpose {
+  const wantsNew = NEW_PASSWORD_HINT.test(haystack);
+  const wantsCurrent = CURRENT_PASSWORD_HINT.test(haystack);
+  if (wantsNew && !wantsCurrent) {
+    return { token: 'new-password', label: 'a new password', accepted: ['new-password'] };
+  }
+  if (wantsCurrent && !wantsNew) {
+    return { token: 'current-password', label: 'a password', accepted: ['current-password'] };
+  }
+  return {
+    token: 'current-password',
+    label: 'a password',
+    accepted: ['current-password', 'new-password'],
+  };
+}
+
+/**
+ * The autocomplete purpose a field should carry, or null when TREE cannot say.
+ *
+ * The field's own metadata is read first and the `type` second, because 1.3.5
+ * covers only fields collecting information about the *user*. A `type="email"`
+ * box named `recipient` on an invitation form has a taxonomy purpose and is
+ * still outside the criterion, so a bare type never decides on its own:
+ * `INPUT_PURPOSES` matching the name, id, label or placeholder is what
+ * establishes the field is about the user, and `aboutUser` is how the harness
+ * says so when the name does not.
+ */
+function inferPurpose(field: FormFieldFact): InputPurpose | null {
+  const type = (field.type ?? '').toLowerCase();
   const haystack = [field.name, field.id, field.label, field.placeholder]
     .filter((v): v is string => typeof v === 'string' && v.trim() !== '')
     .join(' ');
-  if (!haystack) return null;
 
-  for (const purpose of INPUT_PURPOSES) {
-    if (purpose.re.test(haystack)) return { token: purpose.token, label: purpose.label };
+  if (type === 'password') return passwordPurpose(haystack);
+
+  if (haystack) {
+    for (const purpose of INPUT_PURPOSES) {
+      if (purpose.re.test(haystack)) {
+        return { token: purpose.token, label: purpose.label, accepted: [purpose.token] };
+      }
+    }
+  }
+
+  const byType = TYPE_PURPOSES[type];
+  if (byType && field.aboutUser === true) {
+    return { token: byType.token, label: byType.label, accepted: [byType.token] };
   }
   return null;
+}
+
+/**
+ * True when the field's type names a taxonomy purpose but nothing establishes
+ * that the value is about the user.
+ *
+ * Only meaningful once `inferPurpose` has returned null. An explicit
+ * `aboutUser: false` is an answer, not a gap: the field is out of scope and the
+ * page is not held open for it.
+ */
+function purposeUndetermined(field: FormFieldFact): boolean {
+  const type = (field.type ?? '').toLowerCase();
+  return TYPE_PURPOSES[type] !== undefined && field.aboutUser === undefined;
 }
 
 export function checkInputPurpose(ctx: TreeContext): CheckResult {
@@ -934,10 +1098,17 @@ export function checkInputPurpose(ctx: TreeContext): CheckResult {
     return { findings };
   }
 
+  /** Fields whose type names a purpose but whose scope is unestablished. */
+  let undetermined = 0;
+
   for (const field of fields) {
     if (findings.length >= MAX_STRUCTURAL_FINDINGS) break;
     const purpose = inferPurpose(field);
-    if (!purpose) continue;
+    if (!purpose) {
+      if (purposeUndetermined(field)) undetermined += 1;
+      continue;
+    }
+    const wanted = purpose.accepted.map((token) => `\`${token}\``).join(' or ');
 
     const declared = collapse(field.autocomplete ?? '').toLowerCase();
     if (declared === '' || declared === 'off') {
@@ -946,7 +1117,7 @@ export function checkInputPurpose(ctx: TreeContext): CheckResult {
         severity: 'moderate',
         rule: 'tree:input-purpose-missing',
         summary: `A field that collects ${purpose.label} does not declare its purpose.`,
-        detail: `Add \`autocomplete="${purpose.token}"\` so assistive technology and the browser can fill or relabel it.${declared === 'off' ? ' `autocomplete="off"` does not satisfy 1.3.5.' : ''}`,
+        detail: `Add \`autocomplete\` with ${wanted} so assistive technology and the browser can fill or relabel it.${declared === 'off' ? ' `autocomplete="off"` does not satisfy 1.3.5.' : ''}`,
         target: field.selector,
         evidence: [
           {
@@ -954,7 +1125,7 @@ export function checkInputPurpose(ctx: TreeContext): CheckResult {
             source: 'tree:input-purpose-missing',
             targets: [field.selector],
             data: {
-              expected: purpose.token,
+              expected: purpose.accepted.join(' '),
               declared: field.autocomplete ?? null,
               type: field.type ?? null,
               name: field.name ?? null,
@@ -968,25 +1139,37 @@ export function checkInputPurpose(ctx: TreeContext): CheckResult {
     }
 
     const tokens = declared.split(/\s+/);
-    if (!tokens.includes(purpose.token)) {
+    if (!purpose.accepted.some((token) => tokens.includes(token))) {
       const finding = buildFinding(ctx.pageUrl, {
         criterion: '1.3.5',
         severity: 'minor',
         rule: 'tree:input-purpose-mismatch',
         summary: `A field that collects ${purpose.label} declares a different autocomplete purpose.`,
-        detail: `Declared \`${declared}\`, expected \`${purpose.token}\`.`,
+        detail: `Declared \`${declared}\`, expected ${wanted}.`,
         target: field.selector,
         evidence: [
           {
             kind: 'dom',
             source: 'tree:input-purpose-mismatch',
             targets: [field.selector],
-            data: { expected: purpose.token, declared, name: field.name ?? null },
+            data: {
+              expected: purpose.accepted.join(' '),
+              declared,
+              name: field.name ?? null,
+            },
           },
         ],
       });
       if (finding) findings.push(finding);
     }
+  }
+
+  if (findings.length === 0 && undetermined > 0) {
+    return {
+      findings,
+      inconclusive:
+        `${undetermined} field${undetermined === 1 ? '' : 's'} declare an input type that names an autocomplete purpose, but nothing on the field says the value is the user's own - and 1.3.5 covers only fields collecting information about the user. Name the purpose in the field's name, id or label, or set \`aboutUser\` when capturing \`document.formFields\`.`,
+    };
   }
 
   return { findings };
@@ -1037,6 +1220,10 @@ function parseViewportMeta(content: string): Record<string, string> {
 
 export function checkReflow(ctx: TreeContext): CheckResult {
   const findings: AuditFinding[] = [];
+  /** Evidence that decides 1.4.4 Resize Text rather than 1.4.10. */
+  const related: AuditFinding[] = [];
+  /** Why 1.4.10 stays open despite a zoom lock. */
+  let deferred: string | null = null;
 
   // Hard evidence first: the page was rendered narrow and scrolled sideways.
   if (ctx.doc.horizontalScrollAt320 === true) {
@@ -1117,57 +1304,63 @@ export function checkReflow(ctx: TreeContext): CheckResult {
     }
 
     if (scalingLocked) {
-      const finding = buildFinding(ctx.pageUrl, {
-        criterion: '1.4.10',
-        severity: 'serious',
-        rule: 'tree:reflow-scaling-locked',
-        summary: 'The viewport blocks zooming, which prevents the page reflowing.',
-        detail:
-          'Remove `user-scalable=no` and any `maximum-scale` below 2. The same declaration also fails 1.4.4 Resize Text, which axe reports separately.',
-        target: 'meta[name=viewport]',
-        evidence: [
-          {
-            kind: 'document',
-            source: 'tree:reflow-scaling-locked',
-            targets: ['meta[name=viewport]'],
-            data: {
-              metaViewport: meta,
-              userScalable: parsed['user-scalable'] ?? null,
-              maximumScale: parsed['maximum-scale'] ?? null,
+      /*
+       * A zoom lock is decisive for 1.4.4 Resize Text and is not, on its own, a
+       * 1.4.10 failure. W3C's own ACT rule for this directive is written for
+       * 1.4.4 and says outright that a page can still satisfy 1.4.10 with the
+       * rule failing - content that already fits at 320 CSS px has nothing to
+       * reflow. So the finding is filed where the evidence actually decides
+       * something, and 1.4.10 waits for a measurement at 320px.
+       */
+      if (!axeRuleFired(ctx, 'meta-viewport')) {
+        const finding = buildFinding(ctx.pageUrl, {
+          criterion: '1.4.4',
+          severity: 'serious',
+          rule: 'tree:resize-text-scaling-locked',
+          summary: 'The viewport blocks zooming, so text cannot be resized.',
+          detail:
+            'Remove `user-scalable=no` and any `maximum-scale` below 2. A reader who needs larger text has no way round this.',
+          target: 'meta[name=viewport]',
+          needsConfirmation: true,
+          evidence: [
+            {
+              kind: 'document',
+              source: 'tree:resize-text-scaling-locked',
+              targets: ['meta[name=viewport]'],
+              data: {
+                metaViewport: meta,
+                userScalable: parsed['user-scalable'] ?? null,
+                maximumScale: parsed['maximum-scale'] ?? null,
+              },
             },
-          },
-        ],
-      });
-      if (finding) findings.push(finding);
+          ],
+        });
+        if (finding) related.push(finding);
+      }
+      deferred =
+        'The viewport blocks zooming. That fails 1.4.4 Resize Text and is reported there; it does not by itself prove content fails to reflow, because content that already fits at 320 CSS px has nothing to reflow. Deciding 1.4.10 needs the page rendered at 320 CSS px and checked for two-dimensional scrolling - capture `document.horizontalScrollAt320`.';
     }
   } else if (axeRuleFired(ctx, 'meta-viewport')) {
-    // No document facts, but axe already proved the viewport is locked. That is
-    // enough to fail reflow; axe files the same node under 1.4.4 itself.
-    const violation = ctx.violationsByRule.get('meta-viewport');
-    const node = violation?.nodes?.[0];
-    if (violation && node) {
-      const finding = buildFinding(ctx.pageUrl, {
-        criterion: '1.4.10',
-        severity: 'serious',
-        rule: 'tree:reflow-scaling-locked',
-        summary: 'The viewport blocks zooming, which prevents the page reflowing.',
-        detail: collapse(node.failureSummary ?? violation.help ?? ''),
-        target: 'meta[name=viewport]',
-        evidence: [axeEvidence(violation, node, { secondaryCriterion: '1.4.10' })],
-      });
-      if (finding) findings.push(finding);
+    // No document facts, but axe proved the viewport is locked. axe files that
+    // node under 1.4.4 itself and `axePassthrough` carries it through, so there
+    // is nothing to add here beyond withholding the 1.4.10 verdict.
+    deferred =
+      'axe found the viewport blocks zooming, which is reported under 1.4.4 Resize Text. Whether content reflows at 320 CSS px was not measured, so 1.4.10 stays open.';
+  }
+
+  if (findings.length === 0) {
+    if (deferred) return { findings, related, inconclusive: deferred };
+    if (ctx.doc.horizontalScrollAt320 == null) {
+      return {
+        findings,
+        related,
+        inconclusive:
+          'TREE found no viewport lock. Confirming the page reflows needs it rendered at 320 CSS px, which is an ACT check.',
+      };
     }
   }
 
-  if (findings.length === 0 && ctx.doc.horizontalScrollAt320 == null) {
-    return {
-      findings,
-      inconclusive:
-        'TREE found no viewport lock. Confirming the page reflows needs it rendered at 320 CSS px, which is an ACT check.',
-    };
-  }
-
-  return { findings };
+  return { findings, related };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1327,16 +1520,47 @@ export function checkPageTitle(ctx: TreeContext): CheckResult {
 /* 2.4.4 Link Purpose (In Context) - decides                                  */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * The part of a link's programmatically determined context that adds something
+ * to its name. Empty when there is none, or when the context is only the link
+ * text over again.
+ */
+function linkContext(link: LinkFact): string {
+  const context = normaliseText(link.context ?? '');
+  if (context === '') return '';
+  const name = normaliseText(link.name);
+  if (name === '') return context;
+  return context.split(name).join(' ').replace(/\s+/g, ' ').trim();
+}
+
+/**
+ * 2.4.4 is Link Purpose *In Context*.
+ *
+ * "Read more" inside a descriptive sentence conforms, and two "Details" links in
+ * separately labelled table rows conform, so the link name on its own settles
+ * nothing. `LinkFact.context` is the only carrier of the enclosing sentence,
+ * paragraph, list item or table cell the criterion allows the purpose to be read
+ * from; where it was not captured TREE says so rather than guessing.
+ */
 export function checkLinkPurpose(ctx: TreeContext): CheckResult {
   const findings: AuditFinding[] = [...axeFindingsFor(ctx, '2.4.4')];
+  const links = ctx.doc.links;
+  /** Links whose purpose could not be settled because context is missing. */
+  let contextUnknown = 0;
 
-  if (ctx.hasTree) {
-    for (const node of ctx.nodes) {
+  if (links) {
+    // A generic name is a failure only where the harness looked for context and
+    // found none that adds anything to the name.
+    for (const link of links) {
       if (findings.length >= MAX_STRUCTURAL_FINDINGS) break;
-      if (node.ignored || node.role !== 'link') continue;
-      const name = collapse(node.name ?? '');
+      const name = collapse(link.name);
       if (name === '') continue; // a nameless link is `axe:link-name`, already filed
       if (!GENERIC_LINK_NAMES.has(name.toLowerCase().replace(/[.…]+$/, ''))) continue;
+      if (link.context === undefined) {
+        contextUnknown += 1;
+        continue;
+      }
+      if (linkContext(link) !== '') continue; // the context supplies the purpose
 
       const finding = buildFinding(ctx.pageUrl, {
         criterion: '2.4.4',
@@ -1344,40 +1568,64 @@ export function checkLinkPurpose(ctx: TreeContext): CheckResult {
         rule: 'tree:link-purpose-generic',
         summary: `A link is announced only as "${truncate(name, 40)}".`,
         detail:
-          'Screen reader users routinely pull up a list of every link on the page, where surrounding text is gone. Put the destination in the link text.',
+          'Nothing in the surrounding sentence, list item or table cell says where it goes either, so the purpose is not determinable from the link text together with its context. Put the destination in the link text.',
         target: `link:${name}`,
         evidence: [
           {
-            kind: 'axtree',
+            kind: 'dom',
             source: 'tree:link-purpose-generic',
-            targets: [node.nodeId],
-            data: { accessibleName: truncate(name, 120), role: node.rawRole },
+            targets: [link.selector ?? link.href],
+            data: {
+              accessibleName: truncate(name, 120),
+              href: truncate(link.href, 200),
+              context: link.context === null ? null : truncate(link.context, 160),
+            },
           },
         ],
       });
       if (finding) findings.push(finding);
     }
-  }
 
-  const links = ctx.doc.links;
-  if (links) {
-    const byName = new Map<string, Set<string>>();
+    // A shared name is a failure only where the same name in the same context
+    // leads to two different destinations.
+    const byName = new Map<string, LinkFact[]>();
     for (const link of links) {
       const name = normaliseText(link.name);
       if (name === '') continue;
-      const bucket = byName.get(name) ?? new Set<string>();
-      bucket.add(link.href);
+      const bucket = byName.get(name) ?? [];
+      bucket.push(link);
       byName.set(name, bucket);
     }
-    for (const [name, hrefs] of byName) {
-      if (hrefs.size < 2) continue;
+    for (const [name, group] of byName) {
       if (findings.length >= MAX_STRUCTURAL_FINDINGS) break;
+      if (new Set(group.map((l) => l.href)).size < 2) continue;
+      if (group.some((l) => l.context === undefined)) {
+        contextUnknown += 1;
+        continue;
+      }
+
+      // Name plus context is the purpose the criterion actually asks about, so
+      // that is what has to collide before this is a failure.
+      const byPurpose = new Map<string, Set<string>>();
+      for (const link of group) {
+        const purpose = `${name}|${linkContext(link)}`;
+        const destinations = byPurpose.get(purpose) ?? new Set<string>();
+        destinations.add(link.href);
+        byPurpose.set(purpose, destinations);
+      }
+      const hrefs = new Set<string>();
+      for (const destinations of byPurpose.values()) {
+        if (destinations.size < 2) continue;
+        for (const href of destinations) hrefs.add(href);
+      }
+      if (hrefs.size === 0) continue;
+
       const finding = buildFinding(ctx.pageUrl, {
         criterion: '2.4.4',
         severity: 'moderate',
         rule: 'tree:link-purpose-ambiguous',
         summary: `${hrefs.size} links share the name "${truncate(name, 40)}" but go to different places.`,
-        detail: `Destinations: ${[...hrefs].slice(0, 5).join(', ')}.`,
+        detail: `Nothing in the enclosing sentence, list item or table cell distinguishes them either. Destinations: ${[...hrefs].slice(0, 5).join(', ')}.`,
         target: name,
         evidence: [
           {
@@ -1390,10 +1638,30 @@ export function checkLinkPurpose(ctx: TreeContext): CheckResult {
       });
       if (finding) findings.push(finding);
     }
+  } else if (ctx.hasTree) {
+    // The accessibility tree carries no enclosing sentence, list item or table
+    // cell, so a generic name read off it cannot settle the criterion either
+    // way. Count them, so the reason names a number.
+    for (const node of ctx.nodes) {
+      if (node.ignored || node.role !== 'link') continue;
+      const name = collapse(node.name ?? '');
+      if (name === '') continue;
+      if (!GENERIC_LINK_NAMES.has(name.toLowerCase().replace(/[.…]+$/, ''))) continue;
+      contextUnknown += 1;
+    }
   }
 
-  if (!ctx.hasTree && !links && !axeRuleRan(ctx, 'link-name')) {
-    return { findings, inconclusive: 'No accessibility tree, link list or axe result was captured.' };
+  if (findings.length === 0) {
+    if (contextUnknown > 0) {
+      return {
+        findings,
+        inconclusive:
+          `${contextUnknown} link${contextUnknown === 1 ? '' : 's'} could not be settled: a generic name, or a name shared with a different destination, fails 2.4.4 only when the programmatically determined context does not supply the purpose. Capture \`document.links[].context\` - the enclosing sentence, list item, table cell or \`aria-describedby\` text - before this is decided.`,
+      };
+    }
+    if (!ctx.hasTree && !links && !axeRuleRan(ctx, 'link-name')) {
+      return { findings, inconclusive: 'No accessibility tree, link list or axe result was captured.' };
+    }
   }
 
   return { findings };
@@ -1557,14 +1825,24 @@ export function checkTargetSize(ctx: TreeContext): CheckResult {
 
   const targets = ctx.doc.targets;
   if (targets) {
+    /** Undersized targets whose spacing exception could not be evaluated. */
+    let unmeasured = 0;
     for (const target of targets) {
       if (findings.length >= MAX_STRUCTURAL_FINDINGS) break;
       if (target.exempt || target.inline) continue;
       const tooSmall = target.width < MIN_TARGET_PX || target.height < MIN_TARGET_PX;
       if (!tooSmall) continue;
-      // Spacing exception: an undersized target passes when a 24px circle
-      // centred on it overlaps no other target.
-      if (typeof target.spacing === 'number' && target.spacing >= MIN_TARGET_PX) continue;
+      /*
+       * Spacing exception: an undersized target still passes when a 24px circle
+       * centred on it overlaps no other target. Unmeasured spacing has not
+       * tested that exception, so it cannot support a failure - the evidence
+       * would read `spacing: null`, which proves nothing either way.
+       */
+      if (target.spacing === undefined || target.spacing === null) {
+        unmeasured += 1;
+        continue;
+      }
+      if (target.spacing >= MIN_TARGET_PX) continue;
 
       const finding = buildFinding(ctx.pageUrl, {
         criterion: '2.5.8',
@@ -1590,6 +1868,15 @@ export function checkTargetSize(ctx: TreeContext): CheckResult {
       });
       if (finding) findings.push(finding);
     }
+
+    if (findings.length === 0 && unmeasured > 0) {
+      return {
+        findings,
+        inconclusive:
+          `${unmeasured} target${unmeasured === 1 ? ' is' : 's are'} under 24x24 CSS pixels, but the distance to the nearest neighbouring target was not measured, so the 2.5.8 spacing exception has not been tested. Report \`spacing\` on \`document.targets\` - at or above 24 where the target has no neighbour - before this is decided.`,
+      };
+    }
+
     return { findings };
   }
 
@@ -1961,6 +2248,9 @@ export function auditPage(input: TreePageInput): PageAudit {
   for (const [criterion, check] of CHECKS) {
     const result = check(ctx);
     findings.push(...result.findings);
+    // Evidence for somebody else's criterion is kept, but it must not be read
+    // as a verdict on this one.
+    if (result.related) findings.push(...result.related);
 
     if (result.findings.length > 0) {
       failed.push(criterion);
@@ -2000,7 +2290,9 @@ export function auditPage(input: TreePageInput): PageAudit {
     );
   }
   if (!ctx.axeRan) {
-    warnings.push('No axe-core result was supplied; TREE decided only what the tree and DOM facts showed.');
+    warnings.push(
+      'No axe-core result was supplied, or axe did not run; TREE decided only what the tree and DOM facts showed. An empty violation list is not evidence that axe ran - pass `axeRan: true`, or `axePasses`, when it did.',
+    );
   }
   if (!ctx.hasTree) {
     warnings.push('No accessibility tree was supplied; the structural checks did not run.');
