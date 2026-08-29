@@ -25,6 +25,10 @@ export type TestFramework =
   | 'vitest'
   | 'jest'
   | 'playwright'
+  | 'cypress'
+  | 'testcafe'
+  | 'nightwatch'
+  | 'webdriverio'
   | 'mocha'
   | 'ava'
   | 'node'
@@ -69,7 +73,51 @@ const SCRIPT_PREFERENCE: ReadonlyArray<{ script: string; source: DetectionSource
   { script: 'vitest', source: 'script:vitest' },
 ];
 
-const E2E_SCRIPTS = ['test:e2e', 'e2e', 'test:playwright', 'playwright'] as const;
+const E2E_SCRIPTS = [
+  'test:e2e',
+  'e2e',
+  'test:playwright',
+  'playwright',
+  'test:cypress',
+  'cypress',
+  'cy:run',
+] as const;
+
+/**
+ * Runners that drive a real browser against a served application.
+ *
+ * Not one of them can run in this gate, because nothing here serves the target.
+ * They fail on the environment, and A6.4 turns a failing suite into a stop — so
+ * misreading one of these as a unit suite rejects a good patch for a reason that
+ * has nothing to do with the patch. Which runner it is makes no difference to
+ * that, so the whole family is reported and skipped, whatever the script holding
+ * it happens to be called.
+ */
+const E2E_FRAMEWORKS: ReadonlySet<TestFramework> = new Set<TestFramework>([
+  'playwright',
+  'cypress',
+  'testcafe',
+  'nightwatch',
+  'webdriverio',
+]);
+
+/** True when this runner needs a served application, and so is a different gate. */
+function isE2eFramework(framework: TestFramework): boolean {
+  return E2E_FRAMEWORKS.has(framework);
+}
+
+/** The runner's name as it reads in a sentence on the approval card. */
+const E2E_FRAMEWORK_LABELS: Readonly<Record<string, string>> = {
+  playwright: 'Playwright',
+  cypress: 'Cypress',
+  testcafe: 'TestCafe',
+  nightwatch: 'Nightwatch',
+  webdriverio: 'WebdriverIO',
+};
+
+function e2eLabel(framework: TestFramework): string {
+  return E2E_FRAMEWORK_LABELS[framework] ?? 'browser-based';
+}
 
 /**
  * Work out how this repository runs its tests.
@@ -84,11 +132,13 @@ export function detectTestCommand(pkg: PackageJsonLike | null | undefined): Test
   const scripts = pkg?.scripts ?? {};
   const namedE2e = E2E_SCRIPTS.find((name) => typeof scripts[name] === 'string') ?? null;
 
-  // A `test` script that turns out to be Playwright is an end-to-end suite that
-  // happens to be called `test`. Running it here would launch a browser against
-  // an application nothing has served, and reject a good patch on a failure that
-  // is about the environment. It is reported as e2e and the search continues.
-  let e2eFromScript: string | null = null;
+  // A `test` script that turns out to be an end-to-end runner is a browser suite
+  // that happens to be called `test`. Running it here would launch a browser
+  // against an application nothing has served, and reject a good patch on a
+  // failure that is about the environment. Which runner it is changes nothing:
+  // Playwright, Cypress and the rest are all reported as e2e, and the search for
+  // a unit suite carries on to `test:unit` and `vitest`.
+  let e2eFromScript: { readonly script: string; readonly framework: TestFramework } | null = null;
 
   for (const { script, source } of SCRIPT_PREFERENCE) {
     const body = scripts[script];
@@ -96,8 +146,8 @@ export function detectTestCommand(pkg: PackageJsonLike | null | undefined): Test
     if (script === 'test' && NO_TEST_PLACEHOLDER.test(body)) continue;
 
     const framework = frameworkOf(body);
-    if (framework === 'playwright') {
-      e2eFromScript ??= script;
+    if (isE2eFramework(framework)) {
+      e2eFromScript ??= { script, framework };
       continue;
     }
 
@@ -107,12 +157,13 @@ export function detectTestCommand(pkg: PackageJsonLike | null | undefined): Test
       framework,
       source,
       scriptBody: body,
-      e2eScript: namedE2e ?? e2eFromScript,
+      e2eScript: namedE2e ?? e2eFromScript?.script ?? null,
       reason:
         `The repository defines \`npm run ${script}\` as \`${body}\`, so that is what ran.` +
         (e2eFromScript
-          ? ` Its \`${e2eFromScript}\` script is Playwright and was left alone — an end-to-end ` +
-            'suite needs a served application and is a different gate.'
+          ? ` Its \`${e2eFromScript.script}\` script is ${e2eLabel(e2eFromScript.framework)} and ` +
+            'was left alone — an end-to-end suite needs a served application and is a different ' +
+            'gate.'
           : ''),
     };
   }
@@ -125,7 +176,7 @@ export function detectTestCommand(pkg: PackageJsonLike | null | undefined): Test
   // request as though it had failed. The zero-test case is separated afterwards,
   // from the runner's own output, and reported as unproven rather than as a pass.
   const deps = { ...(pkg?.devDependencies ?? {}), ...(pkg?.dependencies ?? {}) };
-  const e2eScript = namedE2e ?? e2eFromScript;
+  const e2eScript = namedE2e ?? e2eFromScript?.script ?? null;
 
   if (typeof deps['vitest'] === 'string') {
     return {
@@ -159,9 +210,10 @@ export function detectTestCommand(pkg: PackageJsonLike | null | undefined): Test
     scriptBody: null,
     e2eScript,
     reason: e2eFromScript
-      ? `This repository's \`${e2eFromScript}\` script is a Playwright end-to-end suite, which ` +
-        'needs a served application and is a different gate. It defines no unit test suite, so ' +
-        'nothing ran here. The patch is backed by the build and the criterion re-check only.'
+      ? `This repository's \`${e2eFromScript.script}\` script is a ` +
+        `${e2eLabel(e2eFromScript.framework)} end-to-end suite, which needs a served ` +
+        'application and is a different gate. It defines no unit test suite, so nothing ran ' +
+        'here. The patch is backed by the build and the criterion re-check only.'
       : 'This repository defines no unit test suite, so there was nothing to run. The patch is ' +
         'backed by the build and the criterion re-check only.',
   };
@@ -193,6 +245,10 @@ function frameworkOf(body: string): TestFramework {
   if (/\bvitest\b/.test(text)) return 'vitest';
   if (/\bjest\b/.test(text)) return 'jest';
   if (/\bplaywright\b/.test(text)) return 'playwright';
+  if (/\bcypress\b|\bcy:(?:run|open)\b/.test(text)) return 'cypress';
+  if (/\btestcafe\b/.test(text)) return 'testcafe';
+  if (/\bnightwatch\b/.test(text)) return 'nightwatch';
+  if (/\bwdio\b|\bwebdriverio\b/.test(text)) return 'webdriverio';
   if (/\bmocha\b/.test(text)) return 'mocha';
   if (/\bava\b/.test(text)) return 'ava';
   if (/node\s+--test|node:test/.test(text)) return 'node';

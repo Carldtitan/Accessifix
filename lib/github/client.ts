@@ -72,6 +72,12 @@ export interface CommitResult {
 export interface BranchResult {
   readonly name: string;
   readonly sha: string;
+  /**
+   * The commit the branch was cut from, or — when it already existed — the base
+   * its tip was checked against. Kept so a caller can pin `parentSha` rather than
+   * trusting whatever the branch tip happens to be by the time it commits.
+   */
+  readonly baseSha: string;
   /** False when the branch already existed and was reused. */
   readonly created: boolean;
 }
@@ -349,6 +355,15 @@ export class GitHubClient {
    * Reuse rather than failure is deliberate: a run that was interrupted after
    * pushing but before opening the pull request has to be able to resume (A12).
    *
+   * Reuse is not the same as trust. The approval named a base; a branch that
+   * merely shares the name is evidence of nothing. It can be a collision with
+   * somebody else's work, a leftover from a run against different history, or a
+   * ref someone repointed by hand. `commitFiles` defaults its parent to the
+   * branch tip, so an unchecked tip becomes the parent of the approved patch and
+   * the human ends up reading a diff cut from history they never saw. The tip is
+   * therefore measured against the base that was authorised, and a branch that is
+   * not this run's to resume is refused out loud instead of written to.
+   *
    * A7.1: a branch is a write, so it needs the human's yes for this repository
    * and this branch name before anything reaches the remote.
    */
@@ -366,11 +381,16 @@ export class GitHubClient {
     });
 
     const base = fromRef ?? (await this.getDefaultBranch(repo));
+    // Resolved before the existence check, because the base is what an existing
+    // branch has to be measured against — not merely what a new one is cut from.
+    const baseSha = await this.resolveSha(repo, base);
 
     const existing = await this.getBranchSha(repo, branch);
-    if (existing) return { name: branch, sha: existing, created: false };
+    if (existing) {
+      await this.assertReusableBranch(repo, branch, existing, base, baseSha);
+      return { name: branch, sha: existing, baseSha, created: false };
+    }
 
-    const baseSha = await this.resolveSha(repo, base);
     try {
       const { data } = await this.octokit.rest.git.createRef({
         owner,
@@ -378,18 +398,115 @@ export class GitHubClient {
         ref: `refs/heads/${branch}`,
         sha: baseSha,
       });
-      return { name: branch, sha: data.object.sha, created: true };
+      return { name: branch, sha: data.object.sha, baseSha, created: true };
     } catch (error) {
-      // Lost a race with another writer; the branch exists now either way.
+      // Lost a race with another writer; the branch exists now either way. It
+      // still has to be the branch this run asked for — losing a race is not a
+      // reason to skip the check.
       if (statusOf(error) === 422) {
         const sha = await this.getBranchSha(repo, branch);
-        if (sha) return { name: branch, sha, created: false };
+        if (sha) {
+          await this.assertReusableBranch(repo, branch, sha, base, baseSha);
+          return { name: branch, sha, baseSha, created: false };
+        }
       }
       throw new GitHubError(
         'createBranch',
         `${owner}/${name}@${branch}: ${messageOf(error)}`,
         statusOf(error),
         error,
+      );
+    }
+  }
+
+  /**
+   * Refuse an existing branch that is not the one this run would have created.
+   *
+   * Two things have to hold before an approved patch may be committed onto a
+   * branch AccessiFix did not just create:
+   *
+   *  1. The tip descends from the approved base. If that base is not in the
+   *     branch's history, the branch was cut from something else entirely and
+   *     the commit about to be written would sit on unrelated history.
+   *  2. Whatever the branch carries on top of that base is the signed-in user's
+   *     own. Under A1.4 every commit AccessiFix makes is attributed to the
+   *     person who asked for it, so a same-named branch holding somebody else's
+   *     commits is not an interrupted run — it is a collision, and those commits
+   *     would ride into the pull request underneath the approved patch.
+   *
+   * A commit GitHub cannot attribute counts as somebody else's. "We could not
+   * tell" is not the same as "it was ours", and this is the one place where
+   * guessing wrong writes to another person's repository.
+   */
+  private async assertReusableBranch(
+    repo: RepoLike,
+    branch: string,
+    tipSha: string,
+    base: string,
+    baseSha: string,
+  ): Promise<void> {
+    // Nothing on top of the base at all: created but never committed to, which
+    // is exactly the interrupted run that reuse exists for.
+    if (tipSha === baseSha) return;
+
+    const { owner, repo: name } = asRepo(repo);
+    let comparison;
+    try {
+      const { data } = await this.octokit.rest.repos.compareCommitsWithBasehead({
+        owner,
+        repo: name,
+        basehead: `${baseSha}...${tipSha}`,
+        per_page: 100,
+      });
+      comparison = data;
+    } catch (error) {
+      throw new GitHubError(
+        'createBranch',
+        `Branch "${branch}" already exists at ${shortSha(tipSha)} and its relationship to the ` +
+          `approved base "${base}" (${shortSha(baseSha)}) could not be established: ` +
+          `${messageOf(error)}. Refusing to commit onto an unverified branch.`,
+        statusOf(error),
+        error,
+      );
+    }
+
+    if (comparison.status !== 'identical' && comparison.status !== 'ahead') {
+      throw new GitHubError(
+        'createBranch',
+        `Branch "${branch}" already exists at ${shortSha(tipSha)}, which does not descend from ` +
+          `the approved base "${base}" (${shortSha(baseSha)}) — GitHub compares them as ` +
+          `"${comparison.status}". Committing onto it would put the approved patch on history ` +
+          'the human never saw. Delete the branch or use a different branch name.',
+        409,
+      );
+    }
+
+    const commits = comparison.commits ?? [];
+    const ahead = comparison.ahead_by ?? commits.length;
+    if (ahead > commits.length) {
+      throw new GitHubError(
+        'createBranch',
+        `Branch "${branch}" is ${ahead} commit(s) ahead of the approved base "${base}", more ` +
+          'than one comparison can list, so what it carries cannot be accounted for. That is ' +
+          'not an interrupted AccessiFix run. Use a different branch name.',
+        409,
+      );
+    }
+
+    const login = await this.getAuthenticatedLogin();
+    const foreign = commits.filter(
+      (commit) => (commit.author?.login ?? '').toLowerCase() !== login.toLowerCase(),
+    );
+    if (foreign.length > 0) {
+      const first = foreign[0];
+      const who = first?.author?.login ?? 'an unattributed author';
+      throw new GitHubError(
+        'createBranch',
+        `Branch "${branch}" already exists and carries ${foreign.length} commit(s) above the ` +
+          `approved base that are not ${login}'s (${shortSha(first?.sha ?? tipSha)} by ` +
+          `${who}). That is another branch with the same name, not this run's to resume, and ` +
+          'those commits would end up inside the pull request. Use a different branch name.',
+        409,
       );
     }
   }
@@ -612,6 +729,11 @@ export class GitHubClient {
       );
     }
   }
+}
+
+/** Seven characters, because that is what a human reads in an error message. */
+function shortSha(sha: string): string {
+  return sha.slice(0, 7);
 }
 
 function normalizePath(path: string): string {
