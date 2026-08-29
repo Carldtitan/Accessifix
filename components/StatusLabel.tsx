@@ -19,6 +19,7 @@ export type StatusValue =
   | "auditing"
   | "fixing"
   | "verifying"
+  | "scoring"
   | "awaiting_approval"
   | "complete"
   | "failed"
@@ -37,6 +38,11 @@ export type StatusValue =
   | "DECIDE"
   | "FLAG"
   | "BLOCKED"
+  // criterion state, as the score reports it (lib/pipeline/score.ts)
+  | "passing"
+  | "failing"
+  | "flagged"
+  | "blocked"
   // severity
   | "critical"
   | "serious"
@@ -49,6 +55,7 @@ const tones: Record<StatusValue, StatusTone> = {
   auditing: "live",
   fixing: "live",
   verifying: "live",
+  scoring: "live",
   awaiting_approval: "attention",
   complete: "done",
   failed: "blocked",
@@ -67,6 +74,11 @@ const tones: Record<StatusValue, StatusTone> = {
   DECIDE: "done",
   FLAG: "attention",
   BLOCKED: "blocked",
+
+  passing: "done",
+  failing: "blocked",
+  flagged: "attention",
+  blocked: "blocked",
 
   critical: "blocked",
   serious: "attention",

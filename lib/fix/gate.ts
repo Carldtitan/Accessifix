@@ -342,6 +342,35 @@ export async function withApproval<T>(
   return fn();
 }
 
+/**
+ * Re-attach a request to the operation a human actually answered.
+ *
+ * The builders below derive an `ApprovalOperation` from whatever they are given,
+ * which is right at the moment the card goes up and wrong at the moment the
+ * write runs. By then the request has to be rebuilt — the prose, the evidence
+ * and the action all come from the same builders — but rebuilding the operation
+ * too would make `assertApproved` compare the current payload against itself and
+ * agree every time. That is not an approval, it is a mirror.
+ *
+ * So the write path rebuilds the request and then puts back the operation that
+ * was recorded when the decision was made. Everything the human bound — the
+ * repository, the branch, the base, the title, the tip, and the digest of every
+ * file's contents — comes from the stored decision; only the wording is fresh.
+ * If any of it has since moved, the comparison at the call site now has two
+ * genuinely different operations in hand and refuses the write.
+ */
+export function bindApprovalToOperation(
+  request: ApprovalRequest,
+  approved: ApprovalOperation,
+): ApprovalRequest {
+  return {
+    ...request,
+    action: approved.action,
+    operation: approved,
+    fingerprint: fingerprintOperation(approved),
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Builders                                                                   */
 /* -------------------------------------------------------------------------- */
@@ -435,6 +464,19 @@ export interface BranchApprovalInput {
   readonly branch: string;
   readonly baseBranch: string;
   readonly patches: readonly FilePatch[];
+  /**
+   * The tip the branch is already at, when it exists and carries commits above
+   * the base — read before asking, and bound into the operation as `commitSha`.
+   *
+   * Reusing a branch that already has history is the human authorising *that
+   * exact tip*, because nothing else can establish that those commits came from
+   * an interrupted run of this tool. Commit author attribution cannot: GitHub
+   * derives it from the commit email, so a branch of the operator's own
+   * unrelated work carries their login just as readily. Leave it unset for a
+   * branch that does not exist yet or sits exactly on the base; an existing
+   * branch ahead of the base is then refused rather than silently resumed.
+   */
+  readonly resumeFromSha?: string | null;
   readonly id?: string;
   readonly now?: Date;
 }
@@ -442,11 +484,13 @@ export interface BranchApprovalInput {
 /** The gate before a branch reaches the remote (A7.1). */
 export function buildBranchApproval(input: BranchApprovalInput): ApprovalRequest {
   const files = input.patches.map((patch) => patch.filePath);
+  const resumeFromSha = input.resumeFromSha ?? null;
   const operation = patchOperation('push-branch', {
     repoFullName: input.repoFullName,
     patches: input.patches,
     branch: input.branch,
     base: input.baseBranch,
+    commitSha: resumeFromSha,
   });
 
   return {
@@ -454,10 +498,15 @@ export function buildBranchApproval(input: BranchApprovalInput): ApprovalRequest
     runId: input.runId,
     action: 'push-branch',
     title: ACTION_TITLES['push-branch'],
-    intent:
-      `I want to create the branch \`${input.branch}\` in ${input.repoFullName}, cut from ` +
-      `\`${input.baseBranch}\`, and commit ${countNoun(files.length, 'file')} to it. This is a ` +
-      `write to your repository using your own GitHub token. \`${input.baseBranch}\` is not touched.`,
+    intent: resumeFromSha
+      ? `The branch \`${input.branch}\` already exists in ${input.repoFullName} at ` +
+        `${resumeFromSha.slice(0, 7)}, ahead of \`${input.baseBranch}\`. I want to reuse it and ` +
+        `commit ${countNoun(files.length, 'file')} on top of what it already carries. Approving ` +
+        `this accepts those existing commits into the eventual pull request as well. This is a ` +
+        `write to your repository using your own GitHub token. \`${input.baseBranch}\` is not touched.`
+      : `I want to create the branch \`${input.branch}\` in ${input.repoFullName}, cut from ` +
+        `\`${input.baseBranch}\`, and commit ${countNoun(files.length, 'file')} to it. This is a ` +
+        `write to your repository using your own GitHub token. \`${input.baseBranch}\` is not touched.`,
     reason:
       `The patches have to live somewhere a pull request can point at. A branch is the smallest ` +
       `thing that does that, and it can be deleted without trace if you decide against the change.`,
@@ -476,6 +525,7 @@ export function buildBranchApproval(input: BranchApprovalInput): ApprovalRequest
       repoFullName: input.repoFullName,
       branch: input.branch,
       base: input.baseBranch,
+      commitSha: resumeFromSha,
       files,
     },
     createdAt: (input.now ?? new Date()).toISOString(),

@@ -1,0 +1,600 @@
+/* =====================================================================
+   The wire shapes the pipeline actually returns, and the pure mappers
+   that turn them into what the presentational components render.
+
+   This file replaces components/sample-data.ts. Nothing here invents a
+   value: every field is either present in the ledger or omitted, and a
+   count this view cannot obtain is reported as unknown rather than as
+   zero.
+
+   Deliberately free of `lib/db` and of React, so a server component and
+   a client component can both import it.
+   ===================================================================== */
+
+import type { TimelineEvent, HarnessCapability } from "./AgentTimeline";
+import type { CriterionCell, CriterionLevel, CriterionRow } from "./CriterionMatrix";
+import type { BrowserEnvironment, EnvironmentState, PathTemplate } from "./EnvironmentGrid";
+import type { AuditAgent, Finding, FindingSeverity, FindingStatus } from "./FindingCard";
+import type { Patch } from "./DiffCard";
+import type { RunPhase, RunSummary } from "./RunSummaryBar";
+import type { StatusValue } from "./StatusLabel";
+
+/* -------------------------------------------------------------------------- */
+/* Wire shapes                                                                */
+/* -------------------------------------------------------------------------- */
+
+export type RunStatusWire =
+  | "queued"
+  | "crawling"
+  | "auditing"
+  | "scoring"
+  | "fixing"
+  | "verifying"
+  | "awaiting_approval"
+  | "done"
+  | "failed";
+
+export interface RunWire {
+  id: string;
+  targetId: string;
+  phase: "baseline" | "final";
+  status: RunStatusWire;
+  /** The pipeline state machine's own label. Equal to `status` in practice. */
+  state?: string;
+  /** Present only while paused: the state the run returns to (A7.4). */
+  pausedFrom?: string | null;
+  inFlight?: boolean;
+  maxSandboxes: number;
+  sandboxesUsed: number;
+  failureReason: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  createdAt: string;
+}
+
+export interface TargetWire {
+  id: string;
+  repoFullName: string;
+  deployedUrl: string;
+}
+
+export interface CriterionScoreWire {
+  criterion: string;
+  name: string;
+  level: CriterionLevel;
+  verdict: "DECIDE" | "FLAG" | "BLOCKED";
+  findings: number;
+  open: number;
+  state: "passing" | "failing" | "flagged" | "blocked";
+  reason?: string;
+}
+
+export interface RunScoreWire {
+  phase: "baseline" | "final";
+  totalCriteria: number;
+  failingCriteria: number;
+  flaggedCriteria: number;
+  blockedCriteria: number;
+  passingCriteria: number;
+  totalFindings: number;
+  openFindings: number;
+  bySeverity: Record<string, number>;
+  criteria: CriterionScoreWire[];
+  disclaimer: string;
+}
+
+export interface FindingWire {
+  id: string;
+  runId: string;
+  phase: string;
+  pageUrl: string;
+  criterion: string;
+  level: CriterionLevel;
+  verdict: "DECIDE" | "FLAG" | "BLOCKED";
+  status: string;
+  severity: string;
+  agent: string;
+  summary: string;
+  detail: string | null;
+  sourcePath: string | null;
+  criterionName?: string | null;
+  plainEnglish?: string | null;
+  createdAt: string;
+  evidence?: ReadonlyArray<{ id: string; kind: string; mimeType: string }>;
+}
+
+export interface JobWire {
+  id: string;
+  runId: string;
+  phase: string;
+  jobKey: string;
+  agent: string | null;
+  status: string;
+  error: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+export interface PatchWire {
+  id: string;
+  filePath: string;
+  diff: string;
+  findingIds: string[];
+  status: string;
+}
+
+export interface HandoffWire {
+  id: string;
+  kind: string;
+  intent: string;
+  reason: string;
+  status: string;
+  createdAt: string;
+  evidenceIds?: string[];
+}
+
+export interface PageWire {
+  id: string;
+  url: string;
+  title: string | null;
+}
+
+export interface RunEventWire {
+  id: number;
+  runId: string;
+  type: string;
+  agent: string;
+  capability: string | null;
+  summary: string;
+  detail: string | null;
+  data: Record<string, unknown>;
+  timestamp: string;
+}
+
+/** Exactly the body of `GET /api/runs/{runId}?jobs=true`. */
+export interface RunDetailWire {
+  run: RunWire;
+  target: TargetWire;
+  score: RunScoreWire;
+  finalScore: RunScoreWire | null;
+  pages: PageWire[];
+  patches: PatchWire[];
+  pendingHandoffs: HandoffWire[];
+  jobs?: JobWire[];
+}
+
+/** One row in the runs list. */
+export interface RunListItem {
+  id: string;
+  targetId: string;
+  repoFullName: string;
+  deployedUrl: string;
+  phase: "baseline" | "final";
+  status: RunStatusWire;
+  failureReason: string | null;
+  findingCount: number;
+  createdAt: string;
+  startedAt: string | null;
+  completedAt: string | null;
+}
+
+export interface TargetListItem {
+  id: string;
+  repoFullName: string;
+  deployedUrl: string;
+  createdAt: string;
+  runCount: number;
+  lastRunId: string | null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Formatting                                                                 */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * A fixed locale and UTC, so the server and the client render byte-identical
+ * text. A relative "2s ago" cannot do that without a hydration mismatch.
+ */
+export function formatUtcTime(iso: string | null | undefined): string | undefined {
+  if (!iso) return undefined;
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return undefined;
+  const time = new Intl.DateTimeFormat("en-GB", {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    timeZone: "UTC",
+  }).format(date);
+  return time + " UTC";
+}
+
+export function formatUtcDate(iso: string | null | undefined): string {
+  if (!iso) return "not started";
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return "not started";
+  const stamp = new Intl.DateTimeFormat("en-GB", {
+    day: "numeric",
+    month: "short",
+    hour: "2-digit",
+    minute: "2-digit",
+    timeZone: "UTC",
+  }).format(date);
+  return stamp + " UTC";
+}
+
+export function formatDuration(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "0s";
+  const total = Math.floor(ms / 1000);
+  const hours = Math.floor(total / 3600);
+  const minutes = Math.floor((total % 3600) / 60);
+  const seconds = total % 60;
+  if (hours > 0) return hours + "h " + minutes + "m";
+  if (minutes > 0) return minutes + "m " + seconds + "s";
+  return seconds + "s";
+}
+
+/** Elapsed wall time for a run, against `now`. Undefined when unknowable. */
+export function runElapsed(run: RunWire, now: number): string | undefined {
+  const startIso = run.startedAt ?? run.createdAt;
+  if (!startIso) return undefined;
+  const start = new Date(startIso).getTime();
+  if (Number.isNaN(start)) return undefined;
+  const end = run.completedAt ? new Date(run.completedAt).getTime() : now;
+  if (Number.isNaN(end)) return undefined;
+  return formatDuration(end - start);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Run status                                                                 */
+/* -------------------------------------------------------------------------- */
+
+const RUN_STATUS_LABELS: Record<RunStatusWire, StatusValue> = {
+  queued: "queued",
+  crawling: "crawling",
+  auditing: "auditing",
+  scoring: "scoring",
+  fixing: "fixing",
+  verifying: "verifying",
+  awaiting_approval: "awaiting_approval",
+  done: "complete",
+  failed: "failed",
+};
+
+export function runStatusLabel(status: string): StatusValue {
+  return RUN_STATUS_LABELS[status as RunStatusWire] ?? "queued";
+}
+
+const TERMINAL: ReadonlySet<string> = new Set(["done", "failed"]);
+
+export function runIsTerminal(status: string): boolean {
+  return TERMINAL.has(status);
+}
+
+/** The run summary bar's props. `activeModel` and `elapsed` stay optional. */
+export function toRunSummary(
+  run: RunWire,
+  extra: { activeModel?: string; elapsed?: string } = {},
+): RunSummary {
+  return {
+    status: runStatusLabel(run.status),
+    phase: run.phase as RunPhase,
+    sandboxesUsed: run.sandboxesUsed,
+    maxSandboxes: run.maxSandboxes,
+    ...(extra.activeModel ? { activeModel: extra.activeModel } : {}),
+    ...(extra.elapsed ? { elapsed: extra.elapsed } : {}),
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Environments, from pipeline_jobs                                           */
+/* -------------------------------------------------------------------------- */
+
+const PHASE_TEMPLATE: Record<string, PathTemplate> = {
+  crawl: "Crawl",
+  tree: "Tree",
+  paths: "Paths",
+  vis: "Vision",
+  act: "Actions",
+  media: "Media",
+  pages: "Pages",
+  code: "Code",
+  score: "Score",
+  fix: "Fix",
+  verify: "Verify",
+  pr: "Pull request",
+  final_audit: "Final audit",
+};
+
+const JOB_STATE: Record<string, EnvironmentState> = {
+  pending: "queued",
+  running: "live",
+  awaiting_approval: "queued",
+  succeeded: "done",
+  failed: "failed",
+  skipped: "done",
+};
+
+/** Which phases actually drive a browser. The rest run in a build sandbox. */
+const BROWSER_PHASES: ReadonlySet<string> = new Set([
+  "crawl",
+  "tree",
+  "paths",
+  "vis",
+  "act",
+  "media",
+  "pages",
+  "final_audit",
+]);
+
+/** Viewport from lib/browser/script.ts, which launches Chromium at 1280x900. */
+const BROWSER_ENGINE = "Chromium 1280x900";
+const BUILD_ENGINE = "Node 22 build sandbox";
+const LEDGER_ENGINE = "Ledger query";
+
+function engineFor(phase: string): string {
+  if (BROWSER_PHASES.has(phase)) return BROWSER_ENGINE;
+  if (phase === "score") return LEDGER_ENGINE;
+  return BUILD_ENGINE;
+}
+
+const PHASE_VERB: Record<string, string> = {
+  tree: "Accessibility tree and axe-core on",
+  vis: "Screenshot pass over",
+  act: "Interaction paths on",
+  media: "Media check on",
+  pages: "Page-level checks on",
+  code: "Source read for",
+  fix: "Patch",
+  verify: "Verify",
+};
+
+/** A URL's path, or the whole string when it is not a URL. */
+function shortKey(key: string): string {
+  try {
+    return new URL(key).pathname;
+  } catch {
+    return key;
+  }
+}
+
+function describeJob(phase: string, jobKey: string): string {
+  switch (phase) {
+    case "crawl":
+      return "Crawl same-origin routes";
+    case "paths":
+      return "Enumerate interaction paths on " + shortKey(jobKey);
+    case "score":
+      return "Score the ledger against all 55 criteria";
+    case "pr":
+      return "Open a pull request";
+    case "final_audit":
+      return "Re-audit after the fix";
+    default: {
+      const verb = PHASE_VERB[phase];
+      return verb ? verb + " " + shortKey(jobKey) : phase + " · " + shortKey(jobKey);
+    }
+  }
+}
+
+/**
+ * One `pipeline_jobs` row is one environment card.
+ *
+ * `pageFindings` lets a page-keyed job report how many findings came out of it.
+ * A job whose key is not a page URL reports no count at all rather than zero,
+ * because "none found" and "not counted here" are different claims.
+ */
+export function jobsToEnvironments(
+  jobs: ReadonlyArray<JobWire>,
+  pageFindings: ReadonlyMap<string, number> = new Map(),
+): BrowserEnvironment[] {
+  const rank = (job: JobWire): number => {
+    const state = JOB_STATE[job.status] ?? "queued";
+    return state === "live" ? 0 : state === "failed" ? 1 : state === "queued" ? 2 : 3;
+  };
+
+  return [...jobs]
+    .sort((a, b) => rank(a) - rank(b) || a.phase.localeCompare(b.phase))
+    .map((job) => {
+      const state = JOB_STATE[job.status] ?? "queued";
+      const findings = pageFindings.get(job.jobKey);
+      const captured = formatUtcTime(job.completedAt ?? job.startedAt);
+      const environment: BrowserEnvironment = {
+        id: job.id,
+        engine: engineFor(job.phase),
+        pathLabel: describeJob(job.phase, job.jobKey),
+        pathTemplate: PHASE_TEMPLATE[job.phase] ?? "Crawl",
+        state,
+        ...(findings === undefined ? {} : { findings }),
+        ...(captured ? { capturedAt: captured } : {}),
+      };
+      return environment;
+    });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Timeline, from run_events                                                  */
+/* -------------------------------------------------------------------------- */
+
+const CAPABILITIES: ReadonlySet<string> = new Set([
+  "sandbox",
+  "subagent",
+  "approval",
+  "skill",
+  "model",
+  "ledger",
+]);
+
+export function eventsToTimeline(events: ReadonlyArray<RunEventWire>): TimelineEvent[] {
+  return events.map((event) => ({
+    id: String(event.id),
+    agent: event.agent,
+    summary: event.summary,
+    timestamp: event.timestamp,
+    ...(event.capability && CAPABILITIES.has(event.capability)
+      ? { capability: event.capability as HarnessCapability }
+      : {}),
+    ...(event.detail ? { detail: event.detail } : {}),
+  }));
+}
+
+/* -------------------------------------------------------------------------- */
+/* The criterion matrix, from the score                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * All 55, baseline against final.
+ *
+ * The cell reports the run's *outcome* for the criterion — passing, failing,
+ * flagged, blocked — not the criterion's routing verdict, because "DECIDE"
+ * says how a finding would be handled, not whether one exists.
+ */
+export function scoreToMatrixRows(
+  baseline: RunScoreWire | null,
+  final: RunScoreWire | null,
+): CriterionRow[] {
+  if (!baseline) return [];
+  const finalByCriterion = new Map((final?.criteria ?? []).map((c) => [c.criterion, c]));
+
+  return baseline.criteria.map((criterion) => {
+    const after = finalByCriterion.get(criterion.criterion);
+    return {
+      id: criterion.criterion,
+      name: criterion.name,
+      level: criterion.level,
+      baseline: criterion.state as CriterionCell,
+      final: after ? (after.state as CriterionCell) : null,
+      findings: criterion.findings,
+    };
+  });
+}
+
+/* -------------------------------------------------------------------------- */
+/* Findings                                                                   */
+/* -------------------------------------------------------------------------- */
+
+const SEVERITIES: ReadonlySet<string> = new Set(["critical", "serious", "moderate", "minor"]);
+
+const STATUSES: ReadonlySet<string> = new Set([
+  "open",
+  "fixing",
+  "fixed",
+  "verified",
+  "dismissed",
+]);
+
+const AGENTS: ReadonlySet<string> = new Set([
+  "TREE",
+  "VIS",
+  "ACT",
+  "PAGES",
+  "MEDIA",
+  "CODE",
+  "FIX",
+  "VERIFY",
+]);
+
+export function toFindingCard(row: FindingWire): Finding {
+  return {
+    id: row.id,
+    criterion: row.criterion,
+    criterionName: row.criterionName ?? row.criterion,
+    level: row.level,
+    verdict: row.verdict,
+    severity: (SEVERITIES.has(row.severity) ? row.severity : "minor") as FindingSeverity,
+    status: (STATUSES.has(row.status) ? row.status : "open") as FindingStatus,
+    pageUrl: row.pageUrl,
+    summary: row.summary,
+    agent: (AGENTS.has(row.agent) ? row.agent : "TREE") as AuditAgent,
+    ...(row.sourcePath ? { sourcePath: row.sourcePath } : {}),
+    ...(row.detail ? { detail: row.detail } : {}),
+  };
+}
+
+export function toFindingCards(rows: ReadonlyArray<FindingWire>): Finding[] {
+  return rows.map(toFindingCard);
+}
+
+/** How many findings each page produced, for the environment cards. */
+export function findingsByPage(rows: ReadonlyArray<FindingWire>): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const row of rows) {
+    const url = row.pageUrl;
+    counts.set(url, (counts.get(url) ?? 0) + 1);
+    // A job keys a page with or without its trailing slash; count both spellings.
+    const alt = url.endsWith("/") ? url.slice(0, -1) : url + "/";
+    counts.set(alt, (counts.get(alt) ?? 0) + 1);
+  }
+  return counts;
+}
+
+export interface CriterionGroup {
+  criterion: string;
+  name: string;
+  level: CriterionLevel;
+  verdict: "DECIDE" | "FLAG" | "BLOCKED";
+  /** Worst severity in the group, which is what orders it. */
+  severity: FindingSeverity;
+  findings: Finding[];
+}
+
+const SEVERITY_RANK: Record<FindingSeverity, number> = {
+  critical: 0,
+  serious: 1,
+  moderate: 2,
+  minor: 3,
+};
+
+/** Findings grouped by the criterion they cite, worst severity first. */
+export function groupByCriterion(rows: ReadonlyArray<FindingWire>): CriterionGroup[] {
+  const groups = new Map<string, CriterionGroup>();
+
+  for (const row of rows) {
+    const card = toFindingCard(row);
+    const existing = groups.get(row.criterion);
+    if (existing) {
+      existing.findings.push(card);
+      if (SEVERITY_RANK[card.severity] < SEVERITY_RANK[existing.severity]) {
+        existing.severity = card.severity;
+      }
+      continue;
+    }
+    groups.set(row.criterion, {
+      criterion: row.criterion,
+      name: card.criterionName,
+      level: card.level,
+      verdict: card.verdict,
+      severity: card.severity,
+      findings: [card],
+    });
+  }
+
+  return [...groups.values()].sort(
+    (a, b) =>
+      SEVERITY_RANK[a.severity] - SEVERITY_RANK[b.severity] ||
+      b.findings.length - a.findings.length ||
+      a.criterion.localeCompare(b.criterion),
+  );
+}
+
+/* -------------------------------------------------------------------------- */
+/* Patches                                                                    */
+/* -------------------------------------------------------------------------- */
+
+/** A patch card, its covered criteria resolved from the findings it cites. */
+export function toPatchCards(
+  patches: ReadonlyArray<PatchWire>,
+  findings: ReadonlyArray<FindingWire>,
+): Patch[] {
+  const criterionById = new Map(findings.map((row) => [row.id, row.criterion]));
+
+  return patches.map((patch) => {
+    const covers = [
+      ...new Set(
+        (patch.findingIds ?? [])
+          .map((id) => criterionById.get(id))
+          .filter((value): value is string => Boolean(value)),
+      ),
+    ].sort();
+    return { id: patch.id, path: patch.filePath, covers, diff: patch.diff };
+  });
+}

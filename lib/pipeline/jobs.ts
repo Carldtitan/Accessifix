@@ -135,7 +135,14 @@ export async function attachSession(
     .where(eq(pipelineJobs.id, jobId));
 }
 
-/** Park a job on a human decision, recording the coordinates needed to resume it. */
+/**
+ * Park a job on a human decision, recording the coordinates needed to resume it.
+ *
+ * `result` is written here rather than only on completion because some cards
+ * carry the thing they are a card *about* — the pull-request gate records the
+ * exact operations it is asking permission for, so a resumed run can tell
+ * whether the card still up describes what it is now about to do (A7.1, A7.4).
+ */
 export async function pauseJobForApproval(
   jobId: string,
   approval: {
@@ -144,6 +151,8 @@ export async function pauseJobForApproval(
     turnId?: string | null;
     threadId?: string | null;
     toolCallId?: string | null;
+    /** What was asked, for the resumed run to compare against. */
+    result?: Record<string, unknown>;
   },
 ): Promise<void> {
   await db
@@ -153,6 +162,7 @@ export async function pauseJobForApproval(
       handoffId: approval.handoffId,
       ...(approval.sessionId ? { sessionId: approval.sessionId } : {}),
       ...(approval.turnId ? { turnId: approval.turnId } : {}),
+      ...(approval.result ? { result: approval.result } : {}),
       threadId: approval.threadId ?? null,
       toolCallId: approval.toolCallId ?? null,
     })

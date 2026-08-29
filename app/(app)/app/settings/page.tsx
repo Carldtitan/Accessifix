@@ -1,31 +1,102 @@
+import { GITHUB_SCOPE } from "@/auth";
 import { Icon } from "@/components/Icon";
+import { AUDIT_AGENTS, criteriaOwnedBy, stateCriteria } from "@/lib/db/criteria";
+import { AGENT_ROSTER, isAgentName } from "@/lib/harness/agents";
+import {
+  BROWSER_RESOURCES,
+  BUILD_RESOURCES,
+  DEFAULT_MAX_CONCURRENT_SANDBOXES,
+  INTERACTION_DEPTH,
+  MAX_PAGES_PER_CRAWL,
+} from "@/lib/sandbox/config";
+
+import { requireSessionUser } from "../../_data";
 
 export const metadata = { title: "Settings" };
+export const dynamic = "force-dynamic";
 
-const roster: ReadonlyArray<{
+/* -------------------------------------------------------------------------- */
+/* The roster, derived rather than transcribed                                */
+/* -------------------------------------------------------------------------- */
+
+interface RosterRow {
   agent: string;
   owns: string;
   model: string;
   sandbox: string;
-}> = [
-  { agent: "TREE", owns: "16 criteria", model: "none — deterministic", sandbox: "none" },
-  { agent: "VIS", owns: "27 criteria", model: "Anthropic, vision", sandbox: "none" },
-  { agent: "ACT", owns: "26 criteria, all 12 state criteria", model: "Anthropic, fast", sandbox: "browser 2 CPU / 2 GB" },
-  { agent: "PAGES", owns: "5 criteria", model: "Fireworks, cheap", sandbox: "none" },
-  { agent: "MEDIA", owns: "4 criteria", model: "Anthropic, multimodal", sandbox: "none" },
-  { agent: "CODE", owns: "3 criteria", model: "Fireworks, small", sandbox: "none" },
-  { agent: "FIX", owns: "writes patches", model: "Anthropic, strong code", sandbox: "build 4 CPU / 8 GB" },
-  { agent: "VERIFY", owns: "gates the pull request", model: "Fireworks + shell", sandbox: "build 4 CPU / 8 GB" },
-];
+}
 
-export default function SettingsPage() {
+const BROWSER_SANDBOX = `browser ${BROWSER_RESOURCES.cpu} CPU / ${BROWSER_RESOURCES.memory} GB`;
+const BUILD_SANDBOX = `build ${BUILD_RESOURCES.cpu} CPU / ${BUILD_RESOURCES.memory} GB`;
+
+/** Which lanes actually open a sandbox. The rest read what a lane captured. */
+const SANDBOX_BY_AGENT: Record<string, string> = {
+  ACT: BROWSER_SANDBOX,
+  FIX: BUILD_SANDBOX,
+  VERIFY: BUILD_SANDBOX,
+};
+
+function modelFor(agent: string): string {
+  const key = agent.toLowerCase();
+  // TREE is deterministic: axe-core and an accessibility tree snapshot, no model.
+  if (!isAgentName(key)) return "none — deterministic";
+  return AGENT_ROSTER[key].model;
+}
+
+function buildRoster(): RosterRow[] {
+  const stateCount = stateCriteria().length;
+
+  const auditRows: RosterRow[] = AUDIT_AGENTS.map((agent) => {
+    const owned = criteriaOwnedBy(agent).length;
+    return {
+      agent,
+      owns:
+        agent === "ACT"
+          ? `${owned} criteria, all ${stateCount} state criteria`
+          : `${owned} criteri${owned === 1 ? "on" : "a"}`,
+      model: modelFor(agent),
+      sandbox: SANDBOX_BY_AGENT[agent] ?? "none",
+    };
+  });
+
+  return [
+    ...auditRows,
+    { agent: "FIX", owns: "writes patches", model: modelFor("FIX"), sandbox: BUILD_SANDBOX },
+    {
+      agent: "VERIFY",
+      owns: "gates the pull request",
+      model: modelFor("VERIFY"),
+      sandbox: BUILD_SANDBOX,
+    },
+  ];
+}
+
+/* -------------------------------------------------------------------------- */
+/* Page                                                                       */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Configuration, read from the code that enforces it.
+ *
+ * The roster, the criterion counts and the limits are all derived from
+ * `lib/db/criteria.ts`, `lib/harness/agents.ts` and `lib/sandbox/config.ts`, so
+ * this page cannot drift from what a run actually does. The account block is
+ * the real GitHub session.
+ */
+export default async function SettingsPage() {
+  const user = await requireSessionUser("/app/settings");
+  const roster = buildRoster();
+
   return (
     <main id="main-content" className="dashboard-page">
       <div className="page-header">
         <div>
           <span className="eyebrow">Configuration</span>
           <h1>Settings</h1>
-          <p>How the run is routed, what it is allowed to spend, and what it is never allowed to do without asking.</p>
+          <p>
+            How the run is routed, what it is allowed to spend, and what it is never allowed to do
+            without asking.
+          </p>
         </div>
       </div>
 
@@ -37,14 +108,23 @@ export default function SettingsPage() {
           </div>
         </div>
         <div className="card">
-          <dl className="score-grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}>
+          <dl
+            className="score-grid"
+            style={{ gridTemplateColumns: "repeat(auto-fit, minmax(200px, 1fr))" }}
+          >
             <div className="cell">
               <dt>Signed in as</dt>
-              <dd>Demo Reviewer</dd>
+              <dd>{user.name}</dd>
+            </div>
+            <div className="cell">
+              <dt>Email</dt>
+              <dd>{user.email ?? "not shared by GitHub"}</dd>
             </div>
             <div className="cell">
               <dt>GitHub scope</dt>
-              <dd>repo</dd>
+              <dd>
+                <code>{GITHUB_SCOPE}</code>
+              </dd>
             </div>
             <div className="cell">
               <dt>Pull requests opened as</dt>
@@ -52,7 +132,8 @@ export default function SettingsPage() {
             </div>
           </dl>
           <p className="muted" style={{ marginTop: 14, fontSize: 13 }}>
-            Placeholder values. These come from the GitHub session once auth is wired in.
+            The GitHub token is never placed on the session. It stays in the database and is read
+            server-side only when a pull request is opened.
           </p>
         </div>
       </section>
@@ -71,7 +152,12 @@ export default function SettingsPage() {
         </div>
 
         <div className="criterion-matrix">
-          <div className="criterion-scroll" role="region" aria-labelledby="roster-caption" tabIndex={0}>
+          <div
+            className="criterion-scroll"
+            role="region"
+            aria-labelledby="roster-caption"
+            tabIndex={0}
+          >
             <table>
               <caption id="roster-caption">
                 The agents dispatched during a run, what they own, and where they execute.
@@ -80,7 +166,7 @@ export default function SettingsPage() {
                 <tr>
                   <th scope="col">Agent</th>
                   <th scope="col">Owns</th>
-                  <th scope="col">Model class</th>
+                  <th scope="col">Model</th>
                   <th scope="col">Sandbox</th>
                 </tr>
               </thead>
@@ -89,7 +175,9 @@ export default function SettingsPage() {
                   <tr key={row.agent}>
                     <th scope="row">{row.agent}</th>
                     <td className="col-name">{row.owns}</td>
-                    <td>{row.model}</td>
+                    <td>
+                      <code>{row.model}</code>
+                    </td>
                     <td>{row.sandbox}</td>
                   </tr>
                 ))}
@@ -104,26 +192,34 @@ export default function SettingsPage() {
           <div>
             <span className="eyebrow">Budget</span>
             <h2 id="limits">Limits</h2>
-            <p>Concurrency is budgeted from the configured cap, never from the core count reported inside a sandbox.</p>
+            <p>
+              Concurrency is budgeted from the configured cap, never from the core count reported
+              inside a sandbox.
+            </p>
           </div>
         </div>
         <div className="card">
-          <dl className="score-grid" style={{ gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))" }}>
+          <dl
+            className="score-grid"
+            style={{ gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))" }}
+          >
             <div className="cell">
               <dt>Max sandboxes</dt>
-              <dd>8</dd>
+              <dd>{DEFAULT_MAX_CONCURRENT_SANDBOXES}</dd>
             </div>
             <div className="cell">
               <dt>Page cap per crawl</dt>
-              <dd>20</dd>
+              <dd>{MAX_PAGES_PER_CRAWL}</dd>
             </div>
             <div className="cell">
               <dt>Interaction depth</dt>
-              <dd>1</dd>
+              <dd>{INTERACTION_DEPTH}</dd>
             </div>
             <div className="cell">
               <dt>Build sandbox</dt>
-              <dd>4 CPU / 8 GB</dd>
+              <dd>
+                {BUILD_RESOURCES.cpu} CPU / {BUILD_RESOURCES.memory} GB
+              </dd>
             </div>
           </dl>
         </div>
@@ -138,16 +234,32 @@ export default function SettingsPage() {
         </div>
         <div className="card">
           <ul className="plain-list">
-            <li>Every body-text colour pair is verified at 4.5:1 or better against its own surface.</li>
+            <li>
+              Every body-text colour pair is verified at 4.5:1 or better against its own surface.
+            </li>
             <li>
               Every disclosure, tab and dialog updates its state attribute on change. The product
               detects that failure; it does not commit it.
             </li>
             <li>Focus is visible on every control and is never obscured by the sticky header.</li>
-            <li>Live status changes go through a polite live region. Focus is never moved by an update.</li>
-            <li>Motion honours <code>prefers-reduced-motion</code>; pinch zoom is never blocked.</li>
+            <li>
+              Live status changes go through a polite live region. Focus is never moved by an
+              update.
+            </li>
+            <li>
+              Motion honours <code>prefers-reduced-motion</code>; pinch zoom is never blocked.
+            </li>
           </ul>
-          <p className="muted" style={{ marginTop: 16, display: "flex", alignItems: "center", gap: 8, fontSize: 13 }}>
+          <p
+            className="muted"
+            style={{
+              marginTop: 16,
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              fontSize: 13,
+            }}
+          >
             <Icon name="target" size={16} />
             AccessiFix will be pointed at its own deployed URL as a test target.
           </p>

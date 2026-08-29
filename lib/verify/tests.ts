@@ -138,32 +138,42 @@ export function detectTestCommand(pkg: PackageJsonLike | null | undefined): Test
   // failure that is about the environment. Which runner it is changes nothing:
   // Playwright, Cypress and the rest are all reported as e2e, and the search for
   // a unit suite carries on to `test:unit` and `vitest`.
-  let e2eFromScript: { readonly script: string; readonly framework: TestFramework } | null = null;
+  let e2eFromScript: {
+    readonly script: string;
+    readonly framework: TestFramework;
+    readonly via: string | null;
+  } | null = null;
 
   for (const { script, source } of SCRIPT_PREFERENCE) {
     const body = scripts[script];
     if (typeof body !== 'string' || body.trim().length === 0) continue;
     if (script === 'test' && NO_TEST_PLACEHOLDER.test(body)) continue;
 
-    const framework = frameworkOf(body);
+    const { framework, via } = resolveFramework(body, scripts);
     if (isE2eFramework(framework)) {
-      e2eFromScript ??= { script, framework };
+      e2eFromScript ??= { script, framework, via };
       continue;
     }
 
     return {
       script,
-      command: buildCommand(script, framework),
+      // The framework is resolved through delegation, but the command is built
+      // from the body itself: `-- --run` is belt and braces for a script that is
+      // bare `vitest`, and forwarding it through a wrapper would hand the flag
+      // to npm rather than to the runner.
+      command: buildCommand(script, frameworkOf(body)),
       framework,
       source,
       scriptBody: body,
-      e2eScript: namedE2e ?? e2eFromScript?.script ?? null,
+      e2eScript: namedE2e ?? e2eFromScript?.via ?? e2eFromScript?.script ?? null,
       reason:
         `The repository defines \`npm run ${script}\` as \`${body}\`, so that is what ran.` +
         (e2eFromScript
-          ? ` Its \`${e2eFromScript.script}\` script is ${e2eLabel(e2eFromScript.framework)} and ` +
-            'was left alone — an end-to-end suite needs a served application and is a different ' +
-            'gate.'
+          ? ` Its \`${e2eFromScript.via ?? e2eFromScript.script}\` script is ` +
+            `${e2eLabel(e2eFromScript.framework)}` +
+            (e2eFromScript.via ? ` — reached from \`${e2eFromScript.script}\` —` : '') +
+            ' and was left alone: an end-to-end suite needs a served application and is a ' +
+            'different gate.'
           : ''),
     };
   }
@@ -176,7 +186,7 @@ export function detectTestCommand(pkg: PackageJsonLike | null | undefined): Test
   // request as though it had failed. The zero-test case is separated afterwards,
   // from the runner's own output, and reported as unproven rather than as a pass.
   const deps = { ...(pkg?.devDependencies ?? {}), ...(pkg?.dependencies ?? {}) };
-  const e2eScript = namedE2e ?? e2eFromScript?.script ?? null;
+  const e2eScript = namedE2e ?? e2eFromScript?.via ?? e2eFromScript?.script ?? null;
 
   if (typeof deps['vitest'] === 'string') {
     return {
@@ -210,7 +220,7 @@ export function detectTestCommand(pkg: PackageJsonLike | null | undefined): Test
     scriptBody: null,
     e2eScript,
     reason: e2eFromScript
-      ? `This repository's \`${e2eFromScript.script}\` script is a ` +
+      ? `This repository's \`${e2eFromScript.via ?? e2eFromScript.script}\` script is a ` +
         `${e2eLabel(e2eFromScript.framework)} end-to-end suite, which needs a served ` +
         'application and is a different gate. It defines no unit test suite, so nothing ran ' +
         'here. The patch is backed by the build and the criterion re-check only.'
@@ -253,6 +263,92 @@ function frameworkOf(body: string): TestFramework {
   if (/\bava\b/.test(text)) return 'ava';
   if (/node\s+--test|node:test/.test(text)) return 'node';
   return 'unknown';
+}
+
+/**
+ * The npm scripts a script body hands off to.
+ *
+ * `"test": "npm run test:e2e"` is the conventional way to give a browser suite
+ * the default name, and its body names no runner at all — so classifying the
+ * literal text returns `unknown`, the suite runs here against an application
+ * nothing served, and a good patch is rejected for a failure that is purely
+ * about the environment.
+ *
+ * Only explicit delegation forms count, and only names the package actually
+ * defines are followed, so a script that merely contains a matching word is
+ * never mistaken for a reference to one.
+ */
+function referencedScripts(body: string): string[] {
+  const names: string[] = [];
+  const add = (name: string | undefined): void => {
+    if (name && !names.includes(name)) names.push(name);
+  };
+
+  for (const match of body.matchAll(
+    /(?:^|[\s;&|(])(?:npm|pnpm|bun)\s+(?:run|run-script)\s+(?:--\s+)?([\w:.-]+)/g,
+  )) {
+    add(match[1]);
+  }
+  for (const match of body.matchAll(/(?:^|[\s;&|(])yarn\s+(?:run\s+)?([\w:.-]+)/g)) {
+    add(match[1]);
+  }
+  // `npm-run-all`, `run-s`, `run-p`: every non-flag token is a script name.
+  for (const match of body.matchAll(
+    /(?:^|[\s;&|(])(?:npm-run-all|run-s|run-p)\s+([^;&|]*)/g,
+  )) {
+    for (const token of (match[1] ?? '').split(/\s+/)) {
+      if (token.length > 0 && !token.startsWith('-')) add(token);
+    }
+  }
+
+  return names;
+}
+
+/** Chains deeper than this are pathological; stop rather than walk forever. */
+const MAX_DELEGATION_DEPTH = 4;
+
+/**
+ * Classify a script by what it ultimately runs, not by the text of its body.
+ *
+ * An end-to-end runner anywhere in the chain classifies the whole script,
+ * because the script runs all of it: `"test": "npm run test:unit && npm run
+ * test:e2e"` still launches a browser, so it still is not this gate's suite and
+ * the search carries on to `test:unit` and `vitest`.
+ *
+ * `via` names the script the classification actually came from, so the reason
+ * can say which suite was left alone rather than pointing at the wrapper.
+ */
+function resolveFramework(
+  body: string,
+  scripts: Readonly<Record<string, string>>,
+  seen: ReadonlySet<string> = new Set<string>(),
+): { readonly framework: TestFramework; readonly via: string | null } {
+  const direct = frameworkOf(body);
+  if (isE2eFramework(direct)) return { framework: direct, via: null };
+  if (seen.size >= MAX_DELEGATION_DEPTH) return { framework: direct, via: null };
+
+  let resolved: { readonly framework: TestFramework; readonly via: string | null } = {
+    framework: direct,
+    via: null,
+  };
+
+  for (const name of referencedScripts(body)) {
+    if (seen.has(name)) continue;
+    const nested = scripts[name];
+    if (typeof nested !== 'string' || nested.trim().length === 0) continue;
+
+    const inner = resolveFramework(nested, scripts, new Set([...seen, name]));
+    // An e2e runner settles it outright; anything else only fills in a body that
+    // named no runner of its own.
+    if (isE2eFramework(inner.framework)) {
+      return { framework: inner.framework, via: inner.via ?? name };
+    }
+    if (resolved.framework === 'unknown' && inner.framework !== 'unknown') {
+      resolved = { framework: inner.framework, via: inner.via ?? name };
+    }
+  }
+
+  return resolved;
 }
 
 /**

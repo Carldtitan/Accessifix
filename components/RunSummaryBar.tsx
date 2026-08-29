@@ -7,7 +7,12 @@ export type RunSummary = {
   phase: RunPhase;
   sandboxesUsed: number;
   maxSandboxes: number;
-  activeModel: string;
+  /**
+   * The model behind the lane that is currently working, when one is. Absent
+   * for a queued run and for TREE, which is deterministic and calls no model —
+   * so the cell is omitted rather than filled with a guess.
+   */
+  activeModel?: string;
   /** Optional human-readable elapsed time, e.g. "4m 12s". */
   elapsed?: string;
 };
@@ -60,14 +65,17 @@ export function RunSummaryBar({ run }: { run: RunSummary }) {
           </dd>
         </div>
 
-        <span className="summary-divider" aria-hidden="true" />
-
-        <div>
-          <dt>Active model</dt>
-          <dd>
-            <code>{run.activeModel}</code>
-          </dd>
-        </div>
+        {run.activeModel ? (
+          <>
+            <span className="summary-divider" aria-hidden="true" />
+            <div>
+              <dt>Active model</dt>
+              <dd>
+                <code>{run.activeModel}</code>
+              </dd>
+            </div>
+          </>
+        ) : null}
 
         {run.elapsed ? (
           <>
@@ -82,7 +90,8 @@ export function RunSummaryBar({ run }: { run: RunSummary }) {
 
       <p className="sr-only" aria-live="polite">
         {`Run ${String(run.status).replace(/_/g, " ")}. ${phaseLabels[run.phase]}. ` +
-          `${run.sandboxesUsed} of ${run.maxSandboxes} sandboxes in use. Model ${run.activeModel}.`}
+          `${run.sandboxesUsed} of ${run.maxSandboxes} sandboxes in use.` +
+          (run.activeModel ? ` Model ${run.activeModel}.` : "")}
       </p>
     </>
   );

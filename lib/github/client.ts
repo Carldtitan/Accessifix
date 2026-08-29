@@ -106,8 +106,18 @@ export interface CommitFilesInput {
   readonly branch: string;
   readonly message: string;
   readonly files: readonly CommitFile[];
-  /** Commit onto this SHA instead of the branch tip. */
-  readonly parentSha?: string;
+  /**
+   * The commit to build on — required, and normally `BranchResult.sha` from the
+   * `createBranch` call that validated it.
+   *
+   * Not optional, because the alternative is re-reading the branch tip here: a
+   * concurrent writer could then replace the validated history between the check
+   * and the commit, and the ref update would still succeed, since the new commit
+   * was built on whatever the tip had become. Pinning the SHA the caller checked
+   * is what makes `force: false` mean something — if the branch moved, the
+   * update is no longer a fast-forward and GitHub rejects it.
+   */
+  readonly parentSha: string;
 }
 
 /* -------------------------------------------------------------------------- */
@@ -387,7 +397,7 @@ export class GitHubClient {
 
     const existing = await this.getBranchSha(repo, branch);
     if (existing) {
-      await this.assertReusableBranch(repo, branch, existing, base, baseSha);
+      await this.assertReusableBranch(repo, branch, existing, base, baseSha, authorization);
       return { name: branch, sha: existing, baseSha, created: false };
     }
 
@@ -406,7 +416,7 @@ export class GitHubClient {
       if (statusOf(error) === 422) {
         const sha = await this.getBranchSha(repo, branch);
         if (sha) {
-          await this.assertReusableBranch(repo, branch, sha, base, baseSha);
+          await this.assertReusableBranch(repo, branch, sha, base, baseSha, authorization);
           return { name: branch, sha, baseSha, created: false };
         }
       }
@@ -422,17 +432,26 @@ export class GitHubClient {
   /**
    * Refuse an existing branch that is not the one this run would have created.
    *
-   * Two things have to hold before an approved patch may be committed onto a
+   * Three things have to hold before an approved patch may be committed onto a
    * branch AccessiFix did not just create:
    *
-   *  1. The tip descends from the approved base. If that base is not in the
+   *  1. The human approved *this exact tip*. Anything above the base is history
+   *     nobody in this run wrote, and no property of a commit can prove which
+   *     tool produced it. `author.login` cannot: GitHub derives it from the
+   *     commit email, so the operator's own unrelated work on a same-named
+   *     branch carries their login just as readily as an interrupted run does.
+   *     Attribution is not provenance, so provenance is asked of the only party
+   *     who actually knows — the person approving the write, whose decision is
+   *     bound to the tip via `ApprovalOperation.commitSha`.
+   *  2. The tip descends from the approved base. If that base is not in the
    *     branch's history, the branch was cut from something else entirely and
    *     the commit about to be written would sit on unrelated history.
-   *  2. Whatever the branch carries on top of that base is the signed-in user's
+   *  3. Whatever the branch carries on top of that base is the signed-in user's
    *     own. Under A1.4 every commit AccessiFix makes is attributed to the
    *     person who asked for it, so a same-named branch holding somebody else's
    *     commits is not an interrupted run — it is a collision, and those commits
-   *     would ride into the pull request underneath the approved patch.
+   *     would ride into the pull request underneath the approved patch. This
+   *     narrows what an approval can cover; it never stands in for one.
    *
    * A commit GitHub cannot attribute counts as somebody else's. "We could not
    * tell" is not the same as "it was ours", and this is the one place where
@@ -444,10 +463,31 @@ export class GitHubClient {
     tipSha: string,
     base: string,
     baseSha: string,
+    authorization: WriteAuthorization,
   ): Promise<void> {
     // Nothing on top of the base at all: created but never committed to, which
-    // is exactly the interrupted run that reuse exists for.
+    // is exactly the interrupted run that reuse exists for. The approval already
+    // covers writing this branch at the base, so there is nothing extra to bind.
     if (tipSha === baseSha) return;
+
+    // Above the base. The approval has to name the tip it is accepting.
+    const approvedTip = authorization.approval.operation.commitSha;
+    if (approvedTip !== tipSha) {
+      throw new GitHubError(
+        'createBranch',
+        `Branch "${branch}" already exists at ${shortSha(tipSha)}, ahead of the approved base ` +
+          `"${base}" (${shortSha(baseSha)}), and the approval on hand ` +
+          `${
+            approvedTip
+              ? `accepts a different tip (${shortSha(approvedTip)})`
+              : 'does not accept any existing commits'
+          }. Commits above the base cannot be shown to have come from an interrupted ` +
+          'AccessiFix run, so they are only reusable when the human approving the write said ' +
+          `so for this exact commit. Re-request approval with \`resumeFromSha: "${tipSha}"\` ` +
+          'after showing what the branch already carries, or use a different branch name.',
+        409,
+      );
+    }
 
     const { owner, repo: name } = asRepo(repo);
     let comparison;
@@ -562,7 +602,7 @@ export class GitHubClient {
     });
 
     try {
-      const parentSha = input.parentSha ?? (await this.requireBranchSha(repo, input.branch));
+      const parentSha = input.parentSha;
       const { data: parent } = await this.octokit.rest.git.getCommit({
         owner,
         repo: name,
@@ -601,13 +641,32 @@ export class GitHubClient {
         parents: [parentSha],
       });
 
-      await this.octokit.rest.git.updateRef({
-        owner,
-        repo: name,
-        ref: `heads/${input.branch}`,
-        sha: commit.sha,
-        force: false,
-      });
+      // `force: false` is the concurrency check, not a formality: the commit
+      // names `parentSha` as its parent, so if anything moved the branch since
+      // that SHA was validated, this is no longer a fast-forward and GitHub
+      // refuses it. The written commit object is simply left unreferenced.
+      try {
+        await this.octokit.rest.git.updateRef({
+          owner,
+          repo: name,
+          ref: `heads/${input.branch}`,
+          sha: commit.sha,
+          force: false,
+        });
+      } catch (error) {
+        if (statusOf(error) === 422) {
+          throw new GitHubError(
+            'commitFiles',
+            `Branch "${input.branch}" moved away from ${shortSha(parentSha)} while the approved ` +
+              'patch was being prepared, so committing onto it would either lose or silently ' +
+              'absorb whatever arrived in between. Nothing was written. Re-read the branch and ' +
+              'obtain a fresh approval for the tip it is at now.',
+            409,
+            error,
+          );
+        }
+        throw error;
+      }
 
       return {
         commitSha: commit.sha,
@@ -697,14 +756,6 @@ export class GitHubClient {
         error,
       );
     }
-  }
-
-  private async requireBranchSha(repo: RepoLike, branch: string): Promise<string> {
-    const sha = await this.getBranchSha(repo, branch);
-    if (!sha) {
-      throw new GitHubError('commitFiles', `Branch "${branch}" does not exist.`, 404);
-    }
-    return sha;
   }
 
   /** Resolve a branch, tag or SHA to a commit SHA. */

@@ -32,6 +32,8 @@ export type Finding = {
   summary: string;
   agent: AuditAgent;
   sourcePath?: string;
+  /** The lane's own prose about this violation, when it recorded any. */
+  detail?: string;
   /** Present for the twelve state criteria (A9.3). */
   tree?: TreeComparison;
 };
@@ -52,6 +54,7 @@ export function FindingCard({ finding }: { finding: Finding }) {
   const [open, setOpen] = useState(false);
   const panelId = useId();
   const hasTree = Boolean(finding.tree);
+  const hasDisclosure = hasTree || Boolean(finding.detail);
 
   return (
     <article className="finding-card">
@@ -83,7 +86,7 @@ export function FindingCard({ finding }: { finding: Finding }) {
         ) : null}
       </p>
 
-      {hasTree && finding.tree ? (
+      {hasDisclosure ? (
         <>
           <button
             type="button"
@@ -93,10 +96,13 @@ export function FindingCard({ finding }: { finding: Finding }) {
             onClick={() => setOpen((value) => !value)}
           >
             <Icon name="chevron" size={15} />
-            {open ? "Hide" : "Show"} accessibility tree, before and after
+            {open ? "Hide" : "Show"}{" "}
+            {hasTree ? "accessibility tree, before and after" : "the recorded detail"}
           </button>
 
           <div id={panelId} hidden={!open}>
+            {finding.tree ? (
+              <>
             <p className="finding-meta" style={{ marginBottom: 10 }}>
               <span>
                 Interaction <strong>{finding.tree.interaction}</strong>
@@ -121,6 +127,9 @@ export function FindingCard({ finding }: { finding: Finding }) {
                 <span>{finding.tree.note}</span>
               </p>
             ) : null}
+              </>
+            ) : null}
+            {finding.detail ? <p className="finding-summary">{finding.detail}</p> : null}
           </div>
         </>
       ) : null}

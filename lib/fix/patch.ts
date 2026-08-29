@@ -679,6 +679,34 @@ export function unifiedDiff(
     ? lastLineReplacement(beforeLines.lines, afterLines.lines)
     : diffLines(beforeLines.lines, afterLines.lines);
 
+  // The same blind spot as `terminatorOnly`, in the case where the rest of the
+  // file did change: the final line is identical on both sides, so it comes out
+  // as context, and a context line carries no `\ No newline at end of file`
+  // marker. The terminator change would then vanish from the diff entirely —
+  // and a diff that omits a real byte difference breaks the guarantee this
+  // function exists for, that what a reviewer reads is what lands in the commit.
+  // Forcing that last line through as a replacement puts the marker back on
+  // whichever side actually lost its newline.
+  if (!terminatorOnly && beforeLines.trailingNewline !== afterLines.trailingNewline) {
+    // Whichever ops produce the two files' final lines: the last op that is not
+    // a deletion ends the new file, the last that is not an addition ends the
+    // old one. They are often the same op and occasionally neither is last
+    // overall — lines deleted off the end leave the new file's final line as a
+    // context op several places back.
+    const splitContextAt = (index: number): void => {
+      const op = index >= 0 ? ops[index] : undefined;
+      if (!op || op.kind !== ' ') return;
+      ops.splice(index, 1, { kind: '-', line: op.line }, { kind: '+', line: op.line });
+    };
+    const lastIndexWhere = (exclude: DiffOp['kind']): number => {
+      for (let i = ops.length - 1; i >= 0; i -= 1) if (ops[i]!.kind !== exclude) return i;
+      return -1;
+    };
+
+    splitContextAt(lastIndexWhere('-'));
+    splitContextAt(lastIndexWhere('+'));
+  }
+
   const oldAt: number[] = new Array(ops.length);
   const newAt: number[] = new Array(ops.length);
   let oldLine = 1;
@@ -745,6 +773,175 @@ export function diffStats(diff: string): PatchStats {
     else if (line.startsWith('-') && !line.startsWith('---')) removed += 1;
   }
   return { linesAdded: added, linesRemoved: removed, hunks };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Reversing the diff                                                         */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The bytes a diff produces, applied to the exact bytes it was computed from.
+ *
+ * VERIFY and the pull request both need the *whole* patched file — one to write
+ * it into the build sandbox, the other to commit it and to digest it for the
+ * approval — but the only thing that survives from FIX to those phases is the
+ * unified diff, because the `patches` row stores the diff and nothing else.
+ * So the contents have to be reconstructed, and reconstructing them by guessing
+ * would put unreviewed bytes into somebody's repository.
+ *
+ * This does not guess. Every context and removed line is checked against the
+ * original before it is consumed, so a file that has drifted since FIX read it
+ * fails here rather than being force-applied, and `rebuildFilePatch` below then
+ * re-derives the diff from the result and requires it to equal the diff it
+ * started from. The output is therefore never merely plausible: it is the one
+ * file whose diff against these bytes is the diff that was approved.
+ *
+ * Returns null when the diff does not apply cleanly. That is an ordinary
+ * outcome — a moved file, a rebased branch — and the caller reports it as a
+ * skip, never as a patch.
+ */
+export function applyUnifiedDiff(original: string, diff: string): string | null {
+  const source = splitLines(original);
+  const lines = diff.split('\n');
+
+  const out: string[] = [];
+  let oldIndex = 0;
+  /** Where a `+` line was marked as ending without a newline. */
+  let addedNoNewlineAt = -1;
+  /** Where the last line written by a `+` op landed. */
+  let lastAddedAt = -1;
+  let sawHunk = false;
+
+  for (let i = 0; i < lines.length; i += 1) {
+    const raw = lines[i]!;
+
+    if (raw.startsWith('--- ') || raw.startsWith('+++ ')) continue;
+
+    if (raw.startsWith('@@')) {
+      const header = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/.exec(raw);
+      if (!header) return null;
+      sawHunk = true;
+
+      const oldStart = Number(header[1]);
+      const oldCount = header[2] === undefined ? 1 : Number(header[2]);
+
+      // A hunk of pure insertion names the line it goes *after*; every other
+      // hunk names its first line. Both are 1-based.
+      const target = oldCount === 0 ? oldStart : oldStart - 1;
+      if (target < oldIndex || target > source.lines.length) return null;
+      while (oldIndex < target) out.push(source.lines[oldIndex++]!);
+      continue;
+    }
+
+    if (!sawHunk) continue;
+
+    if (raw.startsWith('\\')) {
+      // `\ No newline at end of file` describes the line just above it, on
+      // whichever side that line belongs to.
+      const previous = lines[i - 1];
+      if (previous === undefined) return null;
+      if (previous.startsWith('+')) addedNoNewlineAt = out.length - 1;
+      // A marker on a `-` line describes the *old* file, which the original
+      // bytes already answer. It says nothing about the new one.
+      continue;
+    }
+
+    // Every body line carries its prefix, so a blank line here is not an empty
+    // context line — it is the trailing element `split('\n')` leaves behind on
+    // the diff's final newline. An empty context line is written as one space.
+    if (raw === '') continue;
+
+    const kind = raw[0];
+    const text = raw.slice(1);
+
+    if (kind === ' ') {
+      if (source.lines[oldIndex] !== text) return null;
+      out.push(text);
+      oldIndex += 1;
+    } else if (kind === '-') {
+      if (source.lines[oldIndex] !== text) return null;
+      oldIndex += 1;
+    } else if (kind === '+') {
+      out.push(text);
+      lastAddedAt = out.length - 1;
+    } else {
+      return null;
+    }
+  }
+
+  if (!sawHunk) return null;
+  while (oldIndex < source.lines.length) out.push(source.lines[oldIndex++]!);
+
+  /*
+   * The terminator, from what the diff actually states about the *new* file.
+   *
+   * When the final line was written by a `+`, the diff is decisive both ways:
+   * `unifiedDiff` marks that line when the new file ends without a newline, so
+   * an unmarked one ends with a newline. When the final line is context instead,
+   * the diff says nothing — and cannot, because a marker on a context line would
+   * describe both sides at once — so the original's terminator is carried over,
+   * which is right precisely because `unifiedDiff` forces a changed terminator
+   * onto a `+` line rather than leaving it on context.
+   */
+  let trailingNewline = source.trailingNewline;
+  if (out.length > 0 && lastAddedAt === out.length - 1) {
+    trailingNewline = addedNoNewlineAt !== out.length - 1;
+  }
+
+  if (out.length === 0) return '';
+  return trailingNewline ? `${out.join('\n')}\n` : out.join('\n');
+}
+
+/**
+ * A `FilePatch` rebuilt from a stored diff and the file it was computed against.
+ *
+ * The diff is re-derived from the reconstructed contents and compared with the
+ * one that came in. Equality is the whole point: `unifiedDiff` is deterministic,
+ * so a result that does not reproduce its input byte for byte means the bytes on
+ * hand are not the bytes the patch was written against, and the right answer is
+ * to refuse rather than to commit something nobody reviewed.
+ *
+ * Returns null on any mismatch.
+ */
+export function rebuildFilePatch(
+  filePath: string,
+  originalContents: string,
+  diff: string,
+  details: {
+    readonly findingIds?: readonly string[];
+    readonly criteria?: readonly string[];
+    readonly rationale?: string;
+    readonly risk?: string | null;
+  } = {},
+): FilePatch | null {
+  const newContents = applyUnifiedDiff(originalContents, diff);
+  if (newContents === null) return null;
+
+  // The hunks are compared, not the `--- a/… +++ b/…` header, so a stored path
+  // that differs only in form — a backslash, a leading `./` — does not read as
+  // a different change. Everything that decides the bytes is still exact.
+  const recomputed = unifiedDiff(filePath, originalContents, newContents);
+  if (stripDiffHeader(recomputed) !== stripDiffHeader(diff)) return null;
+
+  return {
+    filePath,
+    newContents,
+    originalContents,
+    diff,
+    findingIds: details.findingIds ?? [],
+    criteria: details.criteria ?? [],
+    rationale: details.rationale ?? '',
+    risk: details.risk ?? null,
+    stats: diffStats(diff),
+  };
+}
+
+/** A diff without its `--- a/… +++ b/…` file header. */
+function stripDiffHeader(diff: string): string {
+  return diff
+    .split('\n')
+    .filter((line, index) => !(index < 2 && (line.startsWith('--- ') || line.startsWith('+++ '))))
+    .join('\n');
 }
 
 /**

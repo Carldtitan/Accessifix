@@ -26,6 +26,7 @@ import {
   primaryKey,
   text,
   timestamp,
+  unique,
   uniqueIndex,
   uuid,
 } from 'drizzle-orm/pg-core';
@@ -244,7 +245,12 @@ export const runs = pgTable(
      * findings composite FK needs. Without it a finding could claim a phase its
      * run is not in, and the A8 before/after delta would silently corrupt.
      */
-    uniqueIndex('runs_id_phase_key').on(t.id, t.phase),
+    /**
+     * A UNIQUE CONSTRAINT, not a unique index. Postgres will only accept a
+     * constraint as the target of a composite foreign key - a unique index
+     * alone raises 42830. This is what `findings(run_id, phase)` references.
+     */
+    unique('runs_id_phase_key').on(t.id, t.phase),
   ],
 );
 
@@ -348,6 +354,14 @@ export const findings = pgTable(
      * the delta is one grouped query; this composite FK is what stops the
      * denormalisation drifting. The before/after delta is the headline output -
      * a drifted phase corrupts it silently, which is the worst failure mode.
+     */
+    /**
+     * A finding's phase must match its run's phase (Qodo High #3).
+     *
+     * NOTE: `drizzle-kit push` emits this FK before the UNIQUE constraint it
+     * references, so a fresh push fails with 42830. Push once, then add this
+     * constraint by hand - or use `drizzle-kit generate` + `migrate`, which
+     * orders them correctly.
      */
     foreignKey({
       columns: [t.runId, t.phase],
