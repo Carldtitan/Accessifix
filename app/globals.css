@@ -484,7 +484,16 @@ code, pre, kbd, samp { font-family: var(--font-mono); }
 
 .environment-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+  /*
+   * auto-FILL, not auto-fit, and a hard max on the track.
+   *
+   * auto-fit collapses empty tracks and stretches the survivors, so a run with
+   * a single sandbox produced one card the width of the page - which reads as a
+   * broken layout, not as one browser. Cards now keep their size and pack from
+   * the left however many there are.
+   */
+  grid-template-columns: repeat(auto-fill, minmax(240px, 300px));
+  justify-content: start;
   gap: 14px;
   margin: 0; padding: 0;
   list-style: none;

@@ -429,8 +429,7 @@ export function RunLiveView(props: RunLiveViewProps) {
             <span className="eyebrow">Live</span>
             <h2 id="environments">Browser environments</h2>
             <p>
-              One card per unit of work the conductor has opened. Interaction depth is one; excess
-              paths queue against the sandbox cap.
+              One browser per thing being tested. They run at the same time.
             </p>
           </div>
           <span className="section-count">{environments.length}</span>
@@ -507,7 +506,7 @@ export function RunLiveView(props: RunLiveViewProps) {
           <div>
             <span className="eyebrow">Chronology</span>
             <h2 id="timeline">Agent timeline</h2>
-            <p>Every event names the agent that produced it and the harness capability behind it.</p>
+            <p>What each agent did, in order.</p>
           </div>
           <span className="section-count">{timeline.length}</span>
         </div>
