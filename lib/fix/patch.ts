@@ -405,7 +405,21 @@ export function parseFixResponse(
     });
   }
 
+  // A5.2: a FIX turn owns exactly one file and emits at most one patch for it.
+  // Two accepted entries for the same path would leave the sandbox write and the
+  // Git tree disagreeing about which one is authoritative — and `createTree`
+  // refuses duplicate paths outright.
+  let emitted = false;
+
   for (const file of parsed.data.files) {
+    if (emitted) {
+      warnings.push(
+        `Discarded a further entry for "${file.filePath}": a patch for ` +
+          `"${group.filePath}" was already accepted, and one FIX turn writes one file.`,
+      );
+      continue;
+    }
+
     const returnedPath = normalizeReturnedPath(file.filePath);
     if (returnedPath !== group.filePath) {
       if (parsed.data.files.length === 1) {
@@ -436,6 +450,18 @@ export function parseFixResponse(
         findingIds: group.findingIds,
         criterion: null,
         reason: `FIX returned ${group.filePath} unchanged, so there is nothing to review. The findings stay open.`,
+      });
+      continue;
+    }
+
+    if (isNormalizationOnly(originalContents, file.newContents)) {
+      skipped.push({
+        findingIds: group.findingIds,
+        criterion: null,
+        reason:
+          `FIX returned ${group.filePath} with only its line endings or its final newline ` +
+          'changed. That fixes no finding, and rewriting every line of a file to reach it is ' +
+          'churn a reviewer would have to read, so it was rejected.',
       });
       continue;
     }
@@ -492,6 +518,7 @@ export function parseFixResponse(
       risk: file.risk ?? null,
       stats: diffStats(diff),
     });
+    emitted = true;
   }
 
   return { patches, skipped, warnings };
@@ -516,6 +543,20 @@ function normalizeReturnedPath(value: string): string {
     .replace(/^\/+/, '');
 }
 
+/**
+ * True when the two versions differ only in line endings or the final newline.
+ *
+ * A model asked to fix an accessibility defect sometimes returns the file with
+ * its terminators rewritten and nothing else. The diff for that is honest — every
+ * line changed — but it is also a whole-file rewrite that fixes nothing, so it is
+ * refused here rather than put in front of a reviewer.
+ */
+function isNormalizationOnly(before: string, after: string): boolean {
+  if (before === after) return false;
+  const canonical = (text: string): string => text.replace(/\r\n/g, '\n').replace(/\n$/, '');
+  return canonical(before) === canonical(after);
+}
+
 function looksTruncated(before: string, after: string, minRatio: number): boolean {
   if (before.length < 200) return false;
   if (after.length >= before.length * minRatio) return false;
@@ -524,9 +565,15 @@ function looksTruncated(before: string, after: string, minRatio: number): boolea
 
 /**
  * Which findings a patch addresses. The agent's own list is preferred; when it
- * gave none, the criteria it named are mapped back onto the group's findings;
- * when it named neither, the patch covers every finding in the file, because
- * that is what it was asked to fix.
+ * gave none, the criteria it named are mapped back onto the group's findings.
+ *
+ * When it named neither, this returns nothing, and the caller turns the response
+ * into a skip. Assigning every finding in the file to a patch that could not say
+ * what it fixes would record attribution nobody claimed — A5.5 asks for *exactly*
+ * the findings a patch addresses, the pull-request body cites them one by one,
+ * and the re-check then reports them resolved. A guess at that is worse than an
+ * honest refusal, and it is what makes the caller's "named no finding" rejection
+ * reachable at all.
  */
 function resolveFindingIds(
   group: FixGroup,
@@ -550,7 +597,7 @@ function resolveFindingIds(
     if (matched.length > 0) return matched;
   }
 
-  return [...group.findingIds];
+  return [];
 }
 
 function criteriaOf(group: FixGroup, findingIds: readonly string[]): string[] {
@@ -619,7 +666,18 @@ export function unifiedDiff(
 
   const beforeLines = splitLines(before);
   const afterLines = splitLines(after);
-  const ops = diffLines(beforeLines.lines, afterLines.lines);
+
+  // The one change a line diff cannot see: identical lines, different final
+  // newline. Handled explicitly so `before !== after` can never produce an empty
+  // diff — that equivalence is the whole guarantee this function exists for.
+  const terminatorOnly =
+    beforeLines.trailingNewline !== afterLines.trailingNewline &&
+    beforeLines.lines.length === afterLines.lines.length &&
+    beforeLines.lines.every((line, index) => line === afterLines.lines[index]);
+
+  const ops = terminatorOnly
+    ? lastLineReplacement(beforeLines.lines, afterLines.lines)
+    : diffLines(beforeLines.lines, afterLines.lines);
 
   const oldAt: number[] = new Array(ops.length);
   const newAt: number[] = new Array(ops.length);
@@ -689,13 +747,40 @@ export function diffStats(diff: string): PatchStats {
   return { linesAdded: added, linesRemoved: removed, hunks };
 }
 
+/**
+ * Split into lines without normalising anything.
+ *
+ * A carriage return stays part of the line it terminates. Stripping CRLF here
+ * would be convenient and would also be a lie: a file rewritten from CRLF to LF
+ * has different bytes, those bytes are what get committed, and a diff that
+ * cancelled the change out would show a reviewer an empty hunk for a file that
+ * really did change.
+ */
 function splitLines(text: string): { lines: string[]; trailingNewline: boolean } {
   if (text === '') return { lines: [], trailingNewline: true };
-  const normalized = text.replace(/\r\n/g, '\n');
-  const trailingNewline = normalized.endsWith('\n');
-  const lines = normalized.split('\n');
+  const trailingNewline = text.endsWith('\n');
+  const lines = text.split('\n');
   if (trailingNewline) lines.pop();
   return { lines, trailingNewline };
+}
+
+/**
+ * The ops for a change that is only the file's final newline.
+ *
+ * Both sides have identical lines, so the LCS would call it "no change" and
+ * print nothing. Forcing the last line through as a replacement lets the
+ * `\ No newline at end of file` markers say which side lost its terminator,
+ * which is what git does and what the bytes actually did.
+ */
+function lastLineReplacement(before: readonly string[], after: readonly string[]): DiffOp[] {
+  const ops: DiffOp[] = [];
+  const last = before.length - 1;
+  for (let i = 0; i < last; i += 1) ops.push({ kind: ' ', line: before[i]! });
+  if (last >= 0) {
+    ops.push({ kind: '-', line: before[last]! });
+    ops.push({ kind: '+', line: after[last]! });
+  }
+  return ops;
 }
 
 function changeRanges(ops: readonly DiffOp[], context: number): Array<[number, number]> {

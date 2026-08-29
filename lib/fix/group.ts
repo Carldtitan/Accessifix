@@ -196,10 +196,17 @@ export function normalizeSourcePath(
 
   // Collapse `a/./b` and `a/b/../c`, which show up when an agent quotes an
   // import specifier rather than a repository path.
+  //
+  // A `..` with nothing left to pop is a path that leaves the repository, and it
+  // is rejected rather than collapsed. Popping an empty stack would silently
+  // rewrite `../src/Nav.tsx` into `src/Nav.tsx` — a real file, in this
+  // repository, that the finding was never about, and which a patch would then
+  // overwrite.
   const segments: string[] = [];
   for (const segment of value.split('/')) {
     if (segment === '' || segment === '.') continue;
     if (segment === '..') {
+      if (segments.length === 0) return null;
       segments.pop();
       continue;
     }
@@ -290,8 +297,9 @@ export function groupFindingsForFix(
         finding,
         reason: 'no-source-path',
         explanation:
-          `${finding.criterion} was decided, but the finding carries no source location, so ` +
-          'there is no file to patch. A person has to point it at one.',
+          `${finding.criterion} was decided, but the finding carries no usable source location ` +
+          '— it is missing, or it points outside the repository — so there is no file to ' +
+          'patch. A person has to point it at one.',
       });
       continue;
     }
