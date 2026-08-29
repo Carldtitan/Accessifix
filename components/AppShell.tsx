@@ -159,6 +159,18 @@ export function AppShell({
             </span>
             <Icon name="chevron-right" />
           </Link>
+
+          {/*
+            A real POST, not a link. Sign-out changes server state, and Auth.js
+            requires the CSRF-protected POST route - a GET here would either be
+            prefetched by the router or fail the check.
+          */}
+          <form action="/api/auth/signout" method="post" className="signout-form">
+            <button className="signout-button" type="submit" onClick={closeMenu}>
+              <Icon name="back" size={15} />
+              <span>Sign out</span>
+            </button>
+          </form>
         </div>
       </aside>
 
