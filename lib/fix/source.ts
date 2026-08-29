@@ -30,6 +30,29 @@ function normalizePath(path: string): string {
   return path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
 }
 
+/**
+ * The path, safe to interpolate into a Contents API URL.
+ *
+ * `encodeURI` is the wrong tool here: it leaves the reserved delimiters alone,
+ * so a file legitimately named `report?draft.md` or `notes#1.md` — both valid in
+ * Git and on every filesystem this runs against — turns the rest of the path
+ * into a query string or a fragment, GitHub answers 404, and FIX reports the
+ * file as missing rather than as a file it could not address. `%` is worse
+ * again: it survives `encodeURI` untouched and is then read back as the start
+ * of an escape sequence.
+ *
+ * So every segment is encoded on its own and the `/` separators are put back.
+ * `encodeURIComponent` escapes exactly the characters that would otherwise
+ * change the URL's structure and leaves the unreserved set alone, which is why
+ * an ordinary path still comes out looking like itself.
+ */
+function encodeRepoPath(path: string): string {
+  return path
+    .split('/')
+    .map((segment) => encodeURIComponent(segment))
+    .join('/');
+}
+
 /** A stored patch row, in the shape the pipeline seam passes it around in. */
 export interface StoredPatchInput {
   readonly filePath: string;
@@ -69,7 +92,7 @@ export async function readRepoFile(
 
   const query = ref ? `?ref=${encodeURIComponent(ref)}` : '';
   const response = await fetch(
-    `https://api.github.com/repos/${owner}/${repo}/contents/${encodeURI(path)}${query}`,
+    `https://api.github.com/repos/${owner}/${repo}/contents/${encodeRepoPath(path)}${query}`,
     {
       headers: {
         Authorization: `Bearer ${accessToken}`,

@@ -67,10 +67,28 @@ interface CachedCapabilities {
 /** Long enough that a whole run costs one probe; short enough to notice a restart. */
 const CAPABILITY_TTL_MS = 5 * 60_000;
 
-let cached: CachedCapabilities | null = null;
+/**
+ * One entry per client, keyed by the client object itself.
+ *
+ * A single module-global entry was wrong in a way that only shows up once a
+ * second TrueForge is in play: every lane accepts a `client`, so a lane pointed
+ * at another server — a second tenant, a local harness beside the deployed one,
+ * a test double — would be handed the first client's models, skills and sandbox
+ * flag for the next five minutes. The A3.7 fallback manifest is built from those
+ * three facts, so the consequence is not a stale display value: it is a fallback
+ * agent asking for a model the active server cannot serve, or dropping the WCAG
+ * skill packs (A13.2, A13.3) that server does mount.
+ *
+ * A `WeakMap` rather than a keyed record because the key *is* the identity that
+ * matters — two clients built against the same base URL may still carry
+ * different credentials — and because an entry then dies with the client it
+ * describes instead of pinning it in memory. The process-default client is a
+ * singleton (`getTrueForgeClient`), so it gets exactly one entry of its own.
+ */
+let cache = new WeakMap<TrueForgeClient, CachedCapabilities>();
 
 /**
- * Ask the server what it can do, once per five minutes.
+ * Ask the server what it can do, once per five minutes per client.
  *
  * Returns whatever the caller already supplied untouched — an explicit value is
  * always the answer. Never throws: a probe that fails leaves the fields absent,
@@ -89,13 +107,17 @@ export async function resolveLaneCapabilities(
     return explicit;
   }
 
+  // The client is chosen *before* the cache is consulted, because the cache is
+  // keyed by it. Reading a cached answer first is what let one server's reply
+  // stand in for another's.
+  const client = input.client ?? safeClient();
+  if (!client) return explicit;
+
   const now = Date.now();
+  const cached = cache.get(client);
   if (cached && now - cached.at < CAPABILITY_TTL_MS) {
     return { ...cached.value, ...explicit };
   }
-
-  const client = input.client ?? safeClient();
-  if (!client) return explicit;
 
   const probed: {
     availableModels?: readonly string[];
@@ -113,13 +135,19 @@ export async function resolveLaneCapabilities(
   if (skills) probed.availableSkills = skills.map((skill) => skill.name);
   if (capabilities) probed.sandboxAvailable = capabilities.sandbox.enabled;
 
-  cached = { at: now, value: probed };
+  // A probe where nothing answered is not an answer. Storing it would hold the
+  // lane at the roster defaults for five minutes over what may have been one
+  // unreachable moment, so it is left uncached and the next lane asks again.
+  if (models || skills || capabilities) {
+    cache.set(client, { at: now, value: probed });
+  }
+
   return { ...probed, ...explicit };
 }
 
-/** Forget the probe. For tests, and for a TrueForge that was restarted. */
+/** Forget every probe. For tests, and for a TrueForge that was restarted. */
 export function resetLaneCapabilities(): void {
-  cached = null;
+  cache = new WeakMap();
 }
 
 function safeClient(): TrueForgeClient | null {

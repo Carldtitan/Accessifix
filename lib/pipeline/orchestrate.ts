@@ -44,6 +44,7 @@
 import { and, eq, inArray, ne } from 'drizzle-orm';
 
 import type { InteractionPath } from '@/lib/browser/types';
+import { operationMismatch, type ApprovalOperation } from '@/lib/fix/gate';
 import { db } from '@/lib/db';
 import { findings, patches, runs, targets, type Finding, type RunPhase } from '@/lib/db/schema';
 import { MAX_PAGES_PER_CRAWL } from '@/lib/sandbox/config';
@@ -57,6 +58,7 @@ import {
   enumerateInteractionPaths,
   extractVisionCandidates,
   openPullRequest,
+  planPullRequest,
   runActLane,
   runCodeLane,
   runMediaLane,
@@ -65,8 +67,11 @@ import {
   runVisLane,
   verifyPatches,
   writePatches,
+  type ApprovedWriteOperations,
   type AuditLaneResult,
   type AuditPageInput,
+  type OpenPullRequestInput,
+  type PullRequestPlan,
 } from './lanes';
 import { emitEvent } from './events';
 import { awaitHandoff, loadHandoff, raiseHandoff } from './handoff';
@@ -390,22 +395,44 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     }
 
     /* ---- 6. Pull request, then the final score -------------------------- */
-    const gate = await pullRequestGate(context, verification.reason);
-    if (!gate.approved || !gate.requestId) {
+    /*
+     * The plan is worked out before the human is asked, not after. It is what
+     * the card describes and what the answer is recorded against: the branch,
+     * the base, the title, and the digest of every file's contents. Nothing
+     * here writes anything — every GitHub call it makes is a read.
+     */
+    const seam = pullRequestSeamInput(
+      context,
+      token,
+      proposed,
+      verification.criteriaFixed,
+      verification.evidence,
+    );
+
+    let plan: PullRequestPlan;
+    try {
+      plan = await planPullRequest(seam);
+    } catch (error) {
+      // Nothing to ask about: the patches no longer apply, or the repository
+      // could not be read. Say so rather than raising a card for a write that
+      // could not happen.
+      await transition(runId, 'done', {
+        reason:
+          'No pull request could be prepared, so none was proposed: ' +
+          (error instanceof Error ? error.message : String(error)),
+      });
+      return;
+    }
+
+    const gate = await pullRequestGate(context, verification.reason, plan);
+    if (!gate.approved || !gate.requestId || !gate.operations) {
       await transition(runId, 'done', {
         reason: 'The pull request was declined. Patches are recorded but nothing was pushed.',
       });
       return;
     }
 
-    await prPhase(
-      context,
-      token,
-      proposed,
-      verification.criteriaFixed,
-      verification.evidence,
-      gate.requestId,
-    );
+    await prPhase(context, seam, proposed, gate.requestId, gate.operations);
     await finalAuditPhase(context, verification.previewUrl ?? context.deployedUrl);
 
     await transition(runId, 'done');
@@ -1223,25 +1250,136 @@ async function verifyPhase(
 /* -------------------------------------------------------------------------- */
 
 /**
+ * The seam's flat input, built once and used for both the plan and the write.
+ *
+ * The title, the body and the branch name have to be identical on both sides:
+ * `composePullRequest` derives the title the approval binds to from them, so a
+ * second, separately-built input would show the human one operation and run
+ * another.
+ */
+function pullRequestSeamInput(
+  context: PipelineContext,
+  token: string,
+  proposed: StoredPatch[],
+  criteriaFixed: string[],
+  evidence: VerifyOutcome['evidence'],
+): Omit<OpenPullRequestInput, 'approval'> {
+  const criteria = [...new Set(proposed.flatMap((patch) => patch.criteria))].sort();
+  return {
+    runId: context.runId,
+    repoFullName: context.repoFullName,
+    accessToken: token,
+    branch: `accessifix/run-${context.runId.slice(0, 8)}`,
+    title: `Accessibility fixes for ${criteria.length} WCAG 2.2 criteria`,
+    // A10.5: the body cites each criterion, which is also what makes the
+    // pull request reviewable by Qodo.
+    body: buildPullRequestBody(context, proposed, criteria, criteriaFixed),
+    patches: proposed.map((patch) => ({ filePath: patch.filePath, diff: patch.diff })),
+    // The gates read this rather than taking the conductor's word (A6.4).
+    verification: evidence,
+    ...(context.signal === undefined ? {} : { signal: context.signal }),
+  };
+}
+
+/** The file list a person can actually check, one line each. */
+function describeApprovedFiles(plan: PullRequestPlan): string {
+  return plan.patches
+    .map(
+      (patch) =>
+        `  - ${patch.filePath} (+${patch.stats.linesAdded}/-${patch.stats.linesRemoved}` +
+        `, SC ${patch.criteria.join(', ')})`,
+    )
+    .join('\n');
+}
+
+/**
+ * Read back the operations recorded against a decision.
+ *
+ * Deliberately strict, and deliberately returns null rather than repairing what
+ * it finds. A row written before the operations existed, or one that lost them,
+ * is a recorded yes that names no operation — and a yes that names no operation
+ * is exactly the thing the gate is for.
+ */
+function approvedOperationsFrom(
+  result: Record<string, unknown> | null,
+): ApprovedWriteOperations | null {
+  const operations = result?.['operations'];
+  if (!operations || typeof operations !== 'object') return null;
+  const { branch, pullRequest } = operations as Record<string, unknown>;
+  if (!isApprovalOperation(branch) || !isApprovalOperation(pullRequest)) return null;
+  return { branch, pullRequest };
+}
+
+function isApprovalOperation(value: unknown): value is ApprovalOperation {
+  if (!value || typeof value !== 'object') return false;
+  const operation = value as Record<string, unknown>;
+  return (
+    typeof operation['action'] === 'string' &&
+    typeof operation['repoFullName'] === 'string' &&
+    Array.isArray(operation['files']) &&
+    operation['files'].every((file) => typeof file === 'string')
+  );
+}
+
+/**
  * A7.1: the run pauses before pushing a branch and before opening a pull
  * request. The card states the intent, the reason, and the evidence (A7.2).
+ *
+ * What the human is asked is the *plan* — this repository, this branch, cut
+ * from this base, with this title, writing these files, whose contents are
+ * digested into the operation recorded against their answer. That recording is
+ * the point. A card that said only "push a branch and open a pull request"
+ * would leave the write path with nothing to compare against except the payload
+ * it was already holding, and comparing a payload to itself authorises every
+ * payload.
  *
  * The gate is *recovered*, not re-raised. A restart between the card going up
  * and the PR being opened used to produce a second card over the same decision
  * — and, once approved twice, a second branch and a second pull request on the
  * user's repository. So the fixed `pr`/`approval` job row is the continuation
- * point: it remembers the handoff, and a resumed run re-enters that same wait
- * rather than starting a new conversation (A7.4, A12.2).
+ * point: it remembers the handoff and the operations it authorised, and a
+ * resumed run re-enters that same wait rather than starting a new conversation
+ * (A7.4, A12.2).
  */
 async function pullRequestGate(
   context: PipelineContext,
   verificationSummary: string,
-): Promise<{ approved: boolean; requestId: string | null }> {
+  plan: PullRequestPlan,
+): Promise<{
+  approved: boolean;
+  requestId: string | null;
+  operations: ApprovedWriteOperations | null;
+}> {
   const previous = await findJob(context.runId, 'pr', 'approval');
 
   // The decision was already reached and recorded. Nothing to ask again.
   if (previous?.status === 'succeeded' || previous?.status === 'skipped') {
     const approved = previous.status === 'succeeded';
+    const operations = approved ? approvedOperationsFrom(previous.result) : null;
+
+    if (approved && !operations) {
+      /*
+       * A yes is on the ledger, but not what it was a yes to. That can only be
+       * a row from before the operations were recorded, and there is no honest
+       * way to reconstruct it: rebuilding the operation from the current plan
+       * would put this run's own bytes in the place of the human's answer. So
+       * the run stops and says why, rather than pushing on a consent nobody can
+       * now read.
+       */
+      await emitEvent({
+        runId: context.runId,
+        type: 'approval',
+        capability: 'approval',
+        summary: 'The recorded approval does not name the operation it authorised.',
+        detail:
+          'This run was approved before the decision recorded the repository, branch, title ' +
+          'and file digests it covered, so nothing can be written under it (A7.1). Start the ' +
+          'run again to be asked afresh.',
+        data: { handoffId: previous.handoffId, resumed: true },
+      });
+      return { approved: false, requestId: previous.handoffId ?? null, operations: null };
+    }
+
     await emitEvent({
       runId: context.runId,
       type: 'approval',
@@ -1252,7 +1390,7 @@ async function pullRequestGate(
       detail: 'Recovered from the ledger rather than asking a second time (A12.2).',
       data: { handoffId: previous.handoffId, resumed: true },
     });
-    return { approved, requestId: previous.handoffId ?? null };
+    return { approved, requestId: previous.handoffId ?? null, operations };
   }
 
   // A card is already up for this run. Re-enter its wait.
@@ -1261,17 +1399,49 @@ async function pullRequestGate(
 
   let jobId = previous?.id ?? null;
 
+  /*
+   * The operations this decision is about. For a fresh card that is the plan
+   * just made; for a card already up it is the plan the card was raised for,
+   * read back off the job row.
+   *
+   * They are not the same thing, and the difference matters: a run that
+   * restarts between the card going up and the answer coming in recomputes its
+   * plan against a repository that may have moved. Binding the human's answer
+   * to the *recomputed* plan would authorise bytes the card never described,
+   * which is the tautology this gate exists to prevent, just displaced by a
+   * restart. So the recorded operations win, and a plan that no longer matches
+   * them stops the run instead.
+   */
+  let asked: ApprovedWriteOperations = plan.operations;
+
   if (!handoff) {
     handoff = await raiseHandoff({
       runId: context.runId,
       kind: 'approval',
       agent: 'APP',
-      intent: `Push a branch to ${context.repoFullName} and open a pull request with the accessibility fixes.`,
+      intent:
+        `Create the branch \`${plan.composition.branch}\` in ${context.repoFullName}, cut from ` +
+        `\`${plan.base}\`, commit ${plan.patches.length} file(s) to it, and open a pull request ` +
+        `into \`${plan.base}\` titled "${plan.composition.title}".\n\n` +
+        `${describeApprovedFiles(plan)}\n` +
+        (plan.resumeFromSha
+          ? `\nThe branch already exists at ${plan.resumeFromSha.slice(0, 7)}, ahead of ` +
+            `\`${plan.base}\`. Approving this accepts those existing commits into the pull ` +
+            'request as well.\n'
+          : '') +
+        (plan.failures.length > 0
+          ? `\n${plan.failures.length} proposed patch(es) are not included, because the files ` +
+            'they were written against have changed since: ' +
+            plan.failures.map((failure) => `${failure.filePath} (${failure.reason})`).join('; ') +
+            '\n'
+          : ''),
       reason:
         `${verificationSummary} Pushing a branch and opening a pull request are ` +
         'irreversible actions on your repository, so AccessiFix will not do either ' +
         'without your say-so (A7.1). The pull request is opened with your own GitHub ' +
-        'token, not a bot account.',
+        'token, not a bot account. Your answer is recorded against these exact files and ' +
+        'their exact contents: if anything in the repository moves between now and the ' +
+        'push, the write is refused rather than carried out on something you did not see.',
     });
 
     const job = await beginJob({
@@ -1281,8 +1451,37 @@ async function pullRequestGate(
       agent: 'APP',
     });
     jobId = job.id;
-    await pauseJobForApproval(job.id, { handoffId: handoff.id });
+    await pauseJobForApproval(job.id, {
+      handoffId: handoff.id,
+      // Written now, not on the answer: this is what the card in front of the
+      // human describes, and a resumed run has to be able to check that.
+      result: { operations: plan.operations },
+    });
   } else {
+    const recorded = approvedOperationsFrom(previous?.result ?? null);
+    const drift =
+      recorded === null
+        ? 'the card was raised without recording which operations it covers'
+        : (operationMismatch(recorded.branch, plan.operations.branch) ??
+          operationMismatch(recorded.pullRequest, plan.operations.pullRequest));
+
+    if (drift) {
+      await emitEvent({
+        runId: context.runId,
+        type: 'approval',
+        capability: 'approval',
+        summary: 'The pull request changed while its approval was still open.',
+        detail:
+          `The card already up for this run no longer describes what would be written — ${drift}. ` +
+          'Answering it would approve something other than what it shows, so nothing is ' +
+          'written and the run stops here (A7.1).',
+        data: { handoffId: handoff.id, status: handoff.status, resumed: true },
+      });
+      return { approved: false, requestId: handoff.id, operations: null };
+    }
+
+    asked = recorded as ApprovedWriteOperations;
+
     await emitEvent({
       runId: context.runId,
       type: 'approval',
@@ -1318,42 +1517,46 @@ async function pullRequestGate(
    * continuation point is set: a crash between here and `prPhase` re-enters
    * this function, reads `succeeded`, and goes straight to opening the pull
    * request instead of asking again.
+   *
+   * The operations go down with it. They are what the yes was a yes to, and
+   * without them on the row a resumed run has an approval it cannot check.
    */
   if (jobId) {
-    if (decision.approved) await completeJob(jobId, { result: { approved: true } });
-    else await skipJob(jobId, decision.response ?? 'Declined by the user.');
+    if (decision.approved) {
+      await completeJob(jobId, {
+        result: {
+          approved: true,
+          operations: { branch: asked.branch, pullRequest: asked.pullRequest },
+        },
+      });
+    } else {
+      await skipJob(jobId, decision.response ?? 'Declined by the user.');
+    }
   }
 
-  return { approved: decision.approved, requestId: handoff.id };
+  return {
+    approved: decision.approved,
+    requestId: handoff.id,
+    operations: decision.approved ? asked : null,
+  };
 }
 
 async function prPhase(
   context: PipelineContext,
-  token: string,
+  seam: Omit<OpenPullRequestInput, 'approval'>,
   proposed: StoredPatch[],
-  criteriaFixed: string[],
-  evidence: VerifyOutcome['evidence'],
   approvalRequestId: string,
+  operations: ApprovedWriteOperations,
 ): Promise<void> {
   await runJob(
     { runId: context.runId, phase: 'pr', jobKey: 'open', agent: 'APP' },
     async () => {
-      const criteria = [...new Set(proposed.flatMap((patch) => patch.criteria))].sort();
-
       const pr = await openPullRequest({
-        runId: context.runId,
-        repoFullName: context.repoFullName,
-        accessToken: token,
-        branch: `accessifix/run-${context.runId.slice(0, 8)}`,
-        title: `Accessibility fixes for ${criteria.length} WCAG 2.2 criteria`,
-        // A10.5: the body cites each criterion, which is also what makes the
-        // pull request reviewable by Qodo.
-        body: buildPullRequestBody(context, proposed, criteria, criteriaFixed),
-        patches: proposed.map((patch) => ({ filePath: patch.filePath, diff: patch.diff })),
-        // The gates read this rather than taking the conductor's word (A6.4).
-        verification: evidence,
-        // A7.1: the human decision, bound by id to the request they answered.
-        approval: { requestId: approvalRequestId, approved: true },
+        ...seam,
+        // A7.1: the human decision, and the operations it was a decision about.
+        // The id alone would authorise nothing; the operations are what the
+        // write is compared against, field by field and digest by digest.
+        approval: { requestId: approvalRequestId, approved: true, operations },
       });
 
       await db

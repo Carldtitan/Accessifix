@@ -342,6 +342,35 @@ export async function withApproval<T>(
   return fn();
 }
 
+/**
+ * Re-attach a request to the operation a human actually answered.
+ *
+ * The builders below derive an `ApprovalOperation` from whatever they are given,
+ * which is right at the moment the card goes up and wrong at the moment the
+ * write runs. By then the request has to be rebuilt — the prose, the evidence
+ * and the action all come from the same builders — but rebuilding the operation
+ * too would make `assertApproved` compare the current payload against itself and
+ * agree every time. That is not an approval, it is a mirror.
+ *
+ * So the write path rebuilds the request and then puts back the operation that
+ * was recorded when the decision was made. Everything the human bound — the
+ * repository, the branch, the base, the title, the tip, and the digest of every
+ * file's contents — comes from the stored decision; only the wording is fresh.
+ * If any of it has since moved, the comparison at the call site now has two
+ * genuinely different operations in hand and refuses the write.
+ */
+export function bindApprovalToOperation(
+  request: ApprovalRequest,
+  approved: ApprovalOperation,
+): ApprovalRequest {
+  return {
+    ...request,
+    action: approved.action,
+    operation: approved,
+    fingerprint: fingerprintOperation(approved),
+  };
+}
+
 /* -------------------------------------------------------------------------- */
 /* Builders                                                                   */
 /* -------------------------------------------------------------------------- */

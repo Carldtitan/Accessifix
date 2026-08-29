@@ -35,14 +35,41 @@
  * user's repository is irreversible, and A7.1 says irreversible actions wait
  * for a person.
  */
-import { buildBranchApproval, buildPullRequestApproval, type GateDecision } from '@/lib/fix/gate';
-import { materializePatches } from '@/lib/fix/source';
+import {
+  bindApprovalToOperation,
+  buildBranchApproval,
+  buildPullRequestApproval,
+  type ApprovalOperation,
+  type GateDecision,
+} from '@/lib/fix/gate';
+import type { FilePatch } from '@/lib/fix/patch';
+import { materializePatches, type UnmaterializedPatch } from '@/lib/fix/source';
 import type { BuildResult } from '@/lib/verify/build';
 import type { RecheckReport } from '@/lib/verify/recheck';
 import type { TestRunResult } from '@/lib/verify/tests';
 
 import { GitHubClient, GitHubError } from './client';
-import { composePullRequest, openVerifiedPullRequest } from './pr';
+import { composePullRequest, openVerifiedPullRequest, type PullRequestComposition } from './pr';
+
+/**
+ * The two irreversible acts a run asks for, as the human answered them.
+ *
+ * They are produced by `planPullRequestForRun` *before* the card goes up, and
+ * they are what the conductor records against the decision. Handing them back
+ * here is what makes the check at the write real: without them the write path
+ * would have to derive an operation from the payload it is already holding and
+ * compare it against itself, which agrees with everything.
+ */
+export interface ApprovedWriteOperations {
+  /** Creating or reusing the branch, and committing the bytes onto it. */
+  readonly branch: ApprovalOperation;
+  /**
+   * Opening the pull request. Its `commitSha` is null at approval time — the
+   * commit does not exist yet — and is filled from the commit this run makes
+   * under `branch`, which is itself bound to the approved bytes and tip.
+   */
+  readonly pullRequest: ApprovalOperation;
+}
 
 export interface PipelineOpenPullRequestInput {
   runId: string;
@@ -63,23 +90,59 @@ export interface PipelineOpenPullRequestInput {
     testCommand?: string;
     testSummary?: string;
   };
-  /** The human decision (A7.1). Absent or unapproved means refuse. */
-  approval?: { requestId: string; approved: boolean };
+  /**
+   * The human decision (A7.1). Absent, unapproved, or carrying no operations
+   * means refuse — an id on its own authorises nothing.
+   */
+  approval?: {
+    requestId: string;
+    approved: boolean;
+    operations?: ApprovedWriteOperations;
+  };
   signal?: AbortSignal;
 }
 
-export async function openPullRequestForRun(
-  input: PipelineOpenPullRequestInput,
-): Promise<{ url: string; number: number; branch: string }> {
-  if (!input.approval?.approved) {
-    throw new Error(
-      'openPullRequest was called without an approved decision. Opening a pull ' +
-        'request against a user repository is irreversible and requires explicit ' +
-        'human approval (A7.1).',
-    );
-  }
+/** Everything needed to plan the write. The decision is what the plan is for. */
+export type PullRequestPlanInput = Omit<PipelineOpenPullRequestInput, 'approval'>;
 
-  const client = new GitHubClient(input.accessToken);
+/**
+ * What this run intends to write, resolved against the repository as it is now.
+ *
+ * Built once before the human is asked, and built again immediately before the
+ * write. The two are compared, and the write happens only where they agree.
+ */
+export interface PullRequestPlan {
+  readonly repoFullName: string;
+  /** The default branch the diffs were read against and the PR would target. */
+  readonly base: string;
+  readonly composition: PullRequestComposition;
+  /** Whole files, rebuilt from the stored diffs and verified to reproduce them. */
+  readonly patches: readonly FilePatch[];
+  /** Patches that no longer apply, named so the run can say what it dropped. */
+  readonly failures: readonly UnmaterializedPatch[];
+  /** An existing branch tip above the base, which reuse would absorb. */
+  readonly resumeFromSha: string | null;
+  readonly operations: ApprovedWriteOperations;
+  readonly evidence: { build: BuildResult; tests: TestRunResult; recheck: RecheckReport };
+}
+
+/**
+ * Work out exactly what would be written, without writing anything.
+ *
+ * This is the half of the old `openPullRequestForRun` that has to run *before*
+ * consent rather than after it: resolve the base, rebuild the bytes from the
+ * stored diffs, compose the title and body the gates bind to, read the branch
+ * tip, and turn all of it into the two `ApprovalOperation`s the write will be
+ * measured against.
+ *
+ * Read-only. Every GitHub call here is a GET, so a run that is never approved
+ * has changed nothing.
+ */
+export async function planPullRequestForRun(
+  input: PullRequestPlanInput,
+  existingClient?: GitHubClient,
+): Promise<PullRequestPlan> {
+  const client = existingClient ?? new GitHubClient(input.accessToken);
   const base = await client.getDefaultBranch(input.repoFullName);
 
   // Whole files, rebuilt from the stored diffs and verified to reproduce them
@@ -102,34 +165,9 @@ export async function openPullRequestForRun(
   }
 
   const evidence = pullRequestVerificationEvidence(input, base);
-
-  // Composed once here so the approval is bound to the exact title and branch
-  // `openVerifiedPullRequest` will compose for itself. If they ever diverged,
-  // the field-by-field comparison inside `assertApproved` would refuse the
-  // write rather than open a pull request the human did not read.
-  const composeInput = {
-    runId: input.runId,
-    repoFullName: input.repoFullName,
-    baseBranch: base,
-    branch: input.branch,
-    patches: materialized.patches,
-    findings: [],
-    build: evidence.build,
-    tests: evidence.tests,
-    recheck: evidence.recheck,
-  } as const;
-  const composition = composePullRequest(composeInput);
-
-  /*
-   * The branch has to exist and carry the commit before the pull request can
-   * point at it, and pushing is itself a write, so it carries its own approval
-   * bound to its own operation. Both requests take the id of the decision the
-   * human actually gave: the decision names the request, and each request still
-   * describes only the one act it authorises — `createBranch` accepts nothing
-   * but `push-branch`, `openPullRequest` nothing but `open-pull-request`.
-   */
-  const decisionId = input.approval.requestId;
-  const decision: GateDecision = { requestId: decisionId, status: 'approved' };
+  const composition = composePullRequest(
+    composeInputFor(input, base, materialized.patches, evidence),
+  );
 
   // Read the tip first. An existing branch already ahead of the base is history
   // this run did not write, and the approval has to say so rather than absorb
@@ -138,29 +176,197 @@ export async function openPullRequestForRun(
   const baseTip = await client.getBranchSha(input.repoFullName, base);
   const resumeFromSha = existingTip && existingTip !== baseTip ? existingTip : null;
 
-  const branchApproval = buildBranchApproval({
-    id: decisionId,
+  /*
+   * The operations, built by the same builders the write path uses, so the
+   * digests shown on the card and the digests checked at the write are computed
+   * exactly one way.
+   *
+   * The pull request's `commitSha` is null here and cannot be anything else:
+   * the commit is made under the branch approval, so it does not exist until
+   * after this decision has been answered.
+   */
+  const branchOperation = buildBranchApproval({
     runId: input.runId,
     repoFullName: input.repoFullName,
     branch: composition.branch,
     baseBranch: base,
     patches: materialized.patches,
     resumeFromSha,
-  });
+  }).operation;
+
+  const pullRequestOperation = buildPullRequestApproval({
+    runId: input.runId,
+    repoFullName: input.repoFullName,
+    branch: composition.branch,
+    baseBranch: base,
+    title: composition.title,
+    patches: materialized.patches,
+    commitSha: null,
+    buildSummary: evidence.build.summary,
+    buildOk: evidence.build.ok,
+    buildUnproven: !evidence.build.buildRan,
+    testSummary: evidence.tests.summary,
+    testsOk: evidence.tests.ok,
+    testsUnproven: evidence.tests.skipped,
+    recheckSummary: evidence.recheck.summary,
+  }).operation;
+
+  return {
+    repoFullName: input.repoFullName,
+    base,
+    composition,
+    patches: materialized.patches,
+    failures: materialized.failures,
+    resumeFromSha,
+    operations: { branch: branchOperation, pullRequest: pullRequestOperation },
+    evidence,
+  };
+}
+
+/**
+ * The seam's flat input, in the shape `composePullRequest` takes.
+ *
+ * One function rather than two literals: the composed title and branch are what
+ * the approval binds to, so the plan and the write have to compose from
+ * identical inputs or the operation comparison would fail on wording alone.
+ */
+function composeInputFor(
+  input: PullRequestPlanInput,
+  base: string,
+  patches: readonly FilePatch[],
+  evidence: { build: BuildResult; tests: TestRunResult; recheck: RecheckReport },
+) {
+  return {
+    runId: input.runId,
+    repoFullName: input.repoFullName,
+    baseBranch: base,
+    branch: input.branch,
+    patches,
+    findings: [],
+    build: evidence.build,
+    tests: evidence.tests,
+    recheck: evidence.recheck,
+  } as const;
+}
+
+/**
+ * Fill in the one field the human could not have seen.
+ *
+ * The pull-request operation is approved with `commitSha: null`, which means
+ * "the commit this run makes on the approved branch from the approved bytes".
+ * That commit is not a free variable: `commitFiles` refused to write anything
+ * whose digests were not the approved ones, onto any branch but the approved
+ * one, on top of any tip but the approved one. So the sha is a consequence of
+ * what was approved rather than an addition to it, and substituting it here
+ * does not widen the consent.
+ *
+ * Everything else is left exactly as the human answered it, and the two guards
+ * below are what keep the substitution from becoming a hole: an approval that
+ * already names a commit must name *this* one, and the bytes in the pull-request
+ * operation must be the bytes the branch operation authorised.
+ */
+function pullRequestOperationForCommit(
+  approved: ApprovedWriteOperations,
+  commitSha: string,
+): ApprovalOperation {
+  const operation = approved.pullRequest;
+
+  if (operation.commitSha !== null && operation.commitSha !== commitSha) {
+    throw new GitHubError(
+      'openPullRequest',
+      `The approval opens a pull request from commit ${operation.commitSha}, but this run ` +
+        `pushed ${commitSha}. That is not the change that was approved.`,
+    );
+  }
+
+  const branchFiles = [...approved.branch.files].sort();
+  const pullRequestFiles = [...operation.files].sort();
+  if (
+    branchFiles.length !== pullRequestFiles.length ||
+    branchFiles.some((digest, index) => digest !== pullRequestFiles[index])
+  ) {
+    throw new GitHubError(
+      'openPullRequest',
+      'The approved branch push and the approved pull request describe different bytes, so the ' +
+        'commit sha cannot be carried from one to the other.',
+    );
+  }
+
+  return { ...operation, commitSha };
+}
+
+export async function openPullRequestForRun(
+  input: PipelineOpenPullRequestInput,
+): Promise<{ url: string; number: number; branch: string }> {
+  if (!input.approval?.approved) {
+    throw new Error(
+      'openPullRequest was called without an approved decision. Opening a pull ' +
+        'request against a user repository is irreversible and requires explicit ' +
+        'human approval (A7.1).',
+    );
+  }
+
+  /*
+   * The operations the human answered. Refusing without them is the whole point
+   * of this check: a decision id says which card was clicked and nothing about
+   * which repository, which branch, which title or which bytes, so building an
+   * operation out of the payload in hand and comparing it against itself would
+   * agree with every payload — including one assembled after the yes.
+   */
+  const approvedOperations = input.approval.operations;
+  if (!approvedOperations) {
+    throw new Error(
+      'openPullRequest was called with an approval that names no operation. A decision id ' +
+        'binds nothing on its own: the repository, branch, base, title and the digest of every ' +
+        "file's contents have to come from what the human was shown (A7.1). Plan the write with " +
+        '`planPullRequestForRun`, record its operations against the decision, and pass them here.',
+    );
+  }
+
+  const client = new GitHubClient(input.accessToken);
+
+  // What would be written *now*, resolved against the repository as it is at
+  // this moment rather than as it was when the card went up. Anything that
+  // moved in between shows up as a mismatch at the write and is refused there.
+  const plan = await planPullRequestForRun(input, client);
+
+  const decisionId = input.approval.requestId;
+  const decision: GateDecision = { requestId: decisionId, status: 'approved' };
+
+  /*
+   * The branch has to exist and carry the commit before the pull request can
+   * point at it, and pushing is itself a write, so it carries its own approval
+   * bound to its own operation. The prose is rebuilt from the current plan; the
+   * operation is the recorded one, so `createBranch` and `commitFiles` compare
+   * the repository, branch, base, tip and file digests the human approved
+   * against the ones actually about to be written.
+   */
+  const branchApproval = bindApprovalToOperation(
+    buildBranchApproval({
+      id: decisionId,
+      runId: input.runId,
+      repoFullName: input.repoFullName,
+      branch: plan.composition.branch,
+      baseBranch: plan.base,
+      patches: plan.patches,
+      resumeFromSha: plan.resumeFromSha,
+    }),
+    approvedOperations.branch,
+  );
 
   const branchResult = await client.createBranch(
     input.repoFullName,
-    composition.branch,
+    plan.composition.branch,
     { approval: branchApproval, decision },
-    base,
+    plan.base,
   );
 
   const commit = await client.commitFiles(
     input.repoFullName,
     {
-      branch: composition.branch,
-      message: composition.commitMessage,
-      files: materialized.patches.map((patch) => ({
+      branch: plan.composition.branch,
+      message: plan.composition.commitMessage,
+      files: plan.patches.map((patch) => ({
         path: patch.filePath,
         contents: patch.newContents,
       })),
@@ -174,28 +380,31 @@ export async function openPullRequestForRun(
   // The approval is bound to these exact bytes, on this exact commit. Approving
   // "three files" and approving *these* three files with *these* contents are
   // different consents.
-  const approval = buildPullRequestApproval({
-    id: decisionId,
-    runId: input.runId,
-    repoFullName: input.repoFullName,
-    branch: composition.branch,
-    baseBranch: base,
-    title: composition.title,
-    patches: materialized.patches,
-    commitSha: commit.commitSha,
-    buildSummary: evidence.build.summary,
-    buildOk: evidence.build.ok,
-    buildUnproven: !evidence.build.buildRan,
-    testSummary: evidence.tests.summary,
-    testsOk: evidence.tests.ok,
-    testsUnproven: evidence.tests.skipped,
-    recheckSummary: evidence.recheck.summary,
-  });
+  const approval = bindApprovalToOperation(
+    buildPullRequestApproval({
+      id: decisionId,
+      runId: input.runId,
+      repoFullName: input.repoFullName,
+      branch: plan.composition.branch,
+      baseBranch: plan.base,
+      title: plan.composition.title,
+      patches: plan.patches,
+      commitSha: commit.commitSha,
+      buildSummary: plan.evidence.build.summary,
+      buildOk: plan.evidence.build.ok,
+      buildUnproven: !plan.evidence.build.buildRan,
+      testSummary: plan.evidence.tests.summary,
+      testsOk: plan.evidence.tests.ok,
+      testsUnproven: plan.evidence.tests.skipped,
+      recheckSummary: plan.evidence.recheck.summary,
+    }),
+    pullRequestOperationForCommit(approvedOperations, commit.commitSha),
+  );
 
   const opened = await openVerifiedPullRequest(
     client,
     {
-      ...composeInput,
+      ...composeInputFor(input, plan.base, plan.patches, plan.evidence),
       repo: input.repoFullName,
       commit,
     },
@@ -233,7 +442,7 @@ export async function openPullRequestForRun(
  *    which is A6.4's hard stop.
  */
 export function pullRequestVerificationEvidence(
-  input: PipelineOpenPullRequestInput,
+  input: PullRequestPlanInput,
   base: string,
 ): { build: BuildResult; tests: TestRunResult; recheck: RecheckReport } {
   const verification = input.verification;

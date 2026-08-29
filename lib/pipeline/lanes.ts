@@ -193,7 +193,7 @@ export type VerifyPatches = (input: {
 /* GitHub (A1.4, A10.5)                                                       */
 /* -------------------------------------------------------------------------- */
 
-export type OpenPullRequest = (input: {
+export interface OpenPullRequestInput {
   runId: string;
   repoFullName: string;
   accessToken: string;
@@ -220,10 +220,36 @@ export type OpenPullRequest = (input: {
     testCommand?: string;
     testSummary?: string;
   };
-  /** A7.1: the human decision. Absent or unapproved means refuse. */
-  approval?: { requestId: string; approved: boolean };
+  /**
+   * A7.1: the human decision. Absent or unapproved means refuse, and so does an
+   * approval carrying no `operations` — the id names the card that was clicked
+   * and nothing about the repository, branch, title or bytes it authorised.
+   * `operations` is what `planPullRequest` produced before the card went up and
+   * what the conductor recorded against the answer.
+   */
+  approval?: {
+    requestId: string;
+    approved: boolean;
+    operations?: ApprovedWriteOperations;
+  };
   signal?: AbortSignal;
-}) => Promise<{ url: string; number: number; branch: string }>;
+}
+
+export type OpenPullRequest = (
+  input: OpenPullRequestInput,
+) => Promise<{ url: string; number: number; branch: string }>;
+
+/**
+ * Everything the write would do, worked out without doing any of it (A7.1).
+ *
+ * The conductor calls this *before* raising the approval card, so the card can
+ * name the branch, the base, the title and every file by its digest, and so the
+ * operations the human answered can be recorded alongside their decision. Every
+ * GitHub call it makes is a read.
+ */
+export type PlanPullRequest = (
+  input: Omit<OpenPullRequestInput, 'approval'>,
+) => Promise<PullRequestPlan>;
 
 /* -------------------------------------------------------------------------- */
 /* Bindings                                                                   */
@@ -249,7 +275,12 @@ import { enumerateInteractionPaths as enumeratePathsImpl } from '@/lib/paths';
 import { extractVisionCandidates as extractVisionCandidatesImpl } from '@/lib/vision';
 import { writePatches as writePatchesImpl } from '@/lib/fix';
 import { verifyPatches as verifyPatchesImpl } from '@/lib/verify';
-import { openPullRequestForRun as openPullRequestImpl } from '@/lib/github/open-pr';
+import {
+  openPullRequestForRun as openPullRequestImpl,
+  planPullRequestForRun as planPullRequestImpl,
+  type ApprovedWriteOperations,
+  type PullRequestPlan,
+} from '@/lib/github/open-pr';
 
 /**
  * Deterministic: axe-core and the tree, no sandbox and no model (A3.2).
@@ -312,4 +343,7 @@ export const enumerateInteractionPaths: (input: {
 
 export const writePatches: WritePatches = writePatchesImpl;
 export const verifyPatches: VerifyPatches = verifyPatchesImpl;
+export const planPullRequest: PlanPullRequest = planPullRequestImpl;
 export const openPullRequest: OpenPullRequest = openPullRequestImpl;
+
+export type { ApprovedWriteOperations, PullRequestPlan };
