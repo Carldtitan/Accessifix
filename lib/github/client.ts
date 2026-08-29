@@ -1,0 +1,553 @@
+/**
+ * GitHub, through the signed-in user's own OAuth token (A1.4).
+ *
+ * There is no bot account and no shared installation token. Every branch, every
+ * commit and every pull request AccessiFix creates is attributed to the person
+ * who asked for it, against a repository they already have write access to.
+ * That is not a convenience — it is the reason the agent cannot reach further
+ * than the human who invoked it, whatever it decides to do.
+ *
+ * Commits go through the Git Data API — blob, tree, commit, update-ref — rather
+ * than the contents endpoint, because a patch set is several files and a
+ * per-file commit would leave the branch in a half-fixed state if the process
+ * died between them. One commit, one ref update, or nothing.
+ */
+
+import { Octokit } from '@octokit/rest';
+
+/* -------------------------------------------------------------------------- */
+/* Types                                                                      */
+/* -------------------------------------------------------------------------- */
+
+export interface RepoRef {
+  readonly owner: string;
+  readonly repo: string;
+}
+
+export interface FileContents {
+  readonly path: string;
+  /** Decoded UTF-8 contents. */
+  readonly contents: string;
+  /** Blob SHA, needed by anything that wants to update the file in place. */
+  readonly sha: string;
+  readonly size: number;
+  /** The ref the file was read at, echoed back for the record. */
+  readonly ref: string | null;
+}
+
+export interface CommitFile {
+  /** Repository-relative path, forward slashes. */
+  readonly path: string;
+  /** Complete new contents. */
+  readonly contents: string;
+  /** File mode. Default `100644`; use `100755` for an executable. */
+  readonly mode?: '100644' | '100755';
+}
+
+export interface CommitResult {
+  readonly commitSha: string;
+  readonly treeSha: string;
+  readonly branch: string;
+  readonly parentSha: string;
+  readonly files: readonly string[];
+  readonly url: string;
+}
+
+export interface BranchResult {
+  readonly name: string;
+  readonly sha: string;
+  /** False when the branch already existed and was reused. */
+  readonly created: boolean;
+}
+
+export interface PullRequestResult {
+  readonly number: number;
+  readonly url: string;
+  readonly id: number;
+  readonly head: string;
+  readonly base: string;
+  readonly draft: boolean;
+}
+
+export interface OpenPullRequestInput {
+  readonly head: string;
+  readonly base: string;
+  readonly title: string;
+  readonly body: string;
+  readonly draft?: boolean;
+  /** Reviewers to request. Silently skipped if the API refuses them. */
+  readonly reviewers?: readonly string[];
+  readonly labels?: readonly string[];
+}
+
+export interface CommitFilesInput {
+  readonly branch: string;
+  readonly message: string;
+  readonly files: readonly CommitFile[];
+  /** Commit onto this SHA instead of the branch tip. */
+  readonly parentSha?: string;
+}
+
+/** Anything the GitHub API refused, with the status that says why. */
+export class GitHubError extends Error {
+  readonly status: number | undefined;
+  readonly operation: string;
+
+  constructor(operation: string, message: string, status?: number, cause?: unknown) {
+    super(`${operation}: ${message}`, cause === undefined ? undefined : { cause });
+    this.name = 'GitHubError';
+    this.status = status;
+    this.operation = operation;
+  }
+}
+
+function statusOf(error: unknown): number | undefined {
+  if (typeof error === 'object' && error !== null && 'status' in error) {
+    const status = (error as { status: unknown }).status;
+    if (typeof status === 'number') return status;
+  }
+  return undefined;
+}
+
+function messageOf(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
+}
+
+/* -------------------------------------------------------------------------- */
+/* Client                                                                     */
+/* -------------------------------------------------------------------------- */
+
+export interface GitHubClientOptions {
+  readonly userAgent?: string;
+  /** For GitHub Enterprise. Defaults to the public API. */
+  readonly baseUrl?: string;
+}
+
+/** `owner/repo` -> `{ owner, repo }`, rejecting anything that is not that. */
+export function parseRepoRef(fullName: string): RepoRef {
+  const parts = fullName.trim().replace(/^\/+|\/+$/g, '').split('/');
+  if (parts.length !== 2 || !parts[0] || !parts[1]) {
+    throw new GitHubError('parseRepoRef', `"${fullName}" is not an owner/repo pair.`);
+  }
+  return { owner: parts[0], repo: parts[1].replace(/\.git$/, '') };
+}
+
+/** Accepts either shape at the boundary, so callers can pass whichever they hold. */
+export type RepoLike = RepoRef | string;
+
+function asRepo(repo: RepoLike): RepoRef {
+  return typeof repo === 'string' ? parseRepoRef(repo) : repo;
+}
+
+export class GitHubClient {
+  private readonly octokit: Octokit;
+
+  constructor(token: string, options: GitHubClientOptions = {}) {
+    if (!token || token.trim().length === 0) {
+      throw new GitHubError(
+        'GitHubClient',
+        'No GitHub token. Pull requests are opened with the signed-in user’s own token (A1.4).',
+      );
+    }
+    this.octokit = new Octokit({
+      auth: token,
+      userAgent: options.userAgent ?? 'accessifix',
+      ...(options.baseUrl ? { baseUrl: options.baseUrl } : {}),
+    });
+  }
+
+  /** Escape hatch for endpoints this wrapper does not cover. */
+  get rest(): Octokit {
+    return this.octokit;
+  }
+
+  /** The login of the token's owner, for attribution in the run view. */
+  async getAuthenticatedLogin(): Promise<string> {
+    try {
+      const { data } = await this.octokit.rest.users.getAuthenticated();
+      return data.login;
+    } catch (error) {
+      throw new GitHubError(
+        'getAuthenticatedLogin',
+        messageOf(error),
+        statusOf(error),
+        error,
+      );
+    }
+  }
+
+  /**
+   * The repository's default branch. Every branch AccessiFix creates is cut
+   * from it and every pull request targets it, unless the caller says otherwise.
+   */
+  async getDefaultBranch(repo: RepoLike): Promise<string> {
+    const { owner, repo: name } = asRepo(repo);
+    try {
+      const { data } = await this.octokit.rest.repos.get({ owner, repo: name });
+      return data.default_branch;
+    } catch (error) {
+      throw new GitHubError(
+        'getDefaultBranch',
+        `${owner}/${name}: ${messageOf(error)}`,
+        statusOf(error),
+        error,
+      );
+    }
+  }
+
+  /**
+   * Read one file. Returns null when it does not exist at that ref, because
+   * "the finding points at a file that is not there" is an ordinary outcome
+   * the FIX pass has to handle, not an exception.
+   */
+  async getFileContents(
+    repo: RepoLike,
+    path: string,
+    ref?: string,
+  ): Promise<FileContents | null> {
+    const { owner, repo: name } = asRepo(repo);
+    try {
+      const { data } = await this.octokit.rest.repos.getContent({
+        owner,
+        repo: name,
+        path,
+        ...(ref ? { ref } : {}),
+      });
+
+      if (Array.isArray(data)) {
+        throw new GitHubError('getFileContents', `${path} is a directory, not a file.`);
+      }
+      if (data.type !== 'file' || typeof data.content !== 'string') {
+        throw new GitHubError('getFileContents', `${path} is a ${data.type}, not a file.`);
+      }
+
+      return {
+        path: data.path,
+        contents: Buffer.from(data.content, 'base64').toString('utf8'),
+        sha: data.sha,
+        size: data.size,
+        ref: ref ?? null,
+      };
+    } catch (error) {
+      if (error instanceof GitHubError) throw error;
+      if (statusOf(error) === 404) return null;
+      throw new GitHubError(
+        'getFileContents',
+        `${owner}/${name}:${path}: ${messageOf(error)}`,
+        statusOf(error),
+        error,
+      );
+    }
+  }
+
+  /** Read several files at once. Missing files come back as null entries. */
+  async getFiles(
+    repo: RepoLike,
+    paths: readonly string[],
+    ref?: string,
+  ): Promise<Map<string, FileContents | null>> {
+    const entries = await Promise.all(
+      paths.map(
+        async (path) => [path, await this.getFileContents(repo, path, ref)] as const,
+      ),
+    );
+    return new Map(entries);
+  }
+
+  /**
+   * Create a branch, or reuse it if it is already there.
+   *
+   * Reuse rather than failure is deliberate: a run that was interrupted after
+   * pushing but before opening the pull request has to be able to resume (A12).
+   */
+  async createBranch(
+    repo: RepoLike,
+    branch: string,
+    fromRef?: string,
+  ): Promise<BranchResult> {
+    const { owner, repo: name } = asRepo(repo);
+    const base = fromRef ?? (await this.getDefaultBranch(repo));
+
+    const existing = await this.getBranchSha(repo, branch);
+    if (existing) return { name: branch, sha: existing, created: false };
+
+    const baseSha = await this.resolveSha(repo, base);
+    try {
+      const { data } = await this.octokit.rest.git.createRef({
+        owner,
+        repo: name,
+        ref: `refs/heads/${branch}`,
+        sha: baseSha,
+      });
+      return { name: branch, sha: data.object.sha, created: true };
+    } catch (error) {
+      // Lost a race with another writer; the branch exists now either way.
+      if (statusOf(error) === 422) {
+        const sha = await this.getBranchSha(repo, branch);
+        if (sha) return { name: branch, sha, created: false };
+      }
+      throw new GitHubError(
+        'createBranch',
+        `${owner}/${name}@${branch}: ${messageOf(error)}`,
+        statusOf(error),
+        error,
+      );
+    }
+  }
+
+  /** The tip SHA of a branch, or null when the branch does not exist. */
+  async getBranchSha(repo: RepoLike, branch: string): Promise<string | null> {
+    const { owner, repo: name } = asRepo(repo);
+    try {
+      const { data } = await this.octokit.rest.git.getRef({
+        owner,
+        repo: name,
+        ref: `heads/${branch}`,
+      });
+      return data.object.sha;
+    } catch (error) {
+      if (statusOf(error) === 404) return null;
+      throw new GitHubError(
+        'getBranchSha',
+        `${owner}/${name}@${branch}: ${messageOf(error)}`,
+        statusOf(error),
+        error,
+      );
+    }
+  }
+
+  /**
+   * Commit a patch set to a branch as a single commit.
+   *
+   * Blobs, then a tree layered on the parent commit's tree, then a commit, then
+   * one ref update. Every file lands together or none of them do, so a branch
+   * never carries half a fix.
+   */
+  async commitFiles(repo: RepoLike, input: CommitFilesInput): Promise<CommitResult> {
+    const { owner, repo: name } = asRepo(repo);
+
+    if (input.files.length === 0) {
+      throw new GitHubError('commitFiles', 'Refusing to create an empty commit.');
+    }
+
+    try {
+      const parentSha = input.parentSha ?? (await this.requireBranchSha(repo, input.branch));
+      const { data: parent } = await this.octokit.rest.git.getCommit({
+        owner,
+        repo: name,
+        commit_sha: parentSha,
+      });
+
+      const blobs = await Promise.all(
+        input.files.map(async (file) => {
+          const { data } = await this.octokit.rest.git.createBlob({
+            owner,
+            repo: name,
+            content: Buffer.from(file.contents, 'utf8').toString('base64'),
+            encoding: 'base64',
+          });
+          return {
+            path: normalizePath(file.path),
+            mode: (file.mode ?? '100644') as '100644' | '100755',
+            type: 'blob' as const,
+            sha: data.sha,
+          };
+        }),
+      );
+
+      const { data: tree } = await this.octokit.rest.git.createTree({
+        owner,
+        repo: name,
+        base_tree: parent.tree.sha,
+        tree: blobs,
+      });
+
+      const { data: commit } = await this.octokit.rest.git.createCommit({
+        owner,
+        repo: name,
+        message: input.message,
+        tree: tree.sha,
+        parents: [parentSha],
+      });
+
+      await this.octokit.rest.git.updateRef({
+        owner,
+        repo: name,
+        ref: `heads/${input.branch}`,
+        sha: commit.sha,
+        force: false,
+      });
+
+      return {
+        commitSha: commit.sha,
+        treeSha: tree.sha,
+        branch: input.branch,
+        parentSha,
+        files: input.files.map((file) => normalizePath(file.path)),
+        url: commit.html_url,
+      };
+    } catch (error) {
+      if (error instanceof GitHubError) throw error;
+      throw new GitHubError(
+        'commitFiles',
+        `${owner}/${name}@${input.branch}: ${messageOf(error)}`,
+        statusOf(error),
+        error,
+      );
+    }
+  }
+
+  /**
+   * Open the pull request.
+   *
+   * The last irreversible step in the run, and the one A7.1 pauses before.
+   * Nothing in this class enforces that pause — `lib/fix/gate.ts` does, and
+   * `openVerifiedPullRequest` in `./pr.ts` is the only call site that should
+   * reach this method.
+   */
+  async openPullRequest(
+    repo: RepoLike,
+    input: OpenPullRequestInput,
+  ): Promise<PullRequestResult> {
+    const { owner, repo: name } = asRepo(repo);
+    try {
+      const { data } = await this.octokit.rest.pulls.create({
+        owner,
+        repo: name,
+        title: input.title,
+        body: input.body,
+        head: input.head,
+        base: input.base,
+        draft: input.draft ?? false,
+        maintainer_can_modify: true,
+      });
+
+      // Labels and reviewers are courtesies. A repository that refuses them
+      // (no permission, unknown login, protected label set) must not turn an
+      // opened pull request into a failed run.
+      if (input.labels && input.labels.length > 0) {
+        await this.octokit.rest.issues
+          .addLabels({ owner, repo: name, issue_number: data.number, labels: [...input.labels] })
+          .catch(() => undefined);
+      }
+      if (input.reviewers && input.reviewers.length > 0) {
+        await this.octokit.rest.pulls
+          .requestReviewers({
+            owner,
+            repo: name,
+            pull_number: data.number,
+            reviewers: [...input.reviewers],
+          })
+          .catch(() => undefined);
+      }
+
+      return {
+        number: data.number,
+        url: data.html_url,
+        id: data.id,
+        head: data.head.ref,
+        base: data.base.ref,
+        draft: Boolean(data.draft),
+      };
+    } catch (error) {
+      throw new GitHubError(
+        'openPullRequest',
+        `${owner}/${name} ${input.head} -> ${input.base}: ${messageOf(error)}`,
+        statusOf(error),
+        error,
+      );
+    }
+  }
+
+  private async requireBranchSha(repo: RepoLike, branch: string): Promise<string> {
+    const sha = await this.getBranchSha(repo, branch);
+    if (!sha) {
+      throw new GitHubError('commitFiles', `Branch "${branch}" does not exist.`, 404);
+    }
+    return sha;
+  }
+
+  /** Resolve a branch, tag or SHA to a commit SHA. */
+  private async resolveSha(repo: RepoLike, ref: string): Promise<string> {
+    const branchSha = await this.getBranchSha(repo, ref);
+    if (branchSha) return branchSha;
+
+    const { owner, repo: name } = asRepo(repo);
+    try {
+      const { data } = await this.octokit.rest.repos.getCommit({
+        owner,
+        repo: name,
+        ref,
+      });
+      return data.sha;
+    } catch (error) {
+      throw new GitHubError(
+        'resolveSha',
+        `${owner}/${name}@${ref}: ${messageOf(error)}`,
+        statusOf(error),
+        error,
+      );
+    }
+  }
+}
+
+function normalizePath(path: string): string {
+  return path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '');
+}
+
+/* -------------------------------------------------------------------------- */
+/* Function forms                                                             */
+/* -------------------------------------------------------------------------- */
+
+/** Build a client from the signed-in user's token (`session.accessToken`). */
+export function createGitHubClient(
+  token: string,
+  options: GitHubClientOptions = {},
+): GitHubClient {
+  return new GitHubClient(token, options);
+}
+
+/** Accept a client or a bare token wherever one is needed. */
+export type GitHubAuth = GitHubClient | string;
+
+function resolve(auth: GitHubAuth): GitHubClient {
+  return typeof auth === 'string' ? new GitHubClient(auth) : auth;
+}
+
+export function getDefaultBranch(auth: GitHubAuth, repo: RepoLike): Promise<string> {
+  return resolve(auth).getDefaultBranch(repo);
+}
+
+export function getFileContents(
+  auth: GitHubAuth,
+  repo: RepoLike,
+  path: string,
+  ref?: string,
+): Promise<FileContents | null> {
+  return resolve(auth).getFileContents(repo, path, ref);
+}
+
+export function createBranch(
+  auth: GitHubAuth,
+  repo: RepoLike,
+  branch: string,
+  fromRef?: string,
+): Promise<BranchResult> {
+  return resolve(auth).createBranch(repo, branch, fromRef);
+}
+
+export function commitFiles(
+  auth: GitHubAuth,
+  repo: RepoLike,
+  input: CommitFilesInput,
+): Promise<CommitResult> {
+  return resolve(auth).commitFiles(repo, input);
+}
+
+export function openPullRequest(
+  auth: GitHubAuth,
+  repo: RepoLike,
+  input: OpenPullRequestInput,
+): Promise<PullRequestResult> {
+  return resolve(auth).openPullRequest(repo, input);
+}
