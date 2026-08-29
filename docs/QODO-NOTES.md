@@ -72,3 +72,17 @@ pushes are rejected for everyone including the repository owner.
   - `pagesAudited` no longer derives from findings, which erased every page that passed cleanly — precisely the wrong pages to lose.
   - Password fields resolve to an accepted *set* — `new-password`, `current-password`, or both when ambiguous — so a correctly marked signup field is no longer failed for using the right token.
 - **We dismissed:** One partial. Qodo grouped `type="password"` with email/tel/url as "assumes user data". We kept password decidable from its type: no form legitimately collects a third party's password, so scope is not genuinely in doubt. What *was* wrong is which of the two tokens it assumed, fixed separately. We also kept the fixed-viewport (`width=1024`) branch failing 1.4.10 — a viewport pinned above 320px means the content is never laid out at 320 CSS px, a direct mechanistic failure, unlike the zoom lock which W3C says can coexist with a passing 1.4.10.
+
+---
+
+## PR #7 (follow-up review) and PR #6 (follow-up review)
+
+- **Links:** https://github.com/Carldtitan/Accessifix/pull/7 · https://github.com/Carldtitan/Accessifix/pull/6
+- **Qodo found on re-review:** #7 — clean axe runs appear disabled; explicit recipient scope ignored; punctuated generic links pass. #6 — existing branch ignores base; Cypress tests treated as unit.
+- **We changed:**
+  - **Closed the axe-ran gap end to end.** `runAxe` returns `{violations, ran}` rather than a bare array, and the flag is forwarded through `browserResultSchema`, `PageCapture` and `capturePage`. `TreeLaneInput.axeRan` is **required**, not optional — optional would reproduce the silent `false` the finding is about, whereas required is a compile error until the dispatcher answers. Before this, an empty violations array from a page where axe never executed looked exactly like a clean page, and TREE reported contrast, page title and labels as *passing, untested*.
+  - A form field captured as `aboutUser: false` now drops out of 1.3.5 entirely rather than being failed for having a purpose word in its label. All three states — `true`, `undefined`, `false` — now mean different things.
+  - Generic-link detection decides membership through `normaliseText`, so "Read more!", "Details?" and "Click here:" are caught, and a name normalising to empty counts as generic — which is what makes `>>` and `...` work and generalises to their unlisted cousins.
+  - `createBranch` compares `base...tip` on the reuse path and refuses unless identical or ahead. **Ahead alone is not sufficient**: a colliding branch cut from current main with another author's commits also reads ahead, and those commits would ride into the PR under our approved patch — so every commit above the base must also be the signed-in user's.
+  - Cypress, TestCafe, Nightwatch and WebdriverIO now classify as e2e. Previously only Playwright was excluded, so `test: "cypress run"` was executed without a served app and the environment failure blocked the PR.
+- **We dismissed:** Nothing. One deliberate behaviour change recorded: if a resumed run omits `fromRef` and the default branch has moved, the base comparison reads `diverged` and branch reuse is refused **loudly**, rather than silently building on an unapproved parent. `BranchResult.baseSha` is exposed so a resuming caller can pin it.
