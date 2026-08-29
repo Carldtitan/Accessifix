@@ -3,7 +3,28 @@ import { StatusLabel, type StatusValue } from "./StatusLabel";
 
 export type EnvironmentState = "live" | "done" | "queued" | "failed";
 
-export type PathTemplate = "Toggle" | "Dialog" | "Form" | "Crawl" | "Vision" | "Media";
+/**
+ * The badge on an environment card. The first six are interaction-path
+ * templates; the rest are pipeline phases, so a real `pipeline_jobs` row can
+ * label itself without inventing a template it never used.
+ */
+export type PathTemplate =
+  | "Toggle"
+  | "Dialog"
+  | "Form"
+  | "Crawl"
+  | "Vision"
+  | "Media"
+  | "Tree"
+  | "Paths"
+  | "Actions"
+  | "Pages"
+  | "Code"
+  | "Score"
+  | "Fix"
+  | "Verify"
+  | "Pull request"
+  | "Final audit";
 
 export type BrowserEnvironment = {
   id: string;

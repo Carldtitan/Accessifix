@@ -1,44 +1,51 @@
 import Link from "next/link";
-import { AgentTimeline } from "@/components/AgentTimeline";
-import { ApprovalCard } from "@/components/ApprovalCard";
-import { CriterionMatrix } from "@/components/CriterionMatrix";
-import { DiffStack } from "@/components/DiffCard";
-import { EnvironmentGrid } from "@/components/EnvironmentGrid";
-import { FindingCard } from "@/components/FindingCard";
+import { notFound } from "next/navigation";
+
 import { Icon } from "@/components/Icon";
-import { RunSummaryBar } from "@/components/RunSummaryBar";
-import {
-  sampleApproval,
-  sampleCriterionRows,
-  sampleEnvironments,
-  sampleFindings,
-  samplePatches,
-  sampleRun,
-  sampleTimeline,
-} from "@/components/sample-data";
+import { RunLiveView } from "@/components/RunLiveView";
+import { formatUtcDate } from "@/components/run-data";
+
+import { requireSessionUser, runDetail } from "../../../_data";
 
 export const metadata = { title: "Run detail" };
+export const dynamic = "force-dynamic";
 
 /**
- * The run view. Requirement A11 lives here:
- * live parallel environments, a summary bar, proposed patches as diffs,
- * an attributed agent timeline, and the approval gate.
+ * The run view. Requirement A11 lives here.
  *
- * PLACEHOLDER: the content on this page comes from components/sample-data.ts.
- * The approval gate is the exception: it answers the run's handoff through
- * POST /api/runs/{runId}/approve, so a click reaches the harness rather than
- * only changing what this page says.
+ * The server does the first paint from the ledger so the page is complete
+ * before any JavaScript runs; `RunLiveView` then subscribes to
+ * `/api/runs/{id}/events` and keeps it current without a refresh.
+ *
+ * Ownership: `runDetail` joins through `targets.user_id`, and a run that is not
+ * the signed-in user's is a 404 — never a 403, which would confirm it exists.
+ *
+ * Next 16: `params` is a Promise.
  */
-export default async function RunDetailPage({ params }: { params: Promise<{ runId: string }> }) {
+export default async function RunDetailPage({
+  params,
+}: {
+  params: Promise<{ runId: string }>;
+}) {
   const { runId } = await params;
-  const stateFindings = sampleFindings.filter((finding) => finding.tree);
+  const user = await requireSessionUser(`/app/runs/${runId}`);
+  const detail = await runDetail(runId, user.id);
+
+  if (!detail) notFound();
 
   return (
     <main id="main-content" className="dashboard-page">
       <div className="page-header">
         <div>
-          <span className="eyebrow">Investigation</span>
-          <h1>{runId}</h1>
+          <span className="eyebrow">Investigation · {detail.target.repoFullName}</span>
+          <h1>{detail.target.deployedUrl}</h1>
+          <p>
+            Started {formatUtcDate(detail.run.startedAt ?? detail.run.createdAt)}
+            {detail.run.completedAt
+              ? `, finished ${formatUtcDate(detail.run.completedAt)}`
+              : ""}
+            . Run <code>{detail.run.id}</code>.
+          </p>
         </div>
         <div className="page-action-row">
           <Link className="button secondary" href="/app/runs">
@@ -48,89 +55,19 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         </div>
       </div>
 
-      <h2 className="sr-only">Run summary</h2>
-      <RunSummaryBar run={sampleRun} />
-
-      <section className="section" aria-labelledby="handoff">
-        <div className="section-heading">
-          <div>
-            <span className="eyebrow">Handoff</span>
-            <h2 id="handoff">The agent is waiting for you</h2>
-            <p>
-              The run pauses before pushing a branch, before opening a pull request, and before any
-              write-class tool call.
-            </p>
-          </div>
-        </div>
-        <ApprovalCard approval={sampleApproval} runId={runId} />
-      </section>
-
-      <section className="section" aria-labelledby="environments">
-        <div className="section-heading">
-          <div>
-            <span className="eyebrow">Live</span>
-            <h2 id="environments">Browser environments</h2>
-            <p>Interaction depth is one. Excess paths queue against the sandbox cap.</p>
-          </div>
-          <span className="section-count">{sampleEnvironments.length}</span>
-        </div>
-        <EnvironmentGrid environments={sampleEnvironments} />
-      </section>
-
-      <section className="section" aria-labelledby="patches">
-        <div className="section-heading">
-          <div>
-            <span className="eyebrow">Proposed</span>
-            <h2 id="patches">Code changes</h2>
-            <p>Patches are batched per source file and record the findings they address.</p>
-          </div>
-          <span className="section-count">{samplePatches.length}</span>
-        </div>
-        <DiffStack patches={samplePatches} />
-      </section>
-
-      <section className="section" aria-labelledby="state-findings">
-        <div className="section-heading">
-          <div>
-            <span className="eyebrow">Evidence</span>
-            <h2 id="state-findings">State findings</h2>
-            <p>
-              Findings only observable across a state transition, each with the accessibility tree
-              before and after the interaction.
-            </p>
-          </div>
-          <span className="section-count">{stateFindings.length}</span>
-        </div>
-        <div style={{ display: "grid", gap: 12 }}>
-          {stateFindings.map((finding) => (
-            <FindingCard key={finding.id} finding={finding} />
-          ))}
-        </div>
-      </section>
-
-      <section className="section" aria-labelledby="matrix">
-        <div className="section-heading">
-          <div>
-            <span className="eyebrow">Score</span>
-            <h2 id="matrix">Criterion matrix</h2>
-            <p>Baseline against final, one row per criterion. Scope is never reduced to a subset.</p>
-          </div>
-          <span className="section-count">{sampleCriterionRows.length}</span>
-        </div>
-        <CriterionMatrix rows={sampleCriterionRows} id="run-criterion-matrix" />
-      </section>
-
-      <section className="section" aria-labelledby="timeline">
-        <div className="section-heading">
-          <div>
-            <span className="eyebrow">Chronology</span>
-            <h2 id="timeline">Agent timeline</h2>
-            <p>Every event names the agent that produced it and the harness capability behind it.</p>
-          </div>
-          <span className="section-count">{sampleTimeline.length}</span>
-        </div>
-        <AgentTimeline events={sampleTimeline} />
-      </section>
+      <RunLiveView
+        run={detail.run}
+        target={detail.target}
+        score={detail.score}
+        finalScore={detail.finalScore}
+        findings={detail.findings}
+        events={detail.events}
+        jobs={detail.jobs}
+        patches={detail.patches}
+        pendingHandoffs={detail.pendingHandoffs}
+        pageCount={detail.pages.length}
+        {...(detail.activeModel ? { activeModel: detail.activeModel } : {})}
+      />
     </main>
   );
 }

@@ -1,12 +1,16 @@
-import type { AuditAgent } from "./FindingCard";
-
 /** Which harness capability produced the event (A13.9). */
 export type HarnessCapability = "sandbox" | "subagent" | "approval" | "skill" | "model" | "ledger";
 
 export type TimelineEvent = {
   id: string;
-  /** The agent that produced the event. "APP" is the dispatcher itself. */
-  agent: AuditAgent | "APP";
+  /**
+   * The agent that produced the event. "APP" is the dispatcher itself.
+   *
+   * A free string rather than the lane union: `run_events.agent` is a text
+   * column the pipeline writes, and the timeline renders it verbatim. A label
+   * this view has not heard of must still appear, not crash the page.
+   */
+  agent: string;
   summary: string;
   /** ISO 8601 timestamp. */
   timestamp: string;

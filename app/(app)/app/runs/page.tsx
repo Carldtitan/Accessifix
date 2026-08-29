@@ -1,28 +1,30 @@
 import Link from "next/link";
+
 import { Icon } from "@/components/Icon";
 import { StatusLabel } from "@/components/StatusLabel";
-import { sampleRuns } from "@/components/sample-data";
+import { formatUtcDate, runStatusLabel } from "@/components/run-data";
+
+import { listRuns, requireSessionUser } from "../../_data";
 
 export const metadata = { title: "Runs" };
+export const dynamic = "force-dynamic";
 
-const phaseLabels = {
+const phaseLabels: Record<"baseline" | "final", string> = {
   baseline: "Baseline audit",
-  fix: "Writing fixes",
-  verify: "Verification",
   final: "Final audit",
-} as const;
+};
 
-function formatDate(iso: string): string {
-  return new Intl.DateTimeFormat("en-GB", {
-    day: "numeric",
-    month: "short",
-    hour: "2-digit",
-    minute: "2-digit",
-    timeZone: "UTC",
-  }).format(new Date(iso));
-}
+/**
+ * Every run the signed-in user owns, newest first, read from the ledger.
+ *
+ * A failed run states its reason on the row rather than hiding it behind the
+ * detail page: "failed" without a reason is the thing this product exists to
+ * stop other tools doing.
+ */
+export default async function RunsPage() {
+  const user = await requireSessionUser("/app/runs");
+  const runs = await listRuns(user.id);
 
-export default function RunsPage() {
   return (
     <main id="main-content" className="dashboard-page">
       <div className="page-header">
@@ -43,25 +45,34 @@ export default function RunsPage() {
       </div>
 
       <h2 className="sr-only">All runs</h2>
-      <div className="record-list">
-        {sampleRuns.map((run) => (
-          <Link className="record-row" key={run.id} href={`/app/runs/${run.id}`}>
-            <span className="record-main">
-              <strong>{run.id}</strong>
-              <small>
-                {run.target} · {phaseLabels[run.phase]} · started {formatDate(run.startedAt)} UTC ·{" "}
-                {run.findings} findings
-              </small>
-            </span>
-            <StatusLabel value={run.status} />
-            <Icon name="chevron-right" className="record-arrow" />
-          </Link>
-        ))}
-      </div>
 
-      <p className="muted" style={{ marginTop: 18, fontSize: 13 }}>
-        Placeholder data. Runs will be read from the findings ledger.
-      </p>
+      {runs.length === 0 ? (
+        <div className="quiet-panel">
+          <Icon name="activity" size={22} />
+          <strong>No runs yet</strong>
+          <span>
+            Nothing has been audited on this account. Connect a target and start a run; this list
+            fills in from the ledger.
+          </span>
+        </div>
+      ) : (
+        <div className="record-list">
+          {runs.map((run) => (
+            <Link className="record-row" key={run.id} href={`/app/runs/${run.id}`}>
+              <span className="record-main">
+                <strong>{run.repoFullName}</strong>
+                <small>
+                  {phaseLabels[run.phase]} · started {formatUtcDate(run.startedAt ?? run.createdAt)}{" "}
+                  · {run.findingCount} finding{run.findingCount === 1 ? "" : "s"}
+                  {run.failureReason ? ` · stopped: ${run.failureReason}` : ""}
+                </small>
+              </span>
+              <StatusLabel value={runStatusLabel(run.status)} />
+              <Icon name="chevron-right" className="record-arrow" />
+            </Link>
+          ))}
+        </div>
+      )}
     </main>
   );
 }
