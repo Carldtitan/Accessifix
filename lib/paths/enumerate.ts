@@ -265,6 +265,28 @@ function exposedStateProps(node: AxNodeSnapshot): EnumerableStateProp[] {
   return ENUMERABLE_STATE_PROPS.filter((prop) => node.props[prop] !== null);
 }
 
+/**
+ * Read `aria-haspopup` off a node, whichever shape the capture layer used.
+ *
+ * CDP reports it as an AX property named `haspopup`, and a normaliser can
+ * plausibly lift it to the top level or leave it in the property bag alongside
+ * the six state properties. Reading both is the difference between the popup
+ * branches below being live and being dead code: they key on this one field,
+ * and a normaliser that drops it silently removes every link that declared a
+ * menu from the enumeration, with nothing in the output to say so.
+ *
+ * `null` means the property is absent - which is *not* the same as the string
+ * `'false'`, and `POPUP_HASPOPUP_VALUES` treats neither as a popup.
+ */
+export function readHaspopup(node: AxNodeSnapshot): string | null {
+  const direct = node.haspopup ?? null;
+  if (direct !== null) return String(direct);
+
+  const bag = node.props as Readonly<Record<string, string | null>> | undefined;
+  const fromProps = bag?.['haspopup'] ?? null;
+  return fromProps === null ? null : String(fromProps);
+}
+
 /* ========================================================================== */
 /* Source 1: the accessibility tree                                           */
 /* ========================================================================== */
@@ -357,7 +379,7 @@ export function enumerateFromTree(
     roleCounters.set(role, positional + 1);
 
     const stateProps = exposedStateProps(node);
-    const haspopup = (node.haspopup ?? null) === null ? null : String(node.haspopup);
+    const haspopup = readHaspopup(node);
     const popupish = haspopup !== null && POPUP_HASPOPUP_VALUES.has(haspopup.toLowerCase());
 
     let reason: string;
@@ -482,10 +504,71 @@ function roleFromLooksLike(looksLike: string): string | null {
 /* The diff - the highest-value output in this file (A4.2)                    */
 /* ========================================================================== */
 
+/**
+ * Which tree roles a vision-inferred role may be matched against.
+ *
+ * Matching on the label alone pairs "Remember me" the checkbox with "Remember
+ * me" the link in the footer, and then the checkbox - the one control that
+ * actually owes a state - disappears from the vision-only list, its finding
+ * suppressed and an unrelated node recorded as its counterpart. The VIS agent
+ * named a role; that is evidence, and this is where it is used.
+ *
+ * Generous in one direction on purpose: a link styled as a button and a button
+ * implemented as an anchor are both far too common to call a mismatch, and
+ * "toggle" in a model's vocabulary covers a switch and a toggle button alike.
+ * Strict where it earns something - nothing pairs a checkbox with a link.
+ *
+ * A role with no entry here constrains nothing. Silence is not a mismatch.
+ */
+export const VISION_ROLE_COMPATIBILITY: Readonly<Record<string, ReadonlySet<string>>> = {
+  button: new Set([
+    'button',
+    'togglebutton',
+    'popupbutton',
+    'menubutton',
+    'link',
+    'menuitem',
+    'tab',
+    'summary',
+    'disclosuretriangle',
+  ]),
+  link: new Set(['link', 'button', 'menuitem']),
+  checkbox: new Set(['checkbox', 'switch', 'menuitemcheckbox']),
+  switch: new Set(['switch', 'checkbox', 'menuitemcheckbox', 'togglebutton', 'button']),
+  radio: new Set(['radio', 'menuitemradio', 'option']),
+  tab: new Set(['tab', 'button', 'link']),
+  menuitem: new Set(['menuitem', 'menuitemcheckbox', 'menuitemradio', 'button', 'link']),
+  combobox: new Set(['combobox', 'listbox', 'popupbutton', 'menubutton', 'button']),
+  textbox: new Set(['textbox', 'searchbox', 'combobox']),
+};
+
+/**
+ * May a vision candidate of this role be the tree control of that one?
+ *
+ * The cautious fallback is `true`: when vision supplied no role we have learned
+ * nothing, and inventing a mismatch out of an absent signal would manufacture
+ * vision-only findings rather than prevent them.
+ */
+export function rolesCompatible(visionRole: string | null, treeRole: string): boolean {
+  if (visionRole === null) return true;
+  const allowed = VISION_ROLE_COMPATIBILITY[visionRole];
+  if (allowed === undefined) return true;
+  return allowed.has(treeRole);
+}
+
 interface NearestMatch {
   readonly control: TreeControl | null;
   readonly similarity: number;
   readonly how: SourceMatch['how'];
+  /**
+   * The best label match that was rejected because its role could not be the
+   * one vision described.
+   *
+   * Kept for the evidence trail rather than discarded: "there is a control
+   * called this, but it is a link and vision said checkbox" is exactly what a
+   * reviewer needs in front of them, and it docks the finding's confidence.
+   */
+  readonly roleRejected: { readonly control: TreeControl; readonly similarity: number } | null;
 }
 
 function nearestTreeControl(
@@ -493,41 +576,70 @@ function nearestTreeControl(
   controls: readonly TreeControl[],
 ): NearestMatch {
   const label = normaliseLabel(candidate.label);
+  const visionRole = roleFromLooksLike(candidate.looksLike);
+
   let best: TreeControl | null = null;
   let bestScore = 0;
   let bestHow: SourceMatch['how'] = 'fuzzy';
+  let rejectedControl: TreeControl | null = null;
+  let rejectedScore = 0;
 
   for (const control of controls) {
     if (candidate.approxSelector.length > 0 && candidate.approxSelector === control.selector) {
-      return { control, similarity: 1, how: 'selector' };
+      /*
+       * The VIS agent produced this exact Playwright selector, role and all.
+       * That is identity, not resemblance, and it outranks every heuristic
+       * below - including the role policy, whose input is a guess.
+       */
+      return { control, similarity: 1, how: 'selector', roleRejected: null };
     }
 
     const name = normaliseLabel(control.name);
     if (name.length === 0) continue;
 
-    if (name === label) return { control, similarity: 1, how: 'exact-label' };
+    let score: number;
+    let how: SourceMatch['how'];
 
     const longEnough =
       label.length >= MIN_LABEL_CHARS_FOR_CONTAINS && name.length >= MIN_LABEL_CHARS_FOR_CONTAINS;
-    if (longEnough && (name.includes(label) || label.includes(name))) {
-      const score = Math.max(LABEL_MATCH_THRESHOLD, labelSimilarity(label, name));
-      if (score > bestScore) {
-        best = control;
-        bestScore = score;
-        bestHow = 'contains';
+
+    if (name === label) {
+      score = 1;
+      how = 'exact-label';
+    } else if (longEnough && (name.includes(label) || label.includes(name))) {
+      score = Math.max(LABEL_MATCH_THRESHOLD, labelSimilarity(label, name));
+      how = 'contains';
+    } else {
+      score = labelSimilarity(label, name);
+      how = 'fuzzy';
+    }
+
+    /*
+     * An exact label no longer short-circuits the scan. It used to, which meant
+     * the first same-named control won whatever its role was - so a same-named
+     * link three sections up beat the checkbox standing right there.
+     */
+    if (!rolesCompatible(visionRole, control.role)) {
+      if (score > rejectedScore) {
+        rejectedControl = control;
+        rejectedScore = score;
       }
       continue;
     }
 
-    const score = labelSimilarity(label, name);
     if (score > bestScore) {
       best = control;
       bestScore = score;
-      bestHow = 'fuzzy';
+      bestHow = how;
     }
   }
 
-  return { control: best, similarity: bestScore, how: bestHow };
+  return {
+    control: best,
+    similarity: bestScore,
+    how: bestHow,
+    roleRejected: rejectedControl === null ? null : { control: rejectedControl, similarity: rejectedScore },
+  };
 }
 
 /**
@@ -537,14 +649,18 @@ function nearestTreeControl(
  * in the tree, with no role on it" - which is a far stronger claim, and the
  * difference between DECIDE and FLAG.
  */
-function findOrphanTextNode(
-  tree: AxTreeSnapshot,
-  label: string,
-): AxNodeSnapshot | null {
+interface OrphanMatch {
+  readonly node: AxNodeSnapshot;
+  readonly similarity: number;
+  /** `exact` carries the full orphan-text base; `contains` is docked for it. */
+  readonly how: 'exact' | 'contains';
+}
+
+function findOrphanTextNode(tree: AxTreeSnapshot, label: string): OrphanMatch | null {
   const target = normaliseLabel(label);
   if (target.length === 0) return null;
 
-  let fallback: AxNodeSnapshot | null = null;
+  let fallback: OrphanMatch | null = null;
 
   for (const node of Object.values(tree)) {
     const role = normaliseRole(node.role);
@@ -553,14 +669,30 @@ function findOrphanTextNode(
     const name = normaliseLabel(collapse(node.name ?? ''));
     if (name.length === 0) continue;
 
-    if (name === target) return node;
-    if (
-      fallback === null &&
-      target.length >= MIN_LABEL_CHARS_FOR_CONTAINS &&
-      name.length >= MIN_LABEL_CHARS_FOR_CONTAINS &&
-      (name.includes(target) || target.includes(name))
-    ) {
-      fallback = node;
+    if (name === target) return { node, similarity: 1, how: 'exact' };
+
+    const longEnough =
+      target.length >= MIN_LABEL_CHARS_FOR_CONTAINS && name.length >= MIN_LABEL_CHARS_FOR_CONTAINS;
+    if (!longEnough || !(name.includes(target) || target.includes(name))) continue;
+
+    /*
+     * Containment is not enough on its own.
+     *
+     * "Save" is contained by "Save as draft", "Next" by "Next of kin", "Apply"
+     * by "Apply for a Blue Badge" - and the first such paragraph on the page
+     * used to be accepted as the orphan, unranked and unscored. That association
+     * then collected the 0.86 orphan-text base, cleared the 0.75 DECIDE
+     * threshold on its own, and filed a div-button finding against static prose.
+     *
+     * A tree control has to clear `LABEL_MATCH_THRESHOLD` to be called the same
+     * control; a paragraph does not get an easier test than a button. The best
+     * survivor wins rather than the first, and it is still docked in
+     * `diffSources` for having matched by containment at all.
+     */
+    const similarity = labelSimilarity(target, name);
+    if (similarity < LABEL_MATCH_THRESHOLD) continue;
+    if (fallback === null || similarity > fallback.similarity) {
+      fallback = { node, similarity, how: 'contains' };
     }
   }
 
@@ -589,9 +721,19 @@ export interface DiffSourcesOptions {
  *   near miss         -0.15 when the closest tree control scored within 0.12
  *                     of the match threshold - probably the same control under
  *                     a different accessible name
+ *   orphan by contains -0.12 when the label matched the tree text by
+ *                     containment rather than exactly. This is what keeps a
+ *                     substring association below DECIDE: 0.86 - 0.12 = 0.74,
+ *                     under the 0.75 threshold, so it goes to a human.
+ *   role rejected     -0.10 when a control of that name exists but its role
+ *                     cannot be the one vision described
  *   short label       -0.20 below three characters
  *   inferred label    -0.12 when `looksLike` says icon or image
  *   leaf text node    +0.04 when the orphan node is a bare StaticText
+ *
+ * `absent` cannot reach DECIDE on this evidence by construction: 0.50 plus the
+ * largest possible certainty term (+0.16) is 0.66, below the 0.75 threshold.
+ * A control vision alone believes in is always a human's call.
  */
 export function diffSources(
   treeControls: readonly TreeControl[],
@@ -620,7 +762,8 @@ export function diffSources(
       continue;
     }
 
-    const orphan = options.tree ? findOrphanTextNode(options.tree, candidate.label) : null;
+    const orphanMatch = options.tree ? findOrphanTextNode(options.tree, candidate.label) : null;
+    const orphan = orphanMatch?.node ?? null;
     const kind: VisionOnlyControl['kind'] = orphan ? 'orphan-text' : 'absent';
 
     const terms: { delta: number; because: string }[] = [];
@@ -641,6 +784,24 @@ export function diffSources(
       terms.push({
         delta: -0.15,
         because: `the tree control "${nearest.control.name}" scored ${nearest.similarity.toFixed(2)}, just under the ${LABEL_MATCH_THRESHOLD} match threshold - this may be the same control under a different accessible name`,
+      });
+    }
+
+    if (orphanMatch !== null && orphanMatch.how === 'contains') {
+      terms.push({
+        delta: -0.12,
+        because: `the tree text "${collapse(orphanMatch.node.name ?? '')}" matched this label by containment at ${orphanMatch.similarity.toFixed(2)} rather than exactly, so the two may be different pieces of text`,
+      });
+    }
+
+    if (
+      nearest.control === null &&
+      nearest.roleRejected !== null &&
+      nearest.roleRejected.similarity >= LABEL_MATCH_THRESHOLD
+    ) {
+      terms.push({
+        delta: -0.1,
+        because: `the tree does carry a control named "${nearest.roleRejected.control.name}", but with role "${nearest.roleRejected.control.role}", which cannot be the "${candidate.looksLike}" vision described - if they are in fact the same control, the fault is a wrong role rather than a missing one`,
       });
     }
 
@@ -705,6 +866,11 @@ export function diffSources(
           classification: kind,
           orphanNodeRole: orphan?.role ?? null,
           orphanNodeId: orphan?.nodeId ?? null,
+          orphanMatchedBy: orphanMatch?.how ?? null,
+          orphanSimilarity: orphanMatch === null ? null : Number(orphanMatch.similarity.toFixed(3)),
+          visionInferredRole: roleFromLooksLike(candidate.looksLike),
+          roleRejectedControl: nearest.roleRejected?.control.name ?? null,
+          roleRejectedRole: nearest.roleRejected?.control.role ?? null,
           nearestTreeControl: nearest.control?.name ?? null,
           nearestSimilarity: Number(nearest.similarity.toFixed(3)),
           matchThreshold: LABEL_MATCH_THRESHOLD,

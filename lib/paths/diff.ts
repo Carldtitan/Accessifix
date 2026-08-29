@@ -27,6 +27,18 @@
  *     or two nodes; a menu moves ninety-eight.
  *   - Navigation suppresses the toggle rules entirely. A link that navigates
  *     replaces the whole tree, which looks exactly like the 4.1.2 signature.
+ *     Detected four ways, so that suppression never depends on any one of them
+ *     arriving: the caller, the executor, the URL, and a document title change
+ *     alongside a rebuilt tree - the last two being what catch button-driven
+ *     routing, which no `<a href>` heuristic can see.
+ *   - A control only answers for what *it* changed. Every reading taken after
+ *     the action has a baseline taken before it, and a dialog that was already
+ *     on the page, or a live region that always said "Welcome back", belongs to
+ *     nobody's interaction.
+ *   - The toggle rules run only for the templates that declared them. A form
+ *     submit has no state to report, so 4.1.2 is not a statement about it, and
+ *     neither is it a statement about a conforming dialog trigger - the dialog
+ *     pattern's contract lives on the dialog.
  *   - When the control vanished after the action, no state comparison is
  *     possible, so none is reported.
  *   - When the tree reports the state change on some other node with the same
@@ -40,7 +52,7 @@
 
 import { requireCriterion } from '@/lib/db/criteria';
 
-import { OBSERVATION_KEYS } from './templates';
+import { ASSERTIONS_BY_TEMPLATE, OBSERVATION_KEYS } from './templates';
 import {
   AX_STATE_PROPS,
   type AssertionId,
@@ -188,6 +200,15 @@ export const POPUP_ROLES: ReadonlySet<string> = new Set([
 
 /** Roles that announce without stealing focus. Their presence satisfies 4.1.3. */
 export const LIVE_ROLES: ReadonlySet<string> = new Set(['alert', 'status', 'log']);
+
+/**
+ * Roles that only exist while a dialog surface is on screen.
+ *
+ * Counted on both sides of the interaction, so "a dialog is visible" can be
+ * told apart from "this control opened one" without trusting a single
+ * post-action number.
+ */
+export const DIALOG_ROLES: ReadonlySet<string> = new Set(['dialog', 'alertdialog']);
 
 /**
  * Tags that are not interactive elements. A control built from one of these,
@@ -439,6 +460,26 @@ export function diffTreeSnapshots(
   const errorTextAdded: string[] = [];
   const liveRolesAdded: string[] = [];
   let retained = 0;
+  let dialogNodesBefore = 0;
+  let dialogNodesAfter = 0;
+  let documentNameBefore: string | null = null;
+  let documentNameAfter: string | null = null;
+
+  for (const id of beforeIds) {
+    const node = before[id];
+    if (!node) continue;
+    const role = normaliseRole(node.role);
+    if (DIALOG_ROLES.has(role)) dialogNodesBefore += 1;
+    if (role === 'rootwebarea' && documentNameBefore === null) documentNameBefore = node.name ?? '';
+  }
+
+  for (const id of afterIds) {
+    const node = after[id];
+    if (!node) continue;
+    const role = normaliseRole(node.role);
+    if (DIALOG_ROLES.has(role)) dialogNodesAfter += 1;
+    if (role === 'rootwebarea' && documentNameAfter === null) documentNameAfter = node.name ?? '';
+  }
 
   for (const id of afterIds) {
     if (id in before) continue;
@@ -476,7 +517,48 @@ export function diffTreeSnapshots(
         after: to,
       });
     }
+
+    /*
+     * Validation text does not have to arrive on a new node.
+     *
+     * The common React form renders its error container up front and empty, and
+     * fills it in on submit. The node is retained, so an added-nodes-only scan
+     * sees nothing, the form precondition finds neither text nor material tree
+     * movement, and every validation assertion is skipped on the one page they
+     * exist for. A retained node whose name *became* error-shaped is exactly as
+     * much new text as a node that arrived carrying it.
+     *
+     * The "and was not one before" half is what keeps this from re-reporting a
+     * message that was on the page all along.
+     */
+    const previousName = (previous.name ?? '').trim();
+    const nextName = (next.name ?? '').trim();
+    if (
+      nextName.length > 0 &&
+      nextName !== previousName &&
+      config.errorTextPattern.test(nextName) &&
+      !config.errorTextPattern.test(previousName)
+    ) {
+      errorTextAdded.push(nextName);
+    }
   }
+
+  const idStability = beforeIds.length === 0 ? 1 : retained / beforeIds.length;
+
+  /*
+   * Navigation, measured from the trees alone.
+   *
+   * The title changing says the document is a different one; id stability
+   * collapsing says the tree was rebuilt wholesale rather than extended. Either
+   * on its own is too weak - a live region can rewrite the title, and a big
+   * React re-render churns every id - so both are required. Together they are
+   * the shape of a navigation, and the toggle rules must never fire on one.
+   */
+  const documentReplaced =
+    documentNameBefore !== null &&
+    documentNameAfter !== null &&
+    documentNameBefore !== documentNameAfter &&
+    idStability < config.minIdStability;
 
   return {
     nodesAdded,
@@ -487,10 +569,15 @@ export function diffTreeSnapshots(
     changedCount: changedProps.length,
     sizeDelta: afterIds.length - beforeIds.length,
     churn: nodesAdded.length + nodesRemoved.length,
-    idStability: beforeIds.length === 0 ? 1 : retained / beforeIds.length,
+    idStability,
     popupRolesAdded,
     errorTextAdded,
     liveRolesAdded,
+    dialogNodesBefore,
+    dialogNodesAfter,
+    documentNameBefore,
+    documentNameAfter,
+    documentReplaced,
   };
 }
 
@@ -643,6 +730,106 @@ function asFormErrors(value: unknown): FormErrorObservation | null {
 }
 
 /* ========================================================================== */
+/* Preconditions shared by more than one rule                                 */
+/* ========================================================================== */
+
+export interface DialogOpening {
+  /** True only when *this* interaction put a dialog on screen. */
+  readonly opened: boolean;
+  readonly visibleBefore: number | null;
+  readonly visibleAfter: number | null;
+  /** How `opened` was decided, for the evidence trail. */
+  readonly via: 'counts' | 'tree' | 'none';
+}
+
+/**
+ * Did this interaction open a dialog?
+ *
+ * The Dialog template is chosen from a label heuristic as often as from
+ * `aria-haspopup`, so it is frequently pointed at a control that opens nothing.
+ * Worse, a page can load with a cookie banner, a login modal or a consent sheet
+ * already visible - and then a post-action count of one is true of every
+ * control on the page, so focus, Escape and focus-return findings all land on
+ * whichever control happened to be probed.
+ *
+ * Two readings, preferred in this order:
+ *
+ *   1. the executor's own before/after visible-dialog counts;
+ *   2. dialog-role nodes counted across the two trees, which this layer always
+ *      has. A banner that was already open is in `before` too, so the count
+ *      does not rise - and unlike a single post-action number, that holds even
+ *      when CDP reassigned every node id.
+ *
+ * Anything else is not an opening, and an unanswerable assertion is skipped,
+ * never failed.
+ */
+export function dialogOpening(
+  delta: TreeDelta,
+  observations: Readonly<Record<string, unknown>>,
+): DialogOpening {
+  const visibleBefore = asNumber(observations[OBSERVATION_KEYS.dialogsVisibleBefore]);
+  const visibleAfter = asNumber(observations[OBSERVATION_KEYS.dialogsVisibleAfterOpen]);
+
+  if (visibleAfter === null || visibleAfter < 1) {
+    return { opened: false, visibleBefore, visibleAfter, via: 'none' };
+  }
+  if (visibleBefore !== null) {
+    return { opened: visibleAfter > visibleBefore, visibleBefore, visibleAfter, via: 'counts' };
+  }
+  return {
+    opened: delta.dialogNodesAfter > delta.dialogNodesBefore,
+    visibleBefore,
+    visibleAfter,
+    via: 'tree',
+  };
+}
+
+/**
+ * Two URLs that address the same document.
+ *
+ * The fragment is ignored: `#main` moves the viewport, it does not replace the
+ * tree. Anything else - path, query, origin - is treated as a navigation, which
+ * only ever makes this layer quieter.
+ */
+function sameDocumentUrl(before: string, after: string): boolean {
+  const strip = (url: string): string => {
+    const hash = url.indexOf('#');
+    return (hash === -1 ? url : url.slice(0, hash)).replace(/\/+$/, '');
+  };
+  return strip(before) === strip(after);
+}
+
+/**
+ * Did the action navigate?
+ *
+ * Four independent readings, because suppressing navigation is the single most
+ * important false-positive guard in the 4.1.2 rules and it must not rest on any
+ * one of them arriving:
+ *
+ *   - the caller said so;
+ *   - the executor filed `observations.navigated`;
+ *   - the URL moved to a different document;
+ *   - the document title changed while the whole tree was rebuilt.
+ *
+ * The last two are what cover button-driven routing and scripted redirects,
+ * which no amount of looking at `<a href>` on the trigger can catch.
+ */
+function actionNavigated(
+  delta: TreeDelta,
+  observations: Readonly<Record<string, unknown>>,
+  context: TransitionContext,
+): boolean {
+  if (context.navigated === true) return true;
+  if (asBoolean(observations[OBSERVATION_KEYS.navigated]) === true) return true;
+
+  const urlBefore = asString(observations[OBSERVATION_KEYS.urlBefore]);
+  const urlAfter = asString(observations[OBSERVATION_KEYS.urlAfter]);
+  if (urlBefore !== null && urlAfter !== null && !sameDocumentUrl(urlBefore, urlAfter)) return true;
+
+  return delta.documentReplaced;
+}
+
+/* ========================================================================== */
 /* The analysis                                                               */
 /* ========================================================================== */
 
@@ -718,16 +905,42 @@ export function analyseTransition(
   }
 
   const findings: PathFinding[] = [];
+  const opening = dialogOpening(delta, observations);
 
-  findings.push(
-    ...analyseToggle(delta, stateAttrBefore, stateAttrAfter, identity, selectorPenalty, context),
+  /*
+   * The toggle rules run only for templates that declared them.
+   *
+   * `ASSERTIONS_BY_TEMPLATE` already says which checks each template makes, and
+   * the Form list deliberately excludes both toggle assertions: a submit button
+   * has no state to report, so "the tree moved and this control's aria-expanded
+   * did not" is not a statement about it. Running them anyway handed a 4.1.2 to
+   * every form submit that re-rendered its page. Reading the answer out of the
+   * declared assertion set rather than restating it here means the two cannot
+   * drift apart.
+   */
+  const toggleRulesApply = ASSERTIONS_BY_TEMPLATE[template].some(
+    (id) => id === 'tree-changed-state-frozen' || id === 'tree-changed-no-state-attribute',
   );
 
+  if (toggleRulesApply) {
+    findings.push(
+      ...analyseToggle(
+        delta,
+        stateAttrBefore,
+        stateAttrAfter,
+        identity,
+        selectorPenalty,
+        context,
+        opening,
+      ),
+    );
+  }
+
   if (template === 'dialog') {
-    findings.push(...analyseDialog(delta, observations, identity, selectorPenalty));
+    findings.push(...analyseDialog(delta, observations, identity, selectorPenalty, opening));
   }
   if (template === 'form') {
-    findings.push(...analyseForm(delta, observations, identity, selectorPenalty));
+    findings.push(...analyseForm(delta, observations, identity, selectorPenalty, before));
   }
 
   return findings.filter((finding) => finding.confidence >= config.minReportConfidence);
@@ -770,10 +983,10 @@ function analyseToggle(
   identity: Identity,
   selectorPenalty: readonly ConfidenceTerm[],
   context: TransitionContext,
+  opening: DialogOpening,
 ): PathFinding[] {
   const config = identity.config;
-  const navigated =
-    context.navigated === true || asBoolean(context.observations?.[OBSERVATION_KEYS.navigated]) === true;
+  const navigated = actionNavigated(delta, context.observations ?? {}, context);
 
   /* Guard 1: navigation replaces the whole tree. Never a 4.1.2 on its own. */
   if (navigated && config.suppressOnNavigation) return [];
@@ -856,6 +1069,27 @@ function analyseToggle(
       }),
     ];
   }
+
+  /*
+   * Guard 5: this control opened a dialog, and the Dialog template is already
+   * holding it to the right contract.
+   *
+   * Rule B below reads "no state attribute, and a popup role appeared" as
+   * strong 4.1.2 evidence, and a dialog role is a popup role - so a perfectly
+   * conforming dialog trigger scores 0.80 and goes out as DECIDE. But the APG
+   * dialog pattern puts the contract on the *dialog*: its role, its accessible
+   * name, aria-modal, initial focus, Escape, focus return. A button that opens
+   * one is under no obligation to carry aria-expanded, and telling an author to
+   * add one is telling them to do the wrong thing.
+   *
+   * Nothing is lost by staying quiet here: `analyseDialog` checks every one of
+   * those obligations on this same interaction, so a dialog trigger that really
+   * is broken is still reported - against the criterion it actually failed.
+   *
+   * Rule A above still applies. A control that *does* declare aria-expanded and
+   * then freezes it is lying about its own state, dialog or no dialog.
+   */
+  if (identity.template === 'dialog' && opening.opened) return [];
 
   /* ---- Rule B: the control declares no state at all. --------------------- */
   const divButton = looksLikeDivButton(stateAttrBefore);
@@ -950,17 +1184,27 @@ function analyseDialog(
   observations: Readonly<Record<string, unknown>>,
   identity: Identity,
   selectorPenalty: readonly ConfidenceTerm[],
+  opening: DialogOpening,
 ): PathFinding[] {
-  const dialogsOpen = asNumber(observations[OBSERVATION_KEYS.dialogsVisibleAfterOpen]);
-
   /*
-   * Precondition. The Dialog template is chosen from a label heuristic as often
-   * as from aria-haspopup, so it is frequently pointed at a control that opens
-   * no dialog. When nothing opened, every assertion below is unanswerable, and
-   * an unanswerable assertion is skipped, not failed.
+   * Precondition: *this control* opened a dialog.
+   *
+   * Not "a dialog is visible". The Dialog template is chosen from a label
+   * heuristic as often as from aria-haspopup, so it is frequently pointed at a
+   * control that opens nothing - and a page that loads with a cookie banner,
+   * a login modal or a consent sheet already on screen satisfies "a dialog is
+   * visible" for every control on it. Every assertion below would then be
+   * answered against a surface this control never touched.
+   *
+   * `dialogOpening` requires the count to have *risen*, reading the executor's
+   * before/after counts when it filed them and falling back to dialog-role
+   * nodes across the two trees when it did not. When nothing opened, every
+   * assertion here is unanswerable, and an unanswerable assertion is skipped,
+   * not failed.
    */
-  if (dialogsOpen === null || dialogsOpen < 1) return [];
+  if (!opening.opened) return [];
 
+  const dialogsOpen = opening.visibleAfter ?? delta.dialogNodesAfter;
   const dialogsAfterEscape = asNumber(observations[OBSERVATION_KEYS.dialogsVisibleAfterEscape]);
   const focusAfterOpen = asFocus(observations[OBSERVATION_KEYS.focusAfterOpen]);
   const focusAfterEscape = asFocus(observations[OBSERVATION_KEYS.focusAfterEscape]);
@@ -969,7 +1213,11 @@ function analyseDialog(
   const findings: PathFinding[] = [];
   const evidence = {
     ...evidenceFor(delta, identity),
+    dialogsVisibleBefore: opening.visibleBefore,
     dialogsVisibleAfterOpen: dialogsOpen,
+    dialogOpenedVia: opening.via,
+    dialogNodesBefore: delta.dialogNodesBefore,
+    dialogNodesAfter: delta.dialogNodesAfter,
     dialogsVisibleAfterEscape: dialogsAfterEscape,
     focusAfterOpen,
     focusAfterEscape,
@@ -1119,11 +1367,60 @@ function describeFocus(focus: FocusSnapshot | null): string {
 /* Form: 3.3.1, 3.3.3, 4.1.3, 2.4.3                                           */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Keep only the live-region messages this submission actually produced.
+ *
+ * The executor reads every `[role=alert]` and `[aria-live]` on the page after
+ * submitting, and a great many pages carry one permanently: "Welcome back", a
+ * cart total, a cookie notice, a "3 results" counter. Counting those as
+ * validation output does two kinds of damage. The obvious one is a 3.3.3
+ * finding that the error does not say how to fix an error that does not exist.
+ * The worse one is upstream: any message at all satisfies `submissionRejected`,
+ * so a submit button that did nothing at all still gets its form assertions
+ * evaluated as though it had been rejected.
+ *
+ * Two baselines, preferred in this order:
+ *
+ *   1. the executor's pre-submit capture of the same live regions;
+ *   2. the before-tree's node names, which this layer always has. A message
+ *      rendered on the page before the click is in that tree, by definition.
+ *
+ * Containment as well as equality, because a live region's text content is the
+ * concatenation of its children and the tree carries them one name at a time.
+ */
+function newlyAnnounced(
+  after: readonly string[],
+  before: FormErrorObservation | null,
+  beforeTree: AxTreeSnapshot,
+): string[] {
+  if (before !== null) {
+    const seen = new Set(before.announcedMessages.map((message) => normaliseLabel(message)));
+    return after.filter((message) => !seen.has(normaliseLabel(message)));
+  }
+
+  const namesBefore = new Set<string>();
+  for (const node of Object.values(beforeTree)) {
+    const name = normaliseLabel((node.name ?? '').trim());
+    if (name.length > 0) namesBefore.add(name);
+  }
+
+  return after.filter((message) => {
+    const normalised = normaliseLabel(message);
+    if (normalised.length === 0) return false;
+    for (const name of namesBefore) {
+      if (name === normalised) return false;
+      if (normalised.length >= 8 && name.includes(normalised)) return false;
+    }
+    return true;
+  });
+}
+
 function analyseForm(
   delta: TreeDelta,
   observations: Readonly<Record<string, unknown>>,
   identity: Identity,
   selectorPenalty: readonly ConfidenceTerm[],
+  beforeTree: AxTreeSnapshot,
 ): PathFinding[] {
   const config = identity.config;
   const errors = asFormErrors(observations[OBSERVATION_KEYS.formErrors]);
@@ -1132,16 +1429,21 @@ function analyseForm(
   const focusAfterSubmit = asFocus(observations[OBSERVATION_KEYS.focusAfterSubmit]);
   const change = treeChangeMagnitude(delta, config);
 
-  const announced = errors.announcedMessages.filter((message) => message.trim().length > 0);
+  const errorsBefore = asFormErrors(observations[OBSERVATION_KEYS.formErrorsBefore]);
+  const announcedAfter = errors.announcedMessages.filter((message) => message.trim().length > 0);
+  const announced = newlyAnnounced(announcedAfter, errorsBefore, beforeTree);
+  const carriedOver = announcedAfter.length - announced.length;
   const errorTextInTree = delta.errorTextAdded;
   const hasErrorText = announced.length > 0 || errorTextInTree.length > 0;
 
   /*
    * Precondition. `invalidCount` alone proves nothing: `:invalid` matches a
    * required empty field the moment the page loads, before anything is
-   * submitted. A submission was only *rejected* if something actually happened
-   * - the tree moved, or words appeared. Without that, every rule below would
-   * be guessing, so none of them run.
+   * submitted. Neither does a live region with words in it, unless those words
+   * are *new* - see `newlyAnnounced`. A submission was only *rejected* if
+   * something actually happened: the tree moved, or text appeared that was not
+   * there before. Without that, every rule below would be guessing, so none of
+   * them run.
    */
   const submissionRejected =
     hasErrorText || change.magnitude === 'material' || change.magnitude === 'large';
@@ -1152,6 +1454,8 @@ function analyseForm(
     ...evidenceFor(delta, identity),
     liveRegionCount: errors.liveRegionCount,
     announcedMessages: announced,
+    announcedMessagesCarriedOverFromBeforeSubmit: carriedOver,
+    announcedBaselineVia: errorsBefore !== null ? 'pre-submit capture' : 'before-tree node names',
     invalidCount: errors.invalidCount,
     invalidWithDescription: errors.invalidWithDescription,
     focusAfterSubmit,

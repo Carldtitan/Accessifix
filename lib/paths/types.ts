@@ -316,6 +316,7 @@ export type PathStepKind =
   | 'settle'
   | 'press-key'
   | 'read-focus'
+  | 'read-url'
   | 'count-dialogs'
   | 'collect-form-errors'
   | 'screenshot';
@@ -419,10 +420,41 @@ export interface TreeDelta {
   readonly idStability: number;
   /** Added nodes whose role belongs to a popup surface: menu, dialog, listbox. */
   readonly popupRolesAdded: readonly string[];
-  /** Added node names that read like a validation error. */
+  /**
+   * Text that newly reads like a validation error.
+   *
+   * Two sources, and the second matters more than it looks: names on nodes the
+   * action *added*, and names on *retained* nodes that changed into an error.
+   * A pre-rendered, initially-empty validation container is the common shape on
+   * a React form, and it is invisible to an added-nodes-only scan - the node was
+   * there all along, only its name moved from "" to "Required".
+   */
   readonly errorTextAdded: readonly string[];
   /** Added nodes carrying `alert` or `status`. Evidence for 4.1.3. */
   readonly liveRolesAdded: readonly string[];
+  /**
+   * Nodes carrying `dialog` or `alertdialog`, counted in each snapshot.
+   *
+   * A dialog was opened *by this interaction* only when the count rose. A page
+   * that loads with a cookie banner, a login modal or a consent sheet already
+   * visible would otherwise hand every control on it the Dialog template's
+   * focus, Escape and focus-return findings, attributed to a control that did
+   * nothing. A post-action count alone cannot tell those apart; two counts can.
+   */
+  readonly dialogNodesBefore: number;
+  readonly dialogNodesAfter: number;
+  /**
+   * The `RootWebArea` accessible name - the document title - on each side.
+   *
+   * `documentReplaced` is this layer's own navigation detector: a title change
+   * together with a collapse in id stability means the two snapshots describe
+   * different documents. It exists because navigation suppression is the single
+   * most important false-positive guard in the 4.1.2 rules, and it must not
+   * depend on an `observations.navigated` the executor may never file.
+   */
+  readonly documentNameBefore: string | null;
+  readonly documentNameAfter: string | null;
+  readonly documentReplaced: boolean;
 }
 
 /* -------------------------------------------------------------------------- */
