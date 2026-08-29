@@ -455,6 +455,19 @@ export interface TrueForgeClientOptions {
   fetchImpl?: typeof fetch;
 }
 
+/**
+ * The abort and timeout plumbing for one call, kept alive until the response
+ * body has been consumed rather than until the headers arrive.
+ */
+interface RequestGuard {
+  /** The signal handed to `fetch`; it also aborts an in-flight body read. */
+  readonly signal: AbortSignal;
+  /** Clears the timer and unsubscribes from the caller's signal. */
+  release(): void;
+  /** Classifies a failure as a caller abort, a timeout, or a transport error. */
+  toError(cause: unknown): TrueForgeError;
+}
+
 interface RequestOptions<S extends z.ZodType> {
   method: "GET" | "POST" | "PUT" | "DELETE";
   path: string;
@@ -502,70 +515,120 @@ export class TrueForgeClient {
     return headers;
   }
 
-  /** `timeoutMs <= 0` means no timeout — used by the long-lived SSE subscription. */
+  /**
+   * The abort plumbing for one call: the caller's signal, our own timeout, and
+   * the classification of whatever went wrong.
+   *
+   * It stays armed until `release()`, which is deliberately *not* when `fetch`
+   * resolves. `fetch` resolves on the response headers, so a server that sends
+   * headers and then stalls the body would otherwise leave an unbounded read
+   * behind a supposedly bounded call.
+   */
+  private guardRequest(
+    method: string,
+    url: string,
+    timeoutMs: number,
+    callerSignal?: AbortSignal,
+  ): RequestGuard {
+    const controller = new AbortController();
+    // setTimeout overflows past 2^31-1 ms and fires immediately, so clamp.
+    const delay = Math.min(timeoutMs, 2_147_483_647);
+    const timer =
+      delay > 0 ? setTimeout(() => controller.abort(new Error("timeout")), delay) : undefined;
+
+    // `abort` is never replayed for a listener added after the fact, so a
+    // signal that was already aborted has to be honoured up front. Otherwise
+    // the request still reaches TrueForge and may start model work or write.
+    const onAbort = () => controller.abort(callerSignal?.reason);
+    if (callerSignal?.aborted) {
+      controller.abort(callerSignal.reason);
+    } else {
+      callerSignal?.addEventListener("abort", onAbort, { once: true });
+    }
+
+    const baseUrl = this.baseUrl;
+    return {
+      signal: controller.signal,
+      release() {
+        if (timer !== undefined) clearTimeout(timer);
+        callerSignal?.removeEventListener("abort", onAbort);
+      },
+      toError(cause: unknown): TrueForgeError {
+        if (callerSignal?.aborted) {
+          return new TrueForgeError({
+            kind: "network",
+            message: `${method} ${url} was aborted by the caller`,
+            method,
+            url,
+            cause,
+          });
+        }
+        if (controller.signal.aborted) {
+          return new TrueForgeError({
+            kind: "timeout",
+            message: `${method} ${url} timed out after ${timeoutMs}ms`,
+            method,
+            url,
+            cause,
+          });
+        }
+        return new TrueForgeError({
+          kind: "network",
+          message: `${method} ${url} failed to reach TrueForge at ${baseUrl}: ${describe(cause)}`,
+          method,
+          url,
+          cause,
+        });
+      },
+    };
+  }
+
+  /**
+   * `timeoutMs <= 0` means no timeout — used by the long-lived SSE
+   * subscription. The returned guard covers the response body as well as the
+   * headers, so every caller must `release()` it once the body is consumed.
+   */
   private async rawFetch(
     method: string,
     url: string,
     init: { body?: string; headers: Record<string, string>; timeoutMs: number; signal?: AbortSignal },
-  ): Promise<Response> {
-    const controller = new AbortController();
-    // setTimeout overflows past 2^31-1 ms and fires immediately, so clamp.
-    const delay = Math.min(init.timeoutMs, 2_147_483_647);
-    const timer =
-      delay > 0 ? setTimeout(() => controller.abort(new Error("timeout")), delay) : undefined;
-    const onAbort = () => controller.abort(init.signal?.reason);
-    init.signal?.addEventListener("abort", onAbort, { once: true });
-
+  ): Promise<{ response: Response; guard: RequestGuard }> {
+    const guard = this.guardRequest(method, url, init.timeoutMs, init.signal);
     try {
-      return await this.fetchImpl(url, {
+      const response = await this.fetchImpl(url, {
         method,
         headers: init.headers,
         body: init.body,
-        signal: controller.signal,
+        signal: guard.signal,
       });
+      return { response, guard };
     } catch (cause) {
-      if (init.signal?.aborted) {
-        throw new TrueForgeError({
-          kind: "network",
-          message: `${method} ${url} was aborted by the caller`,
-          method,
-          url,
-          cause,
-        });
-      }
-      if (controller.signal.aborted) {
-        throw new TrueForgeError({
-          kind: "timeout",
-          message: `${method} ${url} timed out after ${init.timeoutMs}ms`,
-          method,
-          url,
-          cause,
-        });
-      }
-      throw new TrueForgeError({
-        kind: "network",
-        message: `${method} ${url} failed to reach TrueForge at ${this.baseUrl}: ${describe(cause)}`,
-        method,
-        url,
-        cause,
-      });
-    } finally {
-      if (timer !== undefined) clearTimeout(timer);
-      init.signal?.removeEventListener("abort", onAbort);
+      guard.release();
+      throw guard.toError(cause);
     }
   }
 
   private async request<S extends z.ZodType>(options: RequestOptions<S>): Promise<z.infer<S>> {
     const url = this.url(options.path, options.query);
     const hasBody = options.body !== undefined;
-    const response = await this.rawFetch(options.method, url, {
+    const { response, guard } = await this.rawFetch(options.method, url, {
       headers: this.headers(hasBody ? { "content-type": "application/json" } : undefined),
       body: hasBody ? JSON.stringify(options.body) : undefined,
       timeoutMs: options.timeoutMs ?? this.timeoutMs,
       signal: options.signal,
     });
 
-    const text = await response.text().catch(() => "");
+    // Still inside the timeout: a body that never arrives is a timed-out call,
+    // not an empty one.
+    let text: string;
+    try {
+      text = await response.text();
+    } catch (cause) {
+      throw guard.toError(cause);
+    } finally {
+      guard.release();
+    }
+
     let payload: unknown = undefined;
     if (text.length > 0) {
       try {
@@ -889,7 +952,7 @@ export class TrueForgeClient {
     const url = this.url(
       `/sessions/${encodeURIComponent(sessionId)}/turns/${encodeURIComponent(turnId)}/subscribe`,
     );
-    const response = await this.rawFetch("GET", url, {
+    const { response, guard } = await this.rawFetch("GET", url, {
       headers: this.headers({ accept: "text/event-stream" }),
       // The stream stays open for the life of the turn; do not time it out.
       timeoutMs: 0,
@@ -897,6 +960,7 @@ export class TrueForgeClient {
     });
 
     if (!response.ok || !response.body) {
+      guard.release();
       throw new TrueForgeError({
         kind: "http",
         message: `Could not subscribe to turn ${turnId}: ${response.status} ${response.statusText}`,
@@ -908,23 +972,46 @@ export class TrueForgeClient {
 
     const decoder = new TextDecoder();
     const reader = response.body.getReader();
-    let buffer = "";
+    /** Decoded and normalised to LF, waiting to be framed on the blank line. */
+    let pending = "";
+    /** A trailing CR whose LF may be at the start of the next chunk. */
+    let carry = "";
+
     try {
       for (;;) {
         const { done, value } = await reader.read();
-        if (done) break;
-        buffer += decoder.decode(value, { stream: true });
+        let chunk = carry + (done ? decoder.decode() : decoder.decode(value, { stream: true }));
+        carry = "";
+        // A CRLF split across two chunks would otherwise look like a boundary.
+        if (!done && chunk.endsWith("\r")) {
+          carry = "\r";
+          chunk = chunk.slice(0, -1);
+        }
+        // SSE treats CRLF, CR and LF as the same line terminator, so a stream
+        // framed with CRLF CRLF is exactly as valid as one framed with LF LF.
+        // Normalising once here is cheaper than matching three delimiters.
+        pending += chunk.replace(/\r\n|\r/g, "\n");
 
-        let boundary = buffer.indexOf("\n\n");
+        let boundary = pending.indexOf("\n\n");
         while (boundary !== -1) {
-          const frame = buffer.slice(0, boundary);
-          buffer = buffer.slice(boundary + 2);
+          const frame = pending.slice(0, boundary);
+          pending = pending.slice(boundary + 2);
           const event = parseSseFrame(frame);
           if (event) yield event;
-          boundary = buffer.indexOf("\n\n");
+          boundary = pending.indexOf("\n\n");
         }
+
+        if (done) break;
+      }
+
+      // A server that closes without a final blank line has still delivered
+      // that frame; parseSseFrame drops it if it is only a fragment.
+      if (pending.trim().length > 0) {
+        const event = parseSseFrame(pending);
+        if (event) yield event;
       }
     } finally {
+      guard.release();
       await reader.cancel().catch(() => undefined);
     }
   }
