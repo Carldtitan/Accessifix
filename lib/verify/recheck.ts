@@ -151,6 +151,49 @@ export interface LiveRecheckOptions {
   readonly labels?: Readonly<Record<string, string>>;
   /** Skip the axe pass and rely on paths alone. */
   readonly skipAxe?: boolean;
+  /**
+   * How many distinct routes to re-check. Every route costs a page load, and a
+   * run with findings spread over forty pages should not turn into forty browser
+   * jobs. Findings past the cap come back inconclusive and say so. Default 8.
+   */
+  readonly maxRoutes?: number;
+}
+
+const DEFAULT_MAX_RECHECK_ROUTES = 8;
+
+/**
+ * Whether the deterministic rule engine actually ran.
+ *
+ * The browser layer reports a missing or broken axe through `warnings` and
+ * returns an empty violation list either way, so an instrumentation failure and
+ * a clean page are the same value. Every axe warning it emits is a failure —
+ * source unavailable, CDN refused, CDN unreachable, run threw — so any of them
+ * means the empty list proves nothing.
+ */
+function axeFailures(warnings: readonly string[] | undefined): string[] {
+  return (warnings ?? []).filter((warning) => /axe[-\s]?core/i.test(warning));
+}
+
+/**
+ * The URL on the patched build that corresponds to where a finding was seen.
+ *
+ * Findings carry the deployed URL they were observed on; `base` serves the
+ * patched tree, which is usually a different origin. The path is what identifies
+ * the route, so it is carried over and everything else is taken from `base`.
+ */
+export function patchedUrlFor(base: string, pageUrl: string | null | undefined): string {
+  if (!pageUrl) return base;
+  try {
+    const observed = new URL(pageUrl);
+    const resolved = new URL(base);
+    resolved.pathname = observed.pathname;
+    resolved.search = observed.search;
+    return resolved.toString();
+  } catch {
+    // Not a URL we can take apart — re-check against the base and let the
+    // evidence speak for itself rather than inventing a route.
+    return base;
+  }
 }
 
 /**
@@ -169,50 +212,104 @@ export async function recheckAgainstUrl(
 
   const outcomes = new Map<string, RecheckOutcome>();
 
-  /* -- path evidence, for the findings that carry an interaction ---------- */
-
-  const paths = options.paths;
-  if (paths && paths.size > 0) {
-    const targets = findings.filter((f) => paths.has(f.id));
-    const list: InteractionPath[] = targets.map((f) => ({
-      ...paths.get(f.id)!,
-      id: f.id,
-    }));
-
-    if (list.length > 0) {
-      const results = await runPaths(url, list, { labels: options.labels });
-      const byId = new Map<string, PathResult>();
-      for (const result of results) {
-        const id = result.path.id;
-        if (id) byId.set(id, result);
-      }
-      for (const finding of targets) {
-        const result = byId.get(finding.id);
-        if (result) outcomes.set(finding.id, evaluatePath(finding, result));
-      }
-    }
+  // A finding is only proven on the page it was observed on. Evaluating a
+  // finding from `/checkout` against whatever `/` happens to render would mark
+  // it resolved because its selector and its violation are simply not on that
+  // page — which is absence of the evidence, presented as evidence of the fix.
+  const maxRoutes = options.maxRoutes ?? DEFAULT_MAX_RECHECK_ROUTES;
+  const byRoute = new Map<string, FixableFinding[]>();
+  for (const finding of findings) {
+    const route = patchedUrlFor(url, finding.pageUrl);
+    const bucket = byRoute.get(route);
+    if (bucket) bucket.push(finding);
+    else byRoute.set(route, [finding]);
   }
 
-  /* -- deterministic evidence for everything else ------------------------ */
-
-  const remaining = findings.filter((f) => !outcomes.has(f.id));
-  if (remaining.length > 0 && !options.skipAxe) {
-    const capture = await capturePage(url, { labels: options.labels });
-    const violations = capture.axeViolations;
-
-    for (const finding of remaining) {
-      outcomes.set(finding.id, evaluateAxe(finding, violations));
-    }
-  } else {
-    for (const finding of remaining) {
+  const routes = [...byRoute.entries()];
+  for (const [route, routeFindings] of routes.slice(maxRoutes)) {
+    for (const finding of routeFindings) {
       outcomes.set(finding.id, {
         findingId: finding.id,
         criterion: finding.criterion,
         resolved: false,
         inconclusive: true,
         method: 'none',
-        note: 'No re-check ran against this finding.',
+        note:
+          `${route} is past the re-check budget of ${maxRoutes} routes for this run, so this ` +
+          'finding was not re-checked. It is reported unproven rather than assumed fixed.',
       });
+    }
+  }
+
+  for (const [route, routeFindings] of routes.slice(0, maxRoutes)) {
+    /* -- path evidence, for the findings that carry an interaction -------- */
+
+    const paths = options.paths;
+    if (paths && paths.size > 0) {
+      const targets = routeFindings.filter((f) => paths.has(f.id));
+      const list: InteractionPath[] = targets.map((f) => ({
+        ...paths.get(f.id)!,
+        id: f.id,
+      }));
+
+      if (list.length > 0) {
+        const results = await runPaths(route, list, { labels: options.labels });
+        const byId = new Map<string, PathResult>();
+        for (const result of results) {
+          const id = result.path.id;
+          if (id) byId.set(id, result);
+        }
+        for (const finding of targets) {
+          const result = byId.get(finding.id);
+          if (result) outcomes.set(finding.id, evaluatePath(finding, result));
+        }
+      }
+    }
+
+    /* -- deterministic evidence for everything else ---------------------- */
+
+    const remaining = routeFindings.filter((f) => !outcomes.has(f.id));
+    if (remaining.length === 0) continue;
+
+    if (options.skipAxe) {
+      for (const finding of remaining) {
+        outcomes.set(finding.id, {
+          findingId: finding.id,
+          criterion: finding.criterion,
+          resolved: false,
+          inconclusive: true,
+          method: 'none',
+          note: 'No re-check ran against this finding.',
+        });
+      }
+      continue;
+    }
+
+    const capture = await capturePage(route, { labels: options.labels });
+
+    // An empty violation list from a page where axe never loaded is not a clean
+    // page. Without this check an instrumentation failure would resolve every
+    // axe-decidable finding at once, and the pull request would claim fixes
+    // nothing observed.
+    const failures = axeFailures(capture.warnings);
+    if (failures.length > 0) {
+      for (const finding of remaining) {
+        outcomes.set(finding.id, {
+          findingId: finding.id,
+          criterion: finding.criterion,
+          resolved: false,
+          inconclusive: true,
+          method: 'none',
+          note:
+            `The deterministic rule engine did not run on ${route} (${failures[0]}), so its ` +
+            'empty result says nothing about this finding.',
+        });
+      }
+      continue;
+    }
+
+    for (const finding of remaining) {
+      outcomes.set(finding.id, evaluateAxe(finding, capture.axeViolations));
     }
   }
 
@@ -434,25 +531,40 @@ export async function recheckFromSource(
       ...(options.signal === undefined ? {} : { signal: options.signal }),
     });
 
+    // An exact finding id, or nothing. Falling back to the criterion would let
+    // one defect's judgement settle another: three separate 4.1.2 failures share
+    // a criterion, the map keeps whichever entry came last, and the other two
+    // would inherit a "resolved" that was never about them.
+    const known = new Set(findings.map((finding) => finding.id));
     const byId = new Map<string, { resolved: boolean; note: string }>();
-    const byCriterion = new Map<string, { resolved: boolean; note: string }>();
+    const duplicated = new Set<string>();
+
     for (const entry of run.data?.recheck ?? []) {
-      const value = { resolved: entry.resolved, note: entry.note };
-      if (entry.findingId) byId.set(entry.findingId, value);
-      byCriterion.set(entry.criterion, value);
+      const id = entry.findingId?.trim();
+      if (!id || !known.has(id)) continue;
+      if (byId.has(id)) {
+        // Two judgements for one finding, possibly disagreeing. Neither is
+        // trustworthy, so the finding stays unproven.
+        duplicated.add(id);
+        continue;
+      }
+      byId.set(id, { resolved: entry.resolved, note: entry.note });
     }
 
     for (const finding of findings) {
-      const judgement = byId.get(finding.id) ?? byCriterion.get(finding.criterion);
+      const judgement = duplicated.has(finding.id) ? undefined : byId.get(finding.id);
       outcomes.set(finding.id, {
         findingId: finding.id,
         criterion: finding.criterion,
         resolved: judgement?.resolved ?? false,
         inconclusive: judgement === undefined,
-        method: 'source',
+        method: judgement ? 'source' : 'none',
         note: judgement
           ? `Judged from the patch, without a running build: ${judgement.note}`
-          : 'VERIFY returned no judgement for this finding.',
+          : duplicated.has(finding.id)
+            ? 'VERIFY returned more than one judgement for this finding, so none of them can ' +
+              'be relied on.'
+            : 'VERIFY returned no judgement for this finding.',
       });
     }
   } catch (error) {
@@ -511,10 +623,12 @@ function buildSourceRecheckPrompt(
     'PATCHES',
     diffs,
     '',
-    'Return JSON with a `recheck` array: one entry per finding, carrying its `findingId`, its',
-    '`criterion`, a boolean `resolved`, and a `note` stating what in the diff settles it.',
-    'Populate `buildPassed`, `testsPassed`, `testCommand` and `testSummary` from what you were',
-    'told, and set `recommendation` to "open-pull-request" only if every finding is resolved.',
+    'Return JSON with a `recheck` array: exactly one entry per finding above, carrying its',
+    '`findingId` copied verbatim from the list, its `criterion`, a boolean `resolved`, and a',
+    '`note` stating what in the diff settles it. The `findingId` is what binds a judgement to a',
+    'finding: an entry without one, with an id that is not in the list, or a second entry for an',
+    'id already used, is discarded and its finding is reported as unproven. Two findings that',
+    'cite the same criterion still need one entry each.',
   ]
     .filter((line) => line !== '')
     .join('\n');
