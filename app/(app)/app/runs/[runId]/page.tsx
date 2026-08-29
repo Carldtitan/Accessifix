@@ -24,7 +24,10 @@ export const metadata = { title: "Run detail" };
  * live parallel environments, a summary bar, proposed patches as diffs,
  * an attributed agent timeline, and the approval gate.
  *
- * PLACEHOLDER: everything on this page comes from components/sample-data.ts.
+ * PLACEHOLDER: the content on this page comes from components/sample-data.ts.
+ * The approval gate is the exception: it answers the run's handoff through
+ * POST /api/runs/{runId}/approve, so a click reaches the harness rather than
+ * only changing what this page says.
  */
 export default async function RunDetailPage({ params }: { params: Promise<{ runId: string }> }) {
   const { runId } = await params;
@@ -59,7 +62,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
             </p>
           </div>
         </div>
-        <ApprovalCard approval={sampleApproval} />
+        <ApprovalCard approval={sampleApproval} runId={runId} />
       </section>
 
       <section className="section" aria-labelledby="environments">

@@ -14,6 +14,7 @@ export type ApprovalEvidence = {
 };
 
 export type Approval = {
+  /** The handoff row this card answers. Sent to the harness as `handoffId`. */
   id: string;
   /** Short name of the irreversible action, e.g. "Open a pull request". */
   title: string;
@@ -40,13 +41,28 @@ const evidenceIcons: Record<ApprovalEvidenceKind, IconName> = {
 
 type Decision = "approved" | "rejected";
 
+/** idle -> submitting -> settled, or submitting -> error and back for a retry. */
+type SubmitState = "idle" | "submitting" | "settled" | "error";
+
 /**
- * ApprovalCard — the handoff (A7). The agent stops here and asks.
+ * ApprovalCard - the handoff (A7). The agent stops here and asks.
+ *
+ * The decision releases an irreversible action, so this card never reports an
+ * outcome it did not obtain. A click answers the run's handoff through
+ * `POST /api/runs/{runId}/approve` (or through `onDecision`, when the caller
+ * owns the operation). The outcome banner appears only once that call has
+ * succeeded; a failure is surfaced and the buttons come back for a retry; and a
+ * card given neither a run nor a handler keeps its controls disabled and says
+ * so, rather than miming a decision that reached nothing.
  *
  * Accessibility contract:
  * - One heading, one paragraph of intent, one of reason, then the evidence.
  *   The ask is written prose, never a raw tool payload.
  * - Approve and Reject are real buttons with distinct accessible names.
+ * - In flight the buttons are `aria-disabled` rather than `disabled`, so the
+ *   button the user just pressed keeps focus; progress is announced politely.
+ * - A failure is announced through `role="alert"` and does not move focus, so a
+ *   keyboard user retries from where they already are.
  * - After a decision the buttons stay in the DOM but are disabled, and focus
  *   moves deliberately to the outcome banner, so a keyboard user is never
  *   dropped back to the top of the document.
@@ -54,19 +70,75 @@ type Decision = "approved" | "rejected";
  */
 export function ApprovalCard({
   approval,
+  runId,
   onDecision,
 }: {
   approval: Approval;
-  onDecision?: (decision: Decision, approvalId: string) => void;
+  /** The run this handoff belongs to. Without it there is nothing to answer. */
+  runId?: string;
+  /** Replaces the default request when the caller owns the decision. */
+  onDecision?: (decision: Decision, approvalId: string) => void | Promise<void>;
 }) {
   const [decision, setDecision] = useState<Decision | null>(null);
+  const [status, setStatus] = useState<SubmitState>("idle");
+  const [error, setError] = useState<string | null>(null);
   const outcomeRef = useRef<HTMLParagraphElement | null>(null);
 
+  const canDecide = Boolean(onDecision) || Boolean(runId);
+  const busy = status === "submitting";
+  const settled = status === "settled" && decision !== null;
+  const locked = !canDecide || busy || settled;
+
+  async function send(next: Decision): Promise<void> {
+    if (onDecision) {
+      await onDecision(next, approval.id);
+      return;
+    }
+
+    const response = await fetch(`/api/runs/${encodeURIComponent(runId as string)}/approve`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        handoffId: approval.id,
+        decision: next === "approved" ? "approve" : "reject",
+      }),
+    });
+
+    let body: { error?: string; reason?: string } | null = null;
+    try {
+      body = (await response.json()) as { error?: string; reason?: string };
+    } catch {
+      body = null;
+    }
+
+    if (!response.ok) {
+      const detail = [body?.error, body?.reason].filter(Boolean).join(" ");
+      throw new Error(
+        detail || `The decision was not recorded. The harness answered ${response.status}.`,
+      );
+    }
+  }
+
   function decide(next: Decision) {
-    setDecision(next);
-    onDecision?.(next, approval.id);
-    // Deliberate focus move on a user-initiated action, not on a status update.
-    requestAnimationFrame(() => outcomeRef.current?.focus());
+    if (locked) return;
+    setStatus("submitting");
+    setError(null);
+    void send(next).then(
+      () => {
+        setDecision(next);
+        setStatus("settled");
+        // Deliberate focus move on a user-initiated action, not on a status update.
+        requestAnimationFrame(() => outcomeRef.current?.focus());
+      },
+      (cause: unknown) => {
+        setStatus("error");
+        setError(
+          cause instanceof Error && cause.message
+            ? cause.message
+            : "The decision could not be recorded.",
+        );
+      },
+    );
   }
 
   return (
@@ -106,12 +178,19 @@ export function ApprovalCard({
         </ul>
       </div>
 
-      {decision ? (
+      {settled && decision ? (
         <p className="approval-resolved" tabIndex={-1} ref={outcomeRef}>
           <Icon name={decision === "approved" ? "check" : "close"} size={18} />
           {decision === "approved"
-            ? "Approved. The agent will continue and record this decision against the run."
-            : "Rejected. The agent will stop before the write and return the findings to the queue."}
+            ? "Approved. The decision is recorded against the run, and the agent continues."
+            : "Rejected. The decision is recorded, and the agent stops before the write and returns the findings to the queue."}
+        </p>
+      ) : null}
+
+      {status === "error" && error ? (
+        <p className="approval-error" role="alert">
+          <Icon name="warning" size={17} />
+          <span>{error} Nothing has been written, and the decision is still open.</span>
         </p>
       ) : null}
 
@@ -120,7 +199,8 @@ export function ApprovalCard({
           type="button"
           className="button primary"
           onClick={() => decide("approved")}
-          disabled={decision !== null}
+          disabled={!canDecide || settled}
+          aria-disabled={locked || undefined}
         >
           Approve
           <Icon name="check" size={15} />
@@ -129,7 +209,8 @@ export function ApprovalCard({
           type="button"
           className="button reject"
           onClick={() => decide("rejected")}
-          disabled={decision !== null}
+          disabled={!canDecide || settled}
+          aria-disabled={locked || undefined}
         >
           Reject
         </button>
@@ -143,7 +224,21 @@ export function ApprovalCard({
         </span>
       </div>
 
-      {approval.waitingFor && decision === null ? (
+      {busy ? (
+        <p className="approval-note" role="status">
+          Recording your decision with the harness.
+        </p>
+      ) : null}
+
+      {!canDecide ? (
+        <p className="approval-note">
+          <Icon name="warning" size={14} /> This card is not bound to a run, so there is no handoff
+          to answer. The controls stay disabled rather than reporting a decision that reached
+          nothing.
+        </p>
+      ) : null}
+
+      {approval.waitingFor && status === "idle" ? (
         <p className="approval-note" aria-live="polite">
           <Icon name="warning" size={14} /> Waiting {approval.waitingFor} for a decision.
         </p>
