@@ -9,7 +9,7 @@ const url = requireEnv('DATABASE_URL');
 
 export default defineConfig({
   dialect: 'postgresql',
-  schema: './lib/db/schema.ts',
+  schema: ['./lib/db/schema.ts', './lib/pipeline/schema.ts'],
   out: './lib/db/migrations',
   dbCredentials: {
     url,
