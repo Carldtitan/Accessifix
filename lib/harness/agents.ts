@@ -95,6 +95,70 @@ const MEDIA_CRITERIA = ["1.2.1", "1.2.2", "1.2.3", "1.2.5"] as const;
 const CODE_CRITERIA = ["2.5.1", "2.5.4", "2.5.7"] as const;
 
 // ---------------------------------------------------------------------------
+// Skills (A13.1 / A13.2 / A13.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The git-backed Skill packs, and the criteria each one carries.
+ *
+ * The normative WCAG text lives in `skills/<name>/SKILL.md` in this
+ * repository and is registered on TrueForge as a `git` skill manifest. An
+ * agent holds only the skill's name and one-line description in context and
+ * pulls the body on demand — progressive disclosure, so no agent ever carries
+ * the text of all 55 criteria (A13.1 / A13.3).
+ *
+ * The criterion lists below are not decoration: `assertSkillsWithinLane`
+ * checks at module load that every skill an agent mounts covers only criteria
+ * that agent owns (A13.2). Widening a lane without widening the pack, or
+ * mounting a pack on an agent that does not own its criteria, fails the boot.
+ *
+ * `wcag-tree-semantics` is registered but mounted on nobody: TREE is a library
+ * inside the application, not a TrueForge agent. It is the reference for that
+ * library's rules and for human reviewers.
+ */
+export const SKILL_CRITERIA: Readonly<Record<string, readonly string[]>> = {
+  "wcag-perceivable-images": ["1.1.1", "1.4.5"],
+  "wcag-perceivable-media": ["1.2.1", "1.2.2", "1.2.3", "1.2.5"],
+  "wcag-perceivable-contrast": ["1.4.1", "1.4.11", "2.3.1"],
+  "wcag-perceivable-structure": ["1.3.1", "1.3.2", "2.5.3", "3.3.2"],
+  "wcag-perceivable-adaptable": ["1.3.4", "1.4.4", "1.4.10", "1.4.12"],
+  "wcag-operable-focus-state": ["1.4.13", "2.1.1", "2.4.3", "2.4.7", "2.4.11"],
+  "wcag-operable-control": ["1.4.2", "2.1.2", "2.1.4", "2.2.1", "2.2.2", "2.4.1"],
+  "wcag-operable-pointer": ["2.5.1", "2.5.2", "2.5.7"],
+  "wcag-understandable-forms": ["3.2.1", "3.2.2", "3.3.1", "3.3.3", "3.3.7", "3.3.8"],
+  "wcag-understandable-consistency": ["2.4.5", "3.2.3", "3.2.4", "3.2.6", "3.3.7"],
+  "wcag-robust-name-role-value": ["4.1.2", "4.1.3"],
+  "wcag-gestures-source": ["2.5.1", "2.5.4", "2.5.7"],
+  // Owned by the in-application TREE library; mounted on no agent.
+  "wcag-tree-semantics": [
+    "1.3.3", "1.3.5", "1.4.3", "2.4.2", "2.4.4", "2.4.6", "2.5.8", "3.1.1", "3.1.2",
+  ],
+  // Lane skills. These carry procedure, not criterion ownership.
+  "accessibility-remediation": [],
+  "target-repo-verification": [],
+} as const;
+
+/** Every skill name the roster can mount. Used by the registration script. */
+export const SKILL_NAMES: readonly string[] = Object.keys(SKILL_CRITERIA);
+
+const VIS_SKILLS = [
+  "wcag-perceivable-images",
+  "wcag-perceivable-contrast",
+  "wcag-perceivable-structure",
+  "wcag-perceivable-adaptable",
+  "wcag-operable-focus-state",
+] as const;
+
+const ACT_SKILLS = [
+  "wcag-perceivable-adaptable",
+  "wcag-operable-focus-state",
+  "wcag-operable-control",
+  "wcag-operable-pointer",
+  "wcag-understandable-forms",
+  "wcag-robust-name-role-value",
+] as const;
+
+// ---------------------------------------------------------------------------
 // Model FQNs
 // ---------------------------------------------------------------------------
 
@@ -301,7 +365,7 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     fallbackModel: MODELS.anthropicSonnet,
     criteria: VIS_CRITERIA,
     verdicts: ALL_VERDICTS,
-    skills: ["wcag-perceivable", "wcag-operable", "wcag-understandable"],
+    skills: VIS_SKILLS,
     instructions: VIS_INSTRUCTIONS,
     responseFormat: buildFindingsResponseFormat(VIS_CRITERIA, ALL_VERDICTS),
     requiresSandbox: false,
@@ -317,12 +381,7 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     fallbackModel: MODELS.anthropicOpus,
     criteria: ACT_CRITERIA,
     verdicts: ALL_VERDICTS,
-    skills: [
-      "wcag-state-transitions",
-      "wcag-operable",
-      "wcag-understandable",
-      "wcag-robust",
-    ],
+    skills: ACT_SKILLS,
     instructions: ACT_INSTRUCTIONS,
     responseFormat: buildFindingsResponseFormat(ACT_CRITERIA, ALL_VERDICTS),
     requiresSandbox: true,
@@ -338,7 +397,7 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     fallbackModel: MODELS.anthropicSonnet,
     criteria: PAGES_CRITERIA,
     verdicts: ALL_VERDICTS,
-    skills: ["wcag-cross-page"],
+    skills: ["wcag-understandable-consistency"],
     instructions: PAGES_INSTRUCTIONS,
     responseFormat: buildFindingsResponseFormat(PAGES_CRITERIA, ALL_VERDICTS),
     requiresSandbox: false,
@@ -355,7 +414,7 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     criteria: MEDIA_CRITERIA,
     // Opinion, never a decision: the enum on the wire contains FLAG alone.
     verdicts: FLAG_ONLY,
-    skills: ["wcag-media"],
+    skills: ["wcag-perceivable-media"],
     instructions: MEDIA_INSTRUCTIONS,
     responseFormat: buildFindingsResponseFormat(MEDIA_CRITERIA, FLAG_ONLY),
     requiresSandbox: false,
@@ -372,7 +431,7 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
     criteria: CODE_CRITERIA,
     // Whether an alternative is genuinely equivalent is a human call.
     verdicts: FLAG_ONLY,
-    skills: ["wcag-gestures"],
+    skills: ["wcag-gestures-source"],
     instructions: CODE_INSTRUCTIONS,
     responseFormat: buildFindingsResponseFormat(CODE_CRITERIA, FLAG_ONLY),
     requiresSandbox: false,
@@ -417,6 +476,59 @@ export const AGENT_ROSTER: Readonly<Record<AgentName, AgentDefinition>> = {
 export const AGENT_DEFINITIONS: readonly AgentDefinition[] = AGENT_NAMES.map(
   (name) => AGENT_ROSTER[name],
 );
+
+// ---------------------------------------------------------------------------
+// Skill / lane containment (A13.2)
+// ---------------------------------------------------------------------------
+
+/** Every criterion reachable through the skills this agent mounts. */
+export function criteriaCoveredBySkills(definition: AgentDefinition): string[] {
+  const covered = new Set<string>();
+  for (const skill of definition.skills) {
+    for (const id of SKILL_CRITERIA[skill] ?? []) covered.add(id);
+  }
+  return [...covered].sort();
+}
+
+/** Criteria an agent owns that no mounted skill covers. Informational, not fatal. */
+export function criteriaWithoutSkill(definition: AgentDefinition): string[] {
+  const covered = new Set(criteriaCoveredBySkills(definition));
+  return definition.criteria.filter((id) => !covered.has(id));
+}
+
+/**
+ * A13.2, enforced rather than asserted in prose: an agent may only mount a
+ * skill whose criteria it owns. A pack that reaches outside the lane would put
+ * another agent's normative text into this agent's context and let it emit
+ * findings its response schema rejects.
+ *
+ * Runs at module load. A violation is a programming error, not a runtime
+ * condition, so it throws.
+ */
+function assertSkillsWithinLane(): void {
+  const problems: string[] = [];
+  for (const definition of AGENT_DEFINITIONS) {
+    const owned = new Set(definition.criteria);
+    for (const skill of definition.skills) {
+      const criteria = SKILL_CRITERIA[skill];
+      if (criteria === undefined) {
+        problems.push(`${definition.name} mounts unknown skill "${skill}"`);
+        continue;
+      }
+      const outside = criteria.filter((id) => !owned.has(id));
+      if (outside.length > 0) {
+        problems.push(
+          `${definition.name} mounts "${skill}", which covers ${outside.join(", ")} — outside its lane`,
+        );
+      }
+    }
+  }
+  if (problems.length > 0) {
+    throw new Error(`Skill mounting violates A13.2:\n  ${problems.join("\n  ")}`);
+  }
+}
+
+assertSkillsWithinLane();
 
 export function getAgentDefinition(name: AgentName): AgentDefinition {
   return AGENT_ROSTER[name];
@@ -494,9 +606,15 @@ export function buildAgentSpec(
   definition: AgentDefinition,
   options: BuildAgentSpecOptions = {},
 ): AgentSpec {
-  const sandboxEnabled = definition.requiresSandbox && options.sandboxAvailable !== false;
   const configured = new Set(options.availableSkills ?? []);
   const skills = definition.skills.filter((name) => configured.has(name));
+  // Two reasons to enable the sandbox: the lane needs a filesystem to do its
+  // work, or it has skills to mount. TrueForge materialises a git-backed skill
+  // by cloning it into the sandbox, so `skills` is rejected without one — VIS,
+  // PAGES, MEDIA and CODE therefore get a sandbox they otherwise would not
+  // need, purely to hold their criterion packs (A13.2).
+  const sandboxEnabled =
+    options.sandboxAvailable !== false && (definition.requiresSandbox || skills.length > 0);
 
   const spec: AgentSpec = {
     model: { name: options.modelOverride ?? resolveModel(definition, options.availableModels) },

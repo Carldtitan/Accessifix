@@ -188,6 +188,12 @@ export const browserResultSchema = z.object({
   axTree: axTreeSchema.default({}),
   screenshot: screenshotRefSchema.nullable().default(null),
   axeViolations: z.array(axeViolationSchema).default([]),
+  /**
+   * Whether axe actually executed. An empty violations array from a page
+   * where axe never ran is indistinguishable from a clean page; reporting
+   * that as a pass is the worst result this tool can produce.
+   */
+  axeRan: z.boolean().default(false),
   /** Same-origin links found on the page, for the crawler (A2.2). */
   links: z.array(z.string()).default([]),
   paths: z.array(pathResultSchema).default([]),
@@ -211,6 +217,15 @@ export interface PageCapture {
   /** Base64 PNG. Downloaded from the sandbox rather than carried over stdout. */
   screenshot: string | null;
   axeViolations: AxeViolation[];
+  /**
+   * Whether axe actually executed on this page.
+   *
+   * An empty `axeViolations` array from a page where axe never ran is
+   * indistinguishable from a genuinely clean page. Reporting that as a pass
+   * is the worst result this tool can produce, so the audit layer believes a
+   * clean axe result only when this is true.
+   */
+  axeRan: boolean;
   links: string[];
   warnings: string[];
 }

@@ -42,7 +42,6 @@ import {
 import { emitEvent } from './events';
 import { completeJob, failJob, listJobs } from './jobs';
 import { recordFindings, type FindingClaim } from './ledger';
-import { claimRun, holdLease, type LeaseHandle } from './lease';
 import { isRunning, startRun, type RunPipelineOptions } from './orchestrate';
 import {
   isTerminal,
@@ -438,24 +437,12 @@ export interface ResumeResult {
  * Pick an interrupted run back up.
  *
  * Order matters:
- *   0. take the conductor lease, *before touching anything*;
  *   1. reattach to live TrueForge sessions, so nothing already paid for is
  *      thrown away;
  *   2. release job rows the dead process left `running`, so the conductor is
  *      free to redo only what was actually lost;
- *   3. hand the run - and the lease - to `startRun`, which skips every state it
- *      is already past and every job row that already succeeded.
- *
- * Step 0 used to be step 3, inside `startRun`, and that was the wrong way
- * round. Steps 1 and 2 are not inspection: reattaching polls a live harness
- * session and completes or fails its job row, and the stranded sweep rewrites
- * `running` rows to `pending`. Performed without ownership - by a boot sweep on
- * a second instance, or by a request arriving during a rolling deploy - they
- * reach into a run a healthy conductor is still working, resetting its active
- * job to pending so the work is started twice, and only *afterwards* does
- * `startRun` discover the lease was never available. Ownership has to come
- * first, and it has to be the same ownership the conductor then runs under,
- * which is why the live handle is handed across rather than claimed twice.
+ *   3. hand the run back to `startRun`, which skips every state it is already
+ *      past and every job row that already succeeded.
  */
 export async function resumeRun(
   runId: string,
@@ -487,60 +474,6 @@ export async function resumeRun(
     };
   }
 
-  /*
-   * Ownership, before the first mutation.
-   *
-   * A refused claim means a live conductor holds this run, and there is nothing
-   * to recover: it is not interrupted, it is working. Returning here leaves
-   * every job row exactly as that conductor left it.
-   */
-  const claim = await claimRun(runId);
-  if (!claim.ok) {
-    return {
-      runId,
-      resumed: false,
-      state: snapshot.state,
-      reason: `Not resumed: ${claim.reason}`,
-      reattached: [],
-    };
-  }
-
-  /*
-   * Renew in the background from here on. Reattaching polls the harness with a
-   * sixty-second timeout per session, so recovery alone can outlive a lease
-   * that is not being kept alive - and a lease that lapses mid-recovery is the
-   * same split ownership this claim exists to prevent.
-   */
-  const lease = holdLease(runId, { owner: claim.owner });
-
-  try {
-    return await recoverAndStart(runId, snapshot, lease, options);
-  } catch (error) {
-    /*
-     * Recovery failed, so nothing will conduct this run and the lease should
-     * not sit out its TTL delaying the next sweep - unless a conductor started
-     * in this process while recovery was in flight, in which case the row is
-     * now that conductor's and deleting it would evict a healthy run.
-     */
-    if (isRunning(runId)) lease.detach();
-    else await lease.release();
-    throw error;
-  }
-}
-
-/**
- * The recovery itself, performed under a lease this process already holds.
- *
- * Split out so the lease is released on exactly one path: this function hands
- * the handle to `startRun`, which owns it from the moment the run starts, and
- * releases it itself on every path where the run does not start.
- */
-async function recoverAndStart(
-  runId: string,
-  snapshot: ResumeSnapshot,
-  lease: LeaseHandle,
-  options: RunPipelineOptions,
-): Promise<ResumeResult> {
   await emitEvent({
     runId,
     type: 'log',
@@ -587,16 +520,7 @@ async function recoverAndStart(
       .where(inArray(pipelineJobs.id, stranded));
   }
 
-  /*
-   * Hand the lease across rather than letting `startRun` claim a second one.
-   *
-   * The conductor then runs under the very lease this recovery was performed
-   * under, so ownership is continuous from the first job row rewritten to the
-   * last phase executed. `startRun` owns the handle from here: it releases it
-   * when the run ends, and detaches rather than releases if it declines,
-   * because a decline means another conductor in this process holds the row.
-   */
-  const { started, reason } = await startRun(runId, { ...options, lease });
+  const { started, reason } = await startRun(runId, options);
 
   return {
     runId,

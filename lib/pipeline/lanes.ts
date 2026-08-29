@@ -42,27 +42,8 @@ import type { FindingClaim } from './ledger';
 /* Audit lanes                                                                */
 /* -------------------------------------------------------------------------- */
 
-/**
- * Cancellation, offered to everything the conductor dispatches.
- *
- * The conductor aborts when the run is cancelled and when it loses its
- * conductor lease to another process. Neither reaches work that never accepted
- * a signal, and until this field existed none of the contracts below did - so a
- * displaced conductor kept writing findings, running builds and opening pull
- * requests beside its successor.
- *
- * Optional, so an implementation that does not yet honour it still satisfies
- * the contract. Honouring it is the difference between the conductor asking
- * work to stop and the work actually stopping; `orchestrate.ts` additionally
- * re-confirms ownership against the database before every durable and external
- * write, which is what bounds the damage until every lane reads this.
- */
-export interface Cancellable {
-  signal?: AbortSignal;
-}
-
 /** What a per-page lane is handed. */
-export interface AuditPageInput extends Cancellable {
+export interface AuditPageInput {
   runId: string;
   phase: RunPhase;
   pageId: string;
@@ -86,13 +67,61 @@ export type ActLane = (
 ) => Promise<AuditLaneResult>;
 
 /** PAGES receives the whole crawl at once (A3.5). */
-export type PagesLane = (
-  input: Cancellable & {
-    runId: string;
-    phase: RunPhase;
-    pages: readonly AuditPageInput[];
-  },
-) => Promise<AuditLaneResult>;
+export type PagesLane = (input: {
+  runId: string;
+  phase: RunPhase;
+  pages: readonly AuditPageInput[];
+}) => Promise<AuditLaneResult>;
+
+/* -------------------------------------------------------------------------- */
+/* Vision candidates (A4.2)                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * One control the VIS model believes it can see in a screenshot.
+ *
+ * Structurally the shape `lib/paths` diffs against. Declared here rather than
+ * imported so the conductor's contract stays readable in one file.
+ */
+export interface VisionCandidate {
+  label: string;
+  approxSelector: string;
+  /** The model's own word for the shape: `button`, `dropdown`, `tab icon`, ... */
+  looksLike: string;
+  /** The model's certainty, already damped by how it came by the label. */
+  confidence?: number;
+}
+
+/**
+ * The screenshot pass that gives path enumeration its second source.
+ *
+ * Path enumeration reads the accessibility tree itself. It cannot read a
+ * screenshot, so the list of things a *sighted* user can see has to come from
+ * somewhere else, and this is it. Subtracting one from the other is what
+ * produces a div-button finding — a control with no counterpart in the tree —
+ * and without this call enumeration runs tree-only and cannot produce one at
+ * all.
+ *
+ * Contractually total: it reports failure in `error` and returns an empty list
+ * rather than throwing, because a page whose vision pass failed is still worth
+ * enumerating from the tree.
+ */
+export type ExtractVisionCandidates = (input: {
+  runId?: string;
+  pageUrl: string;
+  /** Base64 PNG from the crawl. No page is reopened for this. */
+  screenshot: string | null;
+  title?: string | null;
+  signal?: AbortSignal;
+}) => Promise<{
+  candidates: readonly VisionCandidate[];
+  /** A12.1: recorded on the job row so a restart reattaches rather than re-running. */
+  sessionId: string | null;
+  /** Set when the pass failed; the caller degrades to tree-only. */
+  error: string | null;
+  /** Set when the pass was not attempted — no screenshot, or one too large to send. */
+  skipped: string | null;
+}>;
 
 /* -------------------------------------------------------------------------- */
 /* FIX (A5)                                                                   */
@@ -112,7 +141,7 @@ export interface ProposedPatch {
   findingIds?: readonly string[];
 }
 
-export type WritePatches = (input: Cancellable & {
+export type WritePatches = (input: {
   runId: string;
   repoFullName: string;
   /** The user's own GitHub token (A1.4). */
@@ -130,7 +159,7 @@ export type WritePatches = (input: Cancellable & {
 /* VERIFY (A6)                                                                */
 /* -------------------------------------------------------------------------- */
 
-export type VerifyPatches = (input: Cancellable & {
+export type VerifyPatches = (input: {
   runId: string;
   repoFullName: string;
   accessToken: string;
@@ -155,7 +184,7 @@ export type VerifyPatches = (input: Cancellable & {
 /* GitHub (A1.4, A10.5)                                                       */
 /* -------------------------------------------------------------------------- */
 
-export type OpenPullRequest = (input: Cancellable & {
+export type OpenPullRequest = (input: {
   runId: string;
   repoFullName: string;
   accessToken: string;
@@ -186,6 +215,7 @@ import {
   runPagesLane as pagesLane,
 } from '@/lib/audit';
 import { enumerateInteractionPaths as enumeratePathsImpl } from '@/lib/paths';
+import { extractVisionCandidates as extractVisionCandidatesImpl } from '@/lib/vision';
 import { writePatches as writePatchesImpl } from '@/lib/fix';
 import { verifyPatches as verifyPatchesImpl } from '@/lib/verify';
 import { openPullRequest as openPullRequestImpl } from '@/lib/github';
@@ -199,16 +229,30 @@ export const runCodeLane: PerPageLane = codeLane;
 export const runPagesLane: PagesLane = pagesLane;
 
 /**
+ * The screenshot pass (A4.2). Runs immediately before enumeration, on the
+ * screenshot the crawl already took.
+ */
+export const extractVisionCandidates: ExtractVisionCandidates =
+  extractVisionCandidatesImpl;
+
+/**
  * Path enumeration (A4.1, A4.2).
  *
  * Returns both the paths ACT will drive and the findings the enumeration itself
  * produced — a control vision can see that the accessibility tree cannot is a
  * finding the moment it is noticed, not something ACT has to confirm.
+ *
+ * `visionCandidates` is what makes that second kind possible. It is optional
+ * and its absence is not an error: with no list, enumeration falls back to the
+ * tree alone, which still finds every stale-state 4.1.2 but cannot find a
+ * div-button, because a div-button is by definition what the tree does not
+ * contain. The conductor supplies it from `extractVisionCandidates` above.
  */
-export const enumerateInteractionPaths: (input: Cancellable & {
+export const enumerateInteractionPaths: (input: {
   runId: string;
   pageUrl: string;
   capture: PageCapture;
+  visionCandidates?: readonly VisionCandidate[];
 }) => Promise<{
   paths: readonly InteractionPath[];
   findings: readonly FindingClaim[];

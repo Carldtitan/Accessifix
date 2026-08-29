@@ -135,53 +135,13 @@ export async function isLeased(runId: string): Promise<boolean> {
   return Boolean(lease && lease.expiresAt.getTime() > Date.now());
 }
 
-/**
- * Thrown when a conductor discovers it no longer owns the run.
- *
- * A distinct type because losing a lease is an *ownership handoff*, not a
- * pipeline failure, and the two must not be handled alike. A conductor whose
- * lease expired while it was paused is looking at a run that a healthy
- * successor is now conducting; writing `failed` on it would kill somebody
- * else's working run. Modelled on `JobLockedError`, which the conductor already
- * treats as "stand down quietly".
- */
-export class LeaseLostError extends Error {
-  readonly runId: string;
-
-  constructor(runId: string, message: string) {
-    super(message);
-    this.name = 'LeaseLostError';
-    this.runId = runId;
-  }
-}
-
 export interface LeaseHandle {
   runId: string;
   owner: string;
   /** Stop renewing and drop the row. Safe to call twice. */
   release(): Promise<void>;
-  /**
-   * Stop renewing but leave the row standing. Safe to call twice.
-   *
-   * For handing a claim over to something that is already holding it. Owner
-   * identity is per *process*, not per handle, so two handles taken out in one
-   * process name the same row - and `release` on either would delete a lease
-   * the other is still conducting under, which reads to that conductor as
-   * having lost the run. Detaching gives up the timer and keeps the ownership.
-   */
-  detach(): void;
   /** Resolves when the lease is lost to another conductor. */
   readonly lost: Promise<void>;
-  /**
-   * The reason this lease was lost, or `null` while it is still held.
-   *
-   * Synchronous on purpose. A `catch` block has to decide between "this run
-   * failed" and "this run is no longer mine" without awaiting anything, and an
-   * aborted operation can surface as any error at all - the abort reason only
-   * propagates from the few APIs that accept a signal. This is the answer that
-   * does not depend on which error came back.
-   */
-  readonly lostReason: string | null;
 }
 
 /**
@@ -198,7 +158,6 @@ export function holdLease(
   const owner = options.owner ?? conductorId();
 
   let released = false;
-  let lostReason: string | null = null;
   let signalLost: () => void = () => undefined;
   const lost = new Promise<void>((resolve) => {
     signalLost = resolve;
@@ -219,8 +178,9 @@ export function holdLease(
 
       clearInterval(timer);
       released = true;
-      lostReason = `The conductor lease on run ${runId} expired and was taken by another process.`;
-      options.onLost?.(lostReason);
+      options.onLost?.(
+        `The conductor lease on run ${runId} expired and was taken by another process.`,
+      );
       signalLost();
     })();
   }, LEASE_RENEW_MS);
@@ -232,63 +192,11 @@ export function holdLease(
     runId,
     owner,
     lost,
-    get lostReason() {
-      return lostReason;
-    },
-    detach() {
-      if (released) return;
-      released = true;
-      clearInterval(timer);
-    },
     async release() {
-      /*
-       * A lost lease is already gone and already belongs to someone else.
-       * `releaseLease` is owner-scoped so it would delete nothing, but not
-       * calling it at all is the clearer statement: this conductor has no row
-       * left to give up.
-       */
       if (released) return;
       released = true;
       clearInterval(timer);
       await releaseLease(runId, owner).catch(() => undefined);
     },
   };
-}
-
-/**
- * Confirm this process still owns the run, immediately before a durable or
- * external write.
- *
- * Renewal doubles as the check: `renewLease` updates only a row whose owner is
- * still us, so a `false` means the lease was taken. Aborting an
- * `AbortController` does not reach work that never accepted a signal, so this
- * is the guard that actually stops a displaced conductor from writing findings,
- * moving the run's state, or opening a second pull request beside its
- * successor.
- *
- * A database error is not proof of anything and does not stop the run: the
- * renewal loop is three beats wide for exactly that reason, and refusing to
- * proceed on a blip would turn a transient outage into a failed run.
- */
-export async function assertLeaseHeld(lease: LeaseHandle | null | undefined, before: string): Promise<void> {
-  if (!lease) return;
-
-  if (lease.lostReason !== null) {
-    throw new LeaseLostError(lease.runId, `${lease.lostReason} Stood down before ${before}.`);
-  }
-
-  let held: boolean;
-  try {
-    held = await renewLease(lease.runId, lease.owner);
-  } catch {
-    return;
-  }
-
-  if (!held) {
-    throw new LeaseLostError(
-      lease.runId,
-      `The conductor lease on run ${lease.runId} is no longer held by ${lease.owner}; ` +
-        `another process has taken this run. Stood down before ${before}.`,
-    );
-  }
 }

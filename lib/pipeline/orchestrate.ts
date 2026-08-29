@@ -55,6 +55,7 @@ import { crawl, type CrawledPage } from './crawl';
 // this one seam. See `lanes.ts` for the contract each is held to.
 import {
   enumerateInteractionPaths,
+  extractVisionCandidates,
   openPullRequest,
   runActLane,
   runCodeLane,
@@ -69,7 +70,7 @@ import {
 } from './lanes';
 import { emitEvent } from './events';
 import { awaitHandoff, loadHandoff, raiseHandoff } from './handoff';
-import { assertLeaseHeld, claimRun, holdLease, LeaseLostError, type LeaseHandle } from './lease';
+import { claimRun, holdLease, type LeaseHandle } from './lease';
 import {
   attachSession,
   beginJob,
@@ -116,12 +117,6 @@ export interface RunPipelineOptions {
    *
    * Set by `startRun`. When absent, `executeRun` claims one itself, so calling
    * it directly (a test, a script) is still exclusive.
-   *
-   * A caller may also claim the lease itself and hand the live handle in -
-   * `resumeRun` does, because it mutates job rows *before* the conductor
-   * starts and must not do that without ownership. `startRun` then adopts the
-   * handle rather than claiming a second time, and releases it when the run
-   * ends, so ownership passes across in one piece.
    */
   lease?: LeaseHandle;
 }
@@ -179,19 +174,18 @@ export async function startRun(
   options: RunPipelineOptions = {},
 ): Promise<StartRunOutcome> {
   if (activeRuns.has(runId)) {
-    /*
-     * A conductor in this process already has the run - and, being this
-     * process, it holds the very lease row that was handed in, because owner
-     * identity is per process. Stop renewing that handle, but do not delete the
-     * row: it is the running conductor's ownership, and releasing it here would
-     * read to that conductor as having lost the run to somebody else.
-     */
-    options.lease?.detach();
     return {
       started: false,
       alreadyRunning: true,
       reason: 'A conductor in this process is already running this run.',
     };
+  }
+
+  // The durable half. A lease held by a live conductor in any process refuses
+  // the claim; one whose owner died has expired and is taken over here.
+  const claim = await claimRun(runId);
+  if (!claim.ok) {
+    return { started: false, alreadyRunning: true, reason: claim.reason };
   }
 
   const controller = new AbortController();
@@ -200,43 +194,9 @@ export async function startRun(
     else options.signal.addEventListener('abort', () => controller.abort(options.signal?.reason), { once: true });
   }
 
-  /*
-   * The durable half of exclusivity.
-   *
-   * Normally claimed here: a lease held by a live conductor in any process
-   * refuses the claim, and one whose owner died has expired and is taken over.
-   *
-   * A caller that had to establish ownership *before* calling - `resumeRun`,
-   * which rewrites job rows the dead process left behind - hands its live
-   * handle in instead. Adopting it rather than claiming again matters: a second
-   * `claimRun` would succeed (it is re-entrant for the same owner) but would
-   * leave two renewal timers on one row, and the second `release` would delete
-   * a lease the first still believed it held.
-   */
-  let lease: LeaseHandle;
-  let reason: string;
-
-  if (options.lease) {
-    lease = options.lease;
-    reason = `Run ${runId} is conducted by ${lease.owner}.`;
-  } else {
-    const claim = await claimRun(runId);
-    if (!claim.ok) {
-      return { started: false, alreadyRunning: true, reason: claim.reason };
-    }
-    lease = holdLease(runId, { owner: claim.owner });
-    reason = claim.reason;
-  }
-
-  /*
-   * Losing the lease aborts the conductor. `lost` rather than `onLost` because
-   * a handed-over handle was constructed by somebody else and carries no
-   * callback of ours; `lost` resolves for both.
-   */
-  void lease.lost.then(() => {
-    controller.abort(
-      new LeaseLostError(runId, lease.lostReason ?? `The conductor lease on run ${runId} was lost.`),
-    );
+  const lease = holdLease(runId, {
+    owner: claim.owner,
+    onLost: (reason) => controller.abort(new Error(reason)),
   });
 
   const promise = executeRun(runId, { ...options, signal: controller.signal, lease })
@@ -249,7 +209,7 @@ export async function startRun(
     });
 
   activeRuns.set(runId, { controller, promise, startedAt: Date.now() });
-  return { started: true, alreadyRunning: false, reason };
+  return { started: true, alreadyRunning: false, reason: claim.reason };
 }
 
 /** Ask a running pipeline to stop. The run is then failed with the reason. */
@@ -272,22 +232,6 @@ interface PipelineContext {
   phase: RunPhase;
   signal?: AbortSignal;
   options: RunPipelineOptions;
-  /** The lease this run is being conducted under. Absent for a direct call. */
-  lease?: LeaseHandle;
-}
-
-/**
- * Confirm ownership immediately before a side effect, and throw if it is gone.
- *
- * The conductor aborts an `AbortController` when it loses its lease, but that
- * only stops work which accepted the signal - the crawl and the handoff wait.
- * The audit lanes, FIX, VERIFY and the pull request take none, so an abort
- * leaves them running to completion and writing as they go. This is the
- * checkpoint that stops the *effects*: every durable write and every external
- * one is preceded by a question the database answers.
- */
-async function stillOurs(context: PipelineContext, before: string): Promise<void> {
-  await assertLeaseHeld(context.lease, before);
 }
 
 export type { AuditPageInput } from './lanes';
@@ -331,23 +275,15 @@ export async function executeRun(runId: string, options: RunPipelineOptions = {}
         });
       }
     }
-    ownLease = holdLease(runId, { owner: claim.owner });
-    const held = ownLease;
-    void held.lost.then(() => {
-      controller.abort(
-        new LeaseLostError(runId, held.lostReason ?? `The conductor lease on run ${runId} was lost.`),
-      );
+    ownLease = holdLease(runId, {
+      owner: claim.owner,
+      onLost: (reason) => controller.abort(new Error(reason)),
     });
     signal = controller.signal;
   }
 
   try {
-    /*
-     * The lease travels with the options so every phase can re-confirm
-     * ownership before it writes. Aborting a signal only reaches work that
-     * accepted one, and most of what this pipeline dispatches does not.
-     */
-    await conductRun(runId, { ...options, signal, lease: options.lease ?? ownLease ?? undefined });
+    await conductRun(runId, { ...options, signal });
   } finally {
     await ownLease?.release();
   }
@@ -371,7 +307,6 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     phase: row.run.phase,
     signal: options.signal,
     options,
-    lease: options.lease,
   };
 
   const releaseBudget = bindSandboxBudget(runId, row.run.maxSandboxes);
@@ -401,17 +336,14 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     const crawled = await crawlPhase(context);
 
     /* ---- 1-3. Audit --------------------------------------------------- */
-    await stillOurs(context, 'the audit lanes');
     if (reached('auditing')) await enterState(runId, 'auditing');
     await auditPhase(context, crawled);
 
     /* ---- Baseline score ------------------------------------------------ */
-    await stillOurs(context, 'scoring');
     if (reached('scoring')) await enterState(runId, 'scoring');
     await scorePhase(context, crawled[0]?.url ?? context.deployedUrl);
 
     if (options.baselineOnly) {
-      await stillOurs(context, 'finishing a baseline-only run');
       await transition(runId, 'done', { reason: 'Baseline only: fixes were not requested.' });
       return;
     }
@@ -436,7 +368,6 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
       return;
     }
 
-    await stillOurs(context, 'writing patches');
     if (reached('fixing')) await enterState(runId, 'fixing');
     const proposed = await fixPhase(context, token, decidable);
 
@@ -448,7 +379,6 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     }
 
     /* ---- 5. Verify ----------------------------------------------------- */
-    await stillOurs(context, 'verifying patches');
     if (reached('verifying')) await enterState(runId, 'verifying');
     const verification = await verifyPhase(context, token, proposed);
 
@@ -460,7 +390,6 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     }
 
     /* ---- 6. Pull request, then the final score -------------------------- */
-    await stillOurs(context, 'raising the approval handoff');
     const approved = await pullRequestGate(context, verification.reason);
     if (!approved) {
       await transition(runId, 'done', {
@@ -469,23 +398,9 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
       return;
     }
 
-    /*
-     * The one checkpoint that is not merely hygiene.
-     *
-     * The approval gate can hold a run for hours, which is many lease TTLs; if
-     * this process was paused across that window the run may already belong to
-     * a successor that is about to open its own pull request. Opening a second
-     * one against a user's repository is the least reversible thing this
-     * pipeline can do, so ownership is re-confirmed against the database on the
-     * far side of the wait, not merely assumed from having entered it.
-     */
-    await stillOurs(context, 'opening the pull request');
     await prPhase(context, token, proposed, verification.criteriaFixed);
-
-    await stillOurs(context, 'the final audit');
     await finalAuditPhase(context, verification.previewUrl ?? context.deployedUrl);
 
-    await stillOurs(context, 'marking the run done');
     await transition(runId, 'done');
   } catch (error) {
     /*
@@ -500,32 +415,6 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
         type: 'log',
         summary: 'Another conductor is working this run; standing down.',
         detail: error.message,
-      });
-      return;
-    }
-
-    /*
-     * Losing the lease is an ownership handoff, not a pipeline failure.
-     *
-     * By the time this conductor notices, a successor has already taken the
-     * expired lease and is conducting the run. Calling `failRun` here would
-     * mark *its* run failed - the displaced process reaching across and killing
-     * a healthy one - which is worse than the stall the lease exists to fix.
-     *
-     * The second arm catches the case the exception type cannot: an abort only
-     * carries its reason out of the handful of APIs that accept a signal, so an
-     * interrupted phase can surface as any error at all. The lease handle knows
-     * regardless of what was thrown.
-     */
-    const leaseLost =
-      error instanceof LeaseLostError ? error.message : (options.lease?.lostReason ?? null);
-
-    if (leaseLost !== null) {
-      await emitEvent({
-        runId,
-        type: 'log',
-        summary: 'This conductor lost its lease; standing down without touching the run state.',
-        detail: leaseLost,
       });
       return;
     }
@@ -618,7 +507,6 @@ async function auditPhase(context: PipelineContext, crawled: CrawledPage[]): Pro
     pageId: page.pageId,
     pageUrl: page.url,
     capture: page.capture,
-    signal: context.signal,
   }));
 
   /* -- 2b. MEDIA first, awaited last. Its own queue, never blocks browsers. */
@@ -677,7 +565,6 @@ async function auditPhase(context: PipelineContext, crawled: CrawledPage[]): Pro
         runId: context.runId,
         phase: context.phase,
         pages: inputs,
-        signal: context.signal,
       });
       await attach({ sessionId: outcome.sessionId ?? null });
       await recordFindings({
@@ -729,19 +616,7 @@ async function laneOverPages(
   });
 
   await mapLimit(inputs, spec.concurrency, async (input) => {
-    /*
-     * Two cancellation questions, and both are cheap.
-     *
-     * `aborted` covers an explicit stop. `lostReason` covers the case an abort
-     * cannot: a lease taken by another process, where the successor is already
-     * auditing these same pages and a second set of rows through
-     * `recordFindings` would be duplicate work charged to the same run. Asked
-     * per page rather than per phase because a lane over 25 pages is minutes
-     * long, and asked synchronously off the handle rather than against the
-     * database, which the phase boundaries already do.
-     */
     if (context.signal?.aborted) return;
-    if (context.lease?.lostReason) return;
 
     await runJob(
       {
@@ -784,9 +659,25 @@ async function laneOverPages(
 /**
  * Enumerate interaction paths per page (A4.1, A4.2).
  *
- * The discrepancy findings — a control vision can see that the accessibility
- * tree cannot — come back from the same call and go straight into the ledger.
- * They are the div-button findings, and they are the point.
+ * Two sources, and the job is only worth doing because there are two.
+ *
+ * The accessibility tree, enumeration reads for itself: every node whose role
+ * implies a state, every node already carrying `aria-expanded` and friends.
+ * That list alone is enough to catch a stale-state 4.1.2 — a control whose
+ * declared state never moves while the tree beneath it does — because both
+ * halves of that comparison live in the tree.
+ *
+ * The second source is a screenshot, and reading one needs a model. That is
+ * `extractVisionCandidates`, called here on the PNG the crawl already took —
+ * no page is reopened and no sandbox is taken. Subtracting the tree from what
+ * vision saw leaves the controls a sighted user can operate and a screen reader
+ * user is never told about: the div-buttons. They are findings the moment they
+ * are noticed, before anything has been clicked, and they are the point.
+ *
+ * The vision pass is best-effort by contract. A page whose screenshot is
+ * missing, too large to send, or whose model call failed is enumerated from the
+ * tree alone and says so on the timeline. Degrading is correct; failing the
+ * page is not.
  */
 async function enumeratePaths(
   context: PipelineContext,
@@ -803,13 +694,26 @@ async function enumeratePaths(
         agent: 'VIS',
       },
       async ({ attach }) => {
+        const vision = await extractVisionCandidates({
+          runId: context.runId,
+          pageUrl: input.pageUrl,
+          screenshot: input.capture.screenshot,
+          title: input.capture.title,
+        });
+
+        // Attached before enumeration so a crash mid-enumeration still leaves a
+        // session the restart can reattach to rather than pay for twice (A12.1).
+        await attach({ sessionId: vision.sessionId });
+        await reportVisionPass(context.runId, input.pageUrl, vision);
+
         const enumerated = await enumerateInteractionPaths({
           runId: context.runId,
           pageUrl: input.pageUrl,
           capture: input.capture,
-          signal: context.signal,
+          visionCandidates: vision.candidates,
         });
-        await attach({ sessionId: enumerated.sessionId ?? null });
+        // Enumeration itself is pure and calls no model, so the vision pass is
+        // the only session this job ever has.
 
         if (enumerated.findings.length > 0) {
           await recordFindings({
@@ -817,7 +721,7 @@ async function enumeratePaths(
             phase: context.phase,
             agent: 'VIS',
             pageId: input.pageId,
-            sessionId: enumerated.sessionId ?? null,
+            sessionId: vision.sessionId,
             claims: enumerated.findings,
           });
         }
@@ -838,6 +742,44 @@ async function enumeratePaths(
   });
 
   return byPage;
+}
+
+/**
+ * Put the screenshot pass on the run timeline (A11.1).
+ *
+ * Worth an event of its own rather than folding into the enumeration line: the
+ * number of candidates is how an operator tells "the tree had nothing to
+ * subtract from" apart from "vision found nothing", and a page silently
+ * enumerated tree-only is exactly the state that looks like a clean bill of
+ * health and is not.
+ */
+async function reportVisionPass(
+  runId: string,
+  pageUrl: string,
+  vision: Awaited<ReturnType<typeof extractVisionCandidates>>,
+): Promise<void> {
+  const degraded = vision.error !== null || vision.skipped !== null;
+  const why = vision.error ?? vision.skipped ?? '';
+
+  await emitEvent({
+    runId,
+    type: degraded ? 'log' : 'job',
+    agent: 'VIS',
+    capability: 'model',
+    summary: degraded
+      ? `Vision pass produced no candidates for ${pageUrl}; enumerating from the accessibility tree alone.`
+      : `Vision identified ${vision.candidates.length} candidate control(s) on ${pageUrl}.`,
+    detail: degraded
+      ? `${why} Tree-only enumeration still finds stale-state 4.1.2 failures, but cannot find a control the tree does not contain.`
+      : null,
+    data: {
+      pageUrl,
+      candidates: vision.candidates.length,
+      sessionId: vision.sessionId,
+      skipped: vision.skipped,
+      error: vision.error,
+    },
+  });
 }
 
 /* -------------------------------------------------------------------------- */
@@ -999,7 +941,6 @@ async function fixPhase(
           repoFullName: context.repoFullName,
           accessToken: token,
           findings: forFile,
-          signal: context.signal,
         });
         await attach({ sessionId: outcome.sessionId ?? null });
 
@@ -1146,7 +1087,6 @@ async function verifyPhase(
         filePath: patch.filePath,
         diff: patch.diff,
       })),
-      signal: context.signal,
     });
 
     await attachSession(job.id, { sessionId: outcome.sessionId ?? null });
@@ -1349,7 +1289,6 @@ async function prPhase(
         runId: context.runId,
         repoFullName: context.repoFullName,
         accessToken: token,
-        signal: context.signal,
         branch: `accessifix/run-${context.runId.slice(0, 8)}`,
         title: `Accessibility fixes for ${criteria.length} WCAG 2.2 criteria`,
         // A10.5: the body cites each criterion, which is also what makes the

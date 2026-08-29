@@ -9,7 +9,6 @@ export {
   PIPELINE_STATES,
   RESUMABLE_STATES,
   STATE_ORDER,
-  SWEEPABLE_STATES,
   TERMINAL_STATES,
   IllegalTransitionError,
   RunNotFoundError,
@@ -54,7 +53,6 @@ export {
   startRun,
   type AuditPageInput,
   type RunPipelineOptions,
-  type StartRunOutcome,
 } from './orchestrate';
 
 export {
@@ -92,7 +90,6 @@ export {
   loadHandoff,
   pendingHandoffs,
   raiseHandoff,
-  type AnswerOutcome,
   type HandoffDecision,
 } from './handoff';
 
@@ -104,26 +101,10 @@ export {
 } from './events';
 
 export {
-  blockedAddressReason,
   checkDeployedUrl,
-  resolveToPublicAddresses,
   validateDeployedUrl,
-  type AddressCheck,
   type ReachabilityResult,
 } from './reachability';
-
-export {
-  assertLeaseHeld,
-  claimRun,
-  conductorId,
-  isLeased,
-  LeaseLostError,
-  loadLease,
-  releaseLease,
-  renewLease,
-  type LeaseClaim,
-  type LeaseHandle,
-} from './lease';
 
 export {
   currentUser,
@@ -136,7 +117,6 @@ export {
 } from './access';
 
 export {
-  JobLockedError,
   findJobByHandoff,
   listJobs,
   type JobContext,
@@ -148,10 +128,8 @@ export {
   PIPELINE_PHASES,
   pipelineJobs,
   runEvents,
-  runLeases,
   type EventCapability,
   type PipelineJob,
   type PipelinePhase,
   type RunEvent,
-  type RunLease,
 } from './schema';

@@ -59,17 +59,30 @@ pushes are rejected for everyone including the repository owner.
 
 ---
 
-## PR #8 — Task 9: pipeline orchestrator, state machine and API routes
+## PR #7 — Task 4: deterministic TREE engine and the before/after score
 
-- **Link:** https://github.com/Carldtitan/Accessifix/pull/8
-- **Qodo found:** 9 bugs — deployed-URL SSRF; conductors lack durable ownership; reattached work runs again; scoring runs never resume; approval race reverses the decision; resume duplicates approval gates; finding dedupe races; the terminal SSE event can disappear; redirects corrupt crawl identity.
+- **Link:** https://github.com/Carldtitan/Accessifix/pull/7
+- **Qodo found:** 8 bugs — disabled axe appears successful; link purpose ignores context (x2); input type assumes user data; zoom lock treated as proof of no reflow; unmeasured target spacing becomes a failure; clean pages disappear from the score; new-password fields expected the current-password token.
 - **We changed:**
-  - **SSRF, the serious one.** A user-supplied target URL was fetched with no address vetting, so it could reach localhost or private ranges from our server. Now rejects URL credentials, localhost and private IP literals, covers the IANA special-purpose ranges for both families, and unwraps IPv4-mapped, 6to4 and NAT64 IPv6 so `::ffff:127.0.0.1` cannot slip past. Hostnames resolve first and the name is refused if *any* answer is private — the rebinding case. Redirects moved from `follow` to `manual` with a 5-hop loop that re-vets every destination.
-  - **Durable run ownership.** Exclusivity was process-local, so a restart or a second instance could drive the same pipeline twice — duplicate sandboxes, duplicate spend, duplicate findings. Now an atomic conditional upsert on `run_id` with a 60s TTL renewed every 20s; losing the lease aborts the conductor. `beginJob` refuses to reset a row that is running and not stale, since resetting would discard a live TrueForge session.
-  - **Resume replays instead of re-running.** A finished turn's output is parsed and replayed *through* `recordFindings()`, preserving the only-writer invariant. The stranded-job filter was resetting still-running turns to pending — the exact duplicate-work case it existed to prevent.
-  - `prPhase()` had no `fromResult`, so a resumed run would have opened a **second pull request**.
-  - Approval races now derive `approved` from the persisted status and return `applied: false` with the standing decision rather than reversing it.
-  - Dedupe moved inside the insert transaction under a `pg_advisory_xact_lock` keyed on run+phase.
-  - The terminal SSE event can no longer be lost: subscribe-then-replay with buffering, and a final catch-up read on close that consults the durable lease rather than process-local state.
-  - A redirect no longer keys the row to the requested URL while the audit describes the landed one.
-- **We dismissed:** Nothing outright. One deviation: Qodo suggested a unique constraint on `findings` for the dedupe race; that table is in `lib/db/schema.ts`, outside this PR's scope, and the advisory lock closes the same race without a migration. Noted in the code.
+  - **The most serious one: `axeRan` was derived from "violations is not `undefined`"**, but `PageCapture` defaults that to `[]` and callers can pass `job: { axe: false }`. A page where axe never ran was indistinguishable from a page with no violations, so contrast and every other axe-dependent criterion **passed untested**. A false pass is worse than no result — it is the failure that makes an audit worthless. Execution is now believed only on an explicit flag, a supplied passes/incomplete set, or at least one violation actually returning.
+  - 2.4.4 asks about link purpose *in context*, so context is now required: generic names fail only when captured context adds nothing beyond the name, and shared names fail only when name + context resolves to two different destinations. The AX-tree path no longer emits findings at all, since the tree carries no context.
+  - A `type="email"` field no longer implies the address belongs to the *user* — an invitation form's recipient box is not a 1.3.5 failure. The field's own name/label establishes scope first.
+  - A zoom lock no longer fails 1.4.10. It files 1.4.4 Resize Text, where W3C's ACT rule actually applies, and leaves reflow inconclusive pending a real 320px measurement. Needed a new `CheckResult.related` field for findings a check proves on someone else's behalf.
+  - Unmeasured target spacing now means "the 2.5.8 exception was not tested", not "no clearance".
+  - `pagesAudited` no longer derives from findings, which erased every page that passed cleanly — precisely the wrong pages to lose.
+  - Password fields resolve to an accepted *set* — `new-password`, `current-password`, or both when ambiguous — so a correctly marked signup field is no longer failed for using the right token.
+- **We dismissed:** One partial. Qodo grouped `type="password"` with email/tel/url as "assumes user data". We kept password decidable from its type: no form legitimately collects a third party's password, so scope is not genuinely in doubt. What *was* wrong is which of the two tokens it assumed, fixed separately. We also kept the fixed-viewport (`width=1024`) branch failing 1.4.10 — a viewport pinned above 320px means the content is never laid out at 320 CSS px, a direct mechanistic failure, unlike the zoom lock which W3C says can coexist with a passing 1.4.10.
+
+---
+
+## PR #7 (follow-up review) and PR #6 (follow-up review)
+
+- **Links:** https://github.com/Carldtitan/Accessifix/pull/7 · https://github.com/Carldtitan/Accessifix/pull/6
+- **Qodo found on re-review:** #7 — clean axe runs appear disabled; explicit recipient scope ignored; punctuated generic links pass. #6 — existing branch ignores base; Cypress tests treated as unit.
+- **We changed:**
+  - **Closed the axe-ran gap end to end.** `runAxe` returns `{violations, ran}` rather than a bare array, and the flag is forwarded through `browserResultSchema`, `PageCapture` and `capturePage`. `TreeLaneInput.axeRan` is **required**, not optional — optional would reproduce the silent `false` the finding is about, whereas required is a compile error until the dispatcher answers. Before this, an empty violations array from a page where axe never executed looked exactly like a clean page, and TREE reported contrast, page title and labels as *passing, untested*.
+  - A form field captured as `aboutUser: false` now drops out of 1.3.5 entirely rather than being failed for having a purpose word in its label. All three states — `true`, `undefined`, `false` — now mean different things.
+  - Generic-link detection decides membership through `normaliseText`, so "Read more!", "Details?" and "Click here:" are caught, and a name normalising to empty counts as generic — which is what makes `>>` and `...` work and generalises to their unlisted cousins.
+  - `createBranch` compares `base...tip` on the reuse path and refuses unless identical or ahead. **Ahead alone is not sufficient**: a colliding branch cut from current main with another author's commits also reads ahead, and those commits would ride into the PR under our approved patch — so every commit above the base must also be the signed-in user's.
+  - Cypress, TestCafe, Nightwatch and WebdriverIO now classify as e2e. Previously only Playwright was excluded, so `test: "cypress run"` was executed without a served app and the environment failure blocked the PR.
+- **We dismissed:** Nothing. One deliberate behaviour change recorded: if a resumed run omits `fromRef` and the default branch has moved, the base comparison reads `diverged` and branch reuse is refused **loudly**, rather than silently building on an unapproved parent. `BranchResult.baseSha` is exposed so a resuming caller can pin it.
