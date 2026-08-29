@@ -40,24 +40,19 @@ pushes are rejected for everyone including the repository owner.
 
 ---
 
-## PR #5 — Task 6: TrueForge harness client and the seven-agent roster
+## PR #4 — Task 8: Warm Control Room UI and run view
 
-- **Link:** https://github.com/Carldtitan/Accessifix/pull/5
+- **Link:** https://github.com/Carldtitan/Accessifix/pull/4
 - **Qodo found:**
-  - `Reliability` — Timeout ends before body. The request timer was cleared when headers arrived.
-  - `Correctness` — Fallback runtime config diverges from the primary agent.
-  - `Correctness` — Lane verdict policy unenforced; MEDIA and CODE could emit `DECIDE`.
-  - `Correctness` — Pre-aborted `AbortSignal`s ignored.
-  - `Correctness` — CRLF SSE events lost.
-  - `Correctness` — Provider race clobbers a concurrent winner's configuration.
-  - `Correctness` — Unknown criteria pass validation on patch, skipped and recheck paths.
+  - `High` — Approval never reaches harness. The card rendered its outcome banner on click without ever calling the server.
+  - `Medium` — Account navigation leaves the mobile drawer open.
+  - `Medium` — Findings total contradicts the list shown on the same page.
+  - `Medium` — Tabs share the wrong panel; every tab pointed `aria-controls` at one shared panel.
+  - `Medium` — Failed environment badge styled identically to live.
 - **We changed:**
-  - Extracted a `RequestGuard` that lives until `response.text()` completes, so a server that sends headers then stalls now raises a timeout instead of hanging. Also removed a `.catch(() => "")` that was turning body-read failures into confusing schema errors.
-  - **The fallback is now built from the saved agent's own manifest read back from the server, with only the model swapped.** Qodo's suggested plumbing alone still left the bug when a caller omits the options, because `buildAgentSpec` reads an absent `sandboxAvailable` as enabled. **Live evidence this mattered: on our instance `sandbox.enabled` is false, and the pre-fix fallback was rejected outright with `422: sandbox is enabled but no sandbox provider is configured`. ACT, FIX and VERIFY had no working fallback at all.** The fixed one runs.
-  - Lane verdict sets are now enforced in **both** Zod and the emitted JSON Schema. MEDIA and CODE publish `enum: ["FLAG"]`. MEDIA's output is opinion — it judges whether a transcript conveys what a video shows — and must never be a decision. Verified live: the narrowed contract was accepted by the provider, and when pushed with "you are very confident this is a clear failure" the model returned three findings, all `FLAG`.
-  - `guardRequest` checks `callerSignal.aborted` up front, since `abort` is never replayed to late listeners. Verified: the request never reaches the server.
-  - SSE parser normalises `\r\n` and `\r` to `\n` per spec, holds back a trailing CR so a boundary split across chunks is not mis-framed, and flushes an unterminated final frame. Verified live against `/subscribe`.
-  - Provider 409 now re-lists, finds the winner, and merges into *their* manifest so `base_url` and hand-tuned fields survive. If the winner already has every roster model it returns `unchanged` with no PUT at all.
-  - A shared `CriterionIdSchema` pins the criterion enum to the 55 real ids across patch, skipped and recheck. `1.9.9` and `9.9.9` are rejected everywhere.
-- **We dismissed:** Nothing. All seven were genuine.
-- **Partial, stated rather than hidden:** the per-criterion "a BLOCKED-class criterion may never be `DECIDE`" rule cannot be expressed in a flat JSON Schema enum — it needs `anyOf` branching, which strict-mode providers handle inconsistently. Zod enforces it hard and the `verdict` description states it. The lane-level rule Qodo actually asked for is fully enforced in both.
+  - Rewrote `ApprovalCard` around a real submit state machine (`idle → submitting → settled | error`). The decision now POSTs to `/api/runs/{runId}/approve`; the outcome banner renders only after the call succeeds, and a failure surfaces the server's reason in a `role="alert"`. Given neither a `runId` nor a handler, the controls stay disabled and say so — the card can never mime a decision. The approval gate is A7 and the centrepiece of the demo; a button that fakes it is worse than no button at all.
+  - Fixed the tabs properly against the WAI-ARIA pattern: one `role="tabpanel"` per tab, each tab's `aria-controls` naming its own panel and each panel's `aria-labelledby` naming its own tab, so the relationship resolves for inactive tabs too. Unselected panels stay in the DOM closed with `hidden`. Also needed a CSS fix — `.tabpanel { display: block }` would have silently defeated `hidden`. **This product detects exactly this class of ARIA wiring bug; shipping it would have been indefensible.**
+  - Added `onClick={closeMenu}` to the account link, matching every other nav link.
+  - Findings page now derives both numbers and labels the excerpt as a subset, so it no longer contradicts the criterion matrix beside it.
+  - `failed` badge given its own deeper red ground plus a ring, so it differs from `live` by shape as well as hue rather than by colour alone. 8.5:1 composited, recorded in the contrast ledger.
+- **We dismissed:** Nothing. All five were genuine.
