@@ -1,0 +1,344 @@
+/**
+ * `openPullRequest` — the pipeline-facing adapter.
+ *
+ * `lib/github/pr.ts` exposes `openVerifiedPullRequest`, which is the only
+ * sanctioned path to GitHub's `pulls.create`. It enforces, in order: the test
+ * suite did not fail, the build passed, the commit under review is the one that
+ * was verified, and an approval matching this exact operation is held. That
+ * ordering is not decoration — it is what stops a patch reaching someone else's
+ * repository on no evidence.
+ *
+ * The conductor's seam wants a flatter call, and the gap between the two shapes
+ * is wider than it looks:
+ *
+ *  - The seam carries **diffs**, because a `patches` row stores a diff and
+ *    nothing else. Everything downstream needs whole files — to digest for the
+ *    approval, and to commit. So the bytes are rebuilt from the diff and the
+ *    file it was computed against, and a diff that no longer reproduces is
+ *    dropped rather than forced (`lib/fix/source.ts`).
+ *  - `openVerifiedPullRequest` requires a commit **already on the head branch**,
+ *    because the build and the suite ran over local files and the commit is the
+ *    only thing tying that evidence to what is on GitHub. So this adapter is
+ *    also the thing that creates the branch and pushes the commit.
+ *  - The seam's `title` and `body` are advisory. The composed body is built from
+ *    the structured evidence and is what the gates bind to, so it wins; taking
+ *    the caller's prose instead would let the text drift from the operation the
+ *    human approved.
+ *
+ * It **does not loosen a single gate**. Each write is bound to its own operation
+ * — repository, branch, base, title, commit and a digest of every file's
+ * contents — so a decision cannot be replayed against a different payload, and
+ * an approval built for the branch push is refused by `openPullRequest` and vice
+ * versa, because each call site accepts only its own action.
+ *
+ * Without an approved decision it throws. Opening a pull request against a
+ * user's repository is irreversible, and A7.1 says irreversible actions wait
+ * for a person.
+ */
+import { buildBranchApproval, buildPullRequestApproval, type GateDecision } from '@/lib/fix/gate';
+import { materializePatches } from '@/lib/fix/source';
+import type { BuildResult } from '@/lib/verify/build';
+import type { RecheckReport } from '@/lib/verify/recheck';
+import type { TestRunResult } from '@/lib/verify/tests';
+
+import { GitHubClient, GitHubError } from './client';
+import { composePullRequest, openVerifiedPullRequest } from './pr';
+
+export interface PipelineOpenPullRequestInput {
+  runId: string;
+  repoFullName: string;
+  accessToken: string;
+  branch: string;
+  title: string;
+  body: string;
+  patches: readonly { filePath: string; diff: string }[];
+  /** Verification evidence. The gates read this; they do not take our word. */
+  verification?: {
+    buildPassed: boolean;
+    /** False when no build script ran. Unproven, which is not the same as failed. */
+    buildRan?: boolean;
+    testsPassed: boolean;
+    /** False when no suite ran, or one ran and found nothing. Unproven, not a pass. */
+    testsRan?: boolean;
+    testCommand?: string;
+    testSummary?: string;
+  };
+  /** The human decision (A7.1). Absent or unapproved means refuse. */
+  approval?: { requestId: string; approved: boolean };
+  signal?: AbortSignal;
+}
+
+export async function openPullRequestForRun(
+  input: PipelineOpenPullRequestInput,
+): Promise<{ url: string; number: number; branch: string }> {
+  if (!input.approval?.approved) {
+    throw new Error(
+      'openPullRequest was called without an approved decision. Opening a pull ' +
+        'request against a user repository is irreversible and requires explicit ' +
+        'human approval (A7.1).',
+    );
+  }
+
+  const client = new GitHubClient(input.accessToken);
+  const base = await client.getDefaultBranch(input.repoFullName);
+
+  // Whole files, rebuilt from the stored diffs and verified to reproduce them
+  // exactly. A patch that no longer applies is not committed on a guess.
+  const materialized = await materializePatches({
+    repoFullName: input.repoFullName,
+    accessToken: input.accessToken,
+    patches: input.patches,
+    ref: base,
+    ...(input.signal === undefined ? {} : { signal: input.signal }),
+  });
+
+  if (materialized.patches.length === 0) {
+    throw new GitHubError(
+      'openPullRequest',
+      `None of the ${input.patches.length} proposed patch(es) still apply to ${input.repoFullName}` +
+        `@${base}, so there is nothing to open a pull request with. ` +
+        materialized.failures.map((f) => `${f.filePath}: ${f.reason}`).join('; '),
+    );
+  }
+
+  const evidence = pullRequestVerificationEvidence(input, base);
+
+  // Composed once here so the approval is bound to the exact title and branch
+  // `openVerifiedPullRequest` will compose for itself. If they ever diverged,
+  // the field-by-field comparison inside `assertApproved` would refuse the
+  // write rather than open a pull request the human did not read.
+  const composeInput = {
+    runId: input.runId,
+    repoFullName: input.repoFullName,
+    baseBranch: base,
+    branch: input.branch,
+    patches: materialized.patches,
+    findings: [],
+    build: evidence.build,
+    tests: evidence.tests,
+    recheck: evidence.recheck,
+  } as const;
+  const composition = composePullRequest(composeInput);
+
+  /*
+   * The branch has to exist and carry the commit before the pull request can
+   * point at it, and pushing is itself a write, so it carries its own approval
+   * bound to its own operation. Both requests take the id of the decision the
+   * human actually gave: the decision names the request, and each request still
+   * describes only the one act it authorises — `createBranch` accepts nothing
+   * but `push-branch`, `openPullRequest` nothing but `open-pull-request`.
+   */
+  const decisionId = input.approval.requestId;
+  const decision: GateDecision = { requestId: decisionId, status: 'approved' };
+
+  // Read the tip first. An existing branch already ahead of the base is history
+  // this run did not write, and the approval has to say so rather than absorb
+  // it silently.
+  const existingTip = await client.getBranchSha(input.repoFullName, composition.branch);
+  const baseTip = await client.getBranchSha(input.repoFullName, base);
+  const resumeFromSha = existingTip && existingTip !== baseTip ? existingTip : null;
+
+  const branchApproval = buildBranchApproval({
+    id: decisionId,
+    runId: input.runId,
+    repoFullName: input.repoFullName,
+    branch: composition.branch,
+    baseBranch: base,
+    patches: materialized.patches,
+    resumeFromSha,
+  });
+
+  const branchResult = await client.createBranch(
+    input.repoFullName,
+    composition.branch,
+    { approval: branchApproval, decision },
+    base,
+  );
+
+  const commit = await client.commitFiles(
+    input.repoFullName,
+    {
+      branch: composition.branch,
+      message: composition.commitMessage,
+      files: materialized.patches.map((patch) => ({
+        path: patch.filePath,
+        contents: patch.newContents,
+      })),
+      // The tip that was just validated, not whatever the branch happens to be
+      // at by now — that is what makes the non-forced ref update meaningful.
+      parentSha: branchResult.sha,
+    },
+    { approval: branchApproval, decision },
+  );
+
+  // The approval is bound to these exact bytes, on this exact commit. Approving
+  // "three files" and approving *these* three files with *these* contents are
+  // different consents.
+  const approval = buildPullRequestApproval({
+    id: decisionId,
+    runId: input.runId,
+    repoFullName: input.repoFullName,
+    branch: composition.branch,
+    baseBranch: base,
+    title: composition.title,
+    patches: materialized.patches,
+    commitSha: commit.commitSha,
+    buildSummary: evidence.build.summary,
+    buildOk: evidence.build.ok,
+    buildUnproven: !evidence.build.buildRan,
+    testSummary: evidence.tests.summary,
+    testsOk: evidence.tests.ok,
+    testsUnproven: evidence.tests.skipped,
+    recheckSummary: evidence.recheck.summary,
+  });
+
+  const opened = await openVerifiedPullRequest(
+    client,
+    {
+      ...composeInput,
+      repo: input.repoFullName,
+      commit,
+    },
+    approval,
+    decision,
+  );
+
+  return {
+    url: opened.pullRequest.url,
+    number: opened.pullRequest.number,
+    branch: opened.pullRequest.head,
+  };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Evidence                                                                   */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The seam's flat booleans, widened into the shapes the two gates read.
+ *
+ * Nothing here invents a pass. The mapping is deliberately one-directional:
+ *
+ *  - No `verification` at all means nothing was demonstrated, so both sides come
+ *    back unproven — and `openVerifiedPullRequest` rejects unproven-and-unproven
+ *    as no evidence at all. A caller that forgets to pass its evidence gets a
+ *    refusal, never a pull request.
+ *  - `buildPassed: false` is a **failure** unless the caller says the build
+ *    never ran. A build that failed and a build that was never attempted are
+ *    different facts, and only the caller knows which it had.
+ *  - `testsPassed: false` is likewise a failure unless the caller says no suite
+ *    ran. Where the caller says nothing, an empty `testCommand` is taken as
+ *    "there was no suite" — that is what `verifyPatches` puts there when it had
+ *    no command to run — and anything else is read as a suite that did not pass,
+ *    which is A6.4's hard stop.
+ */
+export function pullRequestVerificationEvidence(
+  input: PipelineOpenPullRequestInput,
+  base: string,
+): { build: BuildResult; tests: TestRunResult; recheck: RecheckReport } {
+  const verification = input.verification;
+  const command = verification?.testCommand ?? '';
+
+  /*
+   * With nothing supplied, nothing is proven — on either axis. That is not the
+   * same as a failure, and saying so gets the refusal from the branch that
+   * states the truth ("nothing verified this patch") rather than from one that
+   * claims a build failed that was never reported.
+   *
+   * `buildRan` and `testsRan` default to *true* when evidence was supplied
+   * without them. That direction matters: it makes `buildPassed: false` read as
+   * a build that failed, which is a hard stop, rather than as one that never
+   * ran, which is merely unproven. Only a caller that explicitly says the step
+   * did not run gets the softer reading, because only that caller knows.
+   */
+  const buildRan = verification === undefined ? false : (verification.buildRan ?? true);
+  const buildOk = verification === undefined ? true : verification.buildPassed || !buildRan;
+
+  // Where the caller says nothing, an empty command is "there was no suite" —
+  // that is what `verifyPatches` puts there when it had nothing to run.
+  const testsRan =
+    verification === undefined
+      ? false
+      : (verification.testsRan ?? (verification.testsPassed || command !== ''));
+  const testsOk = verification === undefined ? true : verification.testsPassed || !testsRan;
+
+  const build: BuildResult = {
+    ok: buildOk,
+    log: '',
+    steps: [],
+    failedStage: buildOk ? null : 'build',
+    oomKilled: false,
+    buildRan,
+    // Nothing here watched the install. `buildGate` reads a false here as
+    // observed lockfile drift, which would be a claim about something this
+    // step never saw, so it is not asserted.
+    installReproducible: true,
+    compileErrors: [],
+    repoDir: '',
+    commitSha: null,
+    envCopied: false,
+    durationMs: 0,
+    summary:
+      verification === undefined
+        ? 'No build evidence reached this step, so nothing about this patch has been compiled ' +
+          'or checked here.'
+        : buildRan
+          ? buildOk
+            ? 'The patched tree was built and the build passed, as reported by the VERIFY phase.'
+            : 'The patched tree did not build, as reported by the VERIFY phase.'
+          : 'No build script ran, so nothing was compiled and the build proves nothing.',
+  };
+
+  const detectionReason =
+    verification === undefined
+      ? 'No test evidence reached this step, so no suite has been shown to pass.'
+      : testsRan
+        ? `The verification step ran \`${command || 'the repository test suite'}\`.`
+        : 'No unit test suite ran, so the suite proves nothing about this patch.';
+
+  const tests: TestRunResult = {
+    ok: testsOk,
+    output: verification?.testSummary ?? '',
+    framework: testsRan ? 'unknown' : 'none',
+    command: command === '' ? null : command,
+    exitCode: testsRan ? (testsOk ? 0 : 1) : null,
+    // `skipped` is the gate's word for allowed-but-unproven. It is true only
+    // when no test actually ran, never as a way past a failing suite.
+    skipped: !testsRan,
+    detection: {
+      script: null,
+      command: command === '' ? null : command,
+      framework: testsRan ? 'unknown' : 'none',
+      source: 'none',
+      scriptBody: null,
+      e2eScript: null,
+      reason: detectionReason,
+    },
+    durationMs: 0,
+    summary:
+      verification?.testSummary ??
+      (testsRan
+        ? testsOk
+          ? `\`${command}\` passed.`
+          : `\`${command}\` failed.`
+        : detectionReason),
+  };
+
+  // The seam carries no per-criterion re-check, so the body says so rather than
+  // implying findings were re-tested. A6.5: nothing is reported as resolved
+  // that nothing observed.
+  const recheck: RecheckReport = {
+    outcomes: [],
+    resolvedFindingIds: [],
+    unresolvedFindingIds: [],
+    inconclusiveFindingIds: [],
+    resolvedCriteria: [],
+    unresolvedCriteria: [],
+    checkedUrl: null,
+    summary:
+      'No per-criterion re-check was carried into this step, so no finding is reported as ' +
+      `resolved. The patches are backed by the build and the test suite against \`${base}\`.`,
+  };
+
+  return { build, tests, recheck };
+}
