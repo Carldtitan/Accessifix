@@ -62,6 +62,7 @@ export const RUN_STATUSES = [
   'queued',
   'crawling',
   'auditing',
+  'scoring',
   'fixing',
   'verifying',
   'awaiting_approval',
