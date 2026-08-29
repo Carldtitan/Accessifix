@@ -13,6 +13,7 @@ import { NextResponse } from 'next/server';
 import { db } from '@/lib/db';
 import { pages, patches } from '@/lib/db/schema';
 import { currentUser, NOT_FOUND, runForUser, UNAUTHORIZED } from '@/lib/pipeline/access';
+import { screenshotsForRun } from '@/lib/pipeline/artifacts';
 import { pendingHandoffs } from '@/lib/pipeline/handoff';
 import { listJobs } from '@/lib/pipeline/jobs';
 import { scoreDelta, scoreRun } from '@/lib/pipeline/score';
@@ -38,13 +39,15 @@ export async function GET(
   const url = new URL(request.url);
   const wantJobs = url.searchParams.get('jobs') === 'true';
 
-  const [{ state, pausedFrom }, baseline, pageRows, patchRows, handoffRows] = await Promise.all([
-    readState(runId),
-    scoreRun(runId, 'baseline'),
-    db.select().from(pages).where(eq(pages.runId, runId)).orderBy(pages.crawledAt),
-    db.select().from(patches).where(eq(patches.runId, runId)).orderBy(desc(patches.createdAt)),
-    pendingHandoffs(runId),
-  ]);
+  const [{ state, pausedFrom }, baseline, pageRows, patchRows, handoffRows, frameRows] =
+    await Promise.all([
+      readState(runId),
+      scoreRun(runId, 'baseline'),
+      db.select().from(pages).where(eq(pages.runId, runId)).orderBy(pages.crawledAt),
+      db.select().from(patches).where(eq(patches.runId, runId)).orderBy(desc(patches.createdAt)),
+      pendingHandoffs(runId),
+      screenshotsForRun(runId),
+    ]);
 
   // The delta only exists once the final audit has written rows. Computing it
   // early would report every criterion as a regression.
@@ -79,6 +82,17 @@ export async function GET(
     finalScore: final,
     delta,
     pages: pageRows,
+    /*
+     * The frames captured for this run, as references. Ids only: this body is
+     * refetched on every event the run emits, and a full-page PNG on each of
+     * those would be megabytes per update. The `<img>` fetches the bytes once
+     * from `/api/artifacts/{id}`, where they cache.
+     */
+    frames: frameRows.map((frame) => ({
+      artifactId: frame.artifactId,
+      pageUrl: frame.pageUrl,
+      capturedAt: frame.capturedAt,
+    })),
     patches: patchRows,
     /** A7.5: an unanswered handoff is surfaced rather than left to be noticed. */
     pendingHandoffs: handoffRows,

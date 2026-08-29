@@ -100,7 +100,11 @@ export default async function OverviewPage() {
   /* ---------------------------------------------------------------------- */
 
   const score = latest.score;
-  const environments = jobsToEnvironments(latest.jobs, findingsByPage(latest.findings));
+  const environments = jobsToEnvironments(
+    latest.jobs,
+    findingsByPage(latest.findings),
+    latest.frames,
+  );
   const summary = toRunSummary(
     latest.run,
     latest.activeModel ? { activeModel: latest.activeModel } : {},

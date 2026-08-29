@@ -26,12 +26,14 @@ import {
   type RunPhase,
 } from "@/lib/db/schema";
 import { AGENT_ROSTER, isAgentName } from "@/lib/harness/agents";
+import { screenshotsForRun } from "@/lib/pipeline/artifacts";
 import { readRunEvents } from "@/lib/pipeline/events";
 import { listJobs } from "@/lib/pipeline/jobs";
 import { runForUser } from "@/lib/pipeline/access";
 import { scoreRun } from "@/lib/pipeline/score";
 import type {
   FindingWire,
+  FrameWire,
   HandoffWire,
   JobWire,
   PageWire,
@@ -243,6 +245,14 @@ export interface RunDetail {
   jobs: JobWire[];
   patches: PatchWire[];
   pages: PageWire[];
+  /**
+   * One captured browser frame per page, as references.
+   *
+   * Ids only. The PNG bytes stay in the `artifacts` table and reach the browser
+   * through `/api/artifacts/{id}`; putting them in a server-component payload
+   * would ship megabytes of base64 into the HTML on every render.
+   */
+  frames: FrameWire[];
   pendingHandoffs: HandoffWire[];
   /** The model behind the lane that spoke most recently, when there was one. */
   activeModel?: string;
@@ -257,7 +267,17 @@ export async function runDetail(runId: string, userId: string): Promise<RunDetai
   const owned = await runForUser(runId, userId);
   if (!owned) return null;
 
-  const [score, finalScore, findingRows, eventRows, jobRows, patchRows, pageRows, handoffRows] =
+  const [
+    score,
+    finalScore,
+    findingRows,
+    eventRows,
+    jobRows,
+    patchRows,
+    pageRows,
+    handoffRows,
+    frameRows,
+  ] =
     await Promise.all([
       scoreRun(runId, "baseline"),
       owned.run.phase === "final" ? scoreRun(runId, "final") : Promise.resolve(null),
@@ -271,6 +291,7 @@ export async function runDetail(runId: string, userId: string): Promise<RunDetai
         .from(handoffs)
         .where(and(eq(handoffs.runId, runId), eq(handoffs.status, "pending")))
         .orderBy(desc(handoffs.createdAt)),
+      screenshotsForRun(runId),
     ]);
 
   return {
@@ -324,6 +345,11 @@ export async function runDetail(runId: string, userId: string): Promise<RunDetai
       status: patch.status,
     })),
     pages: pageRows.map((page) => ({ id: page.id, url: page.url, title: page.title })),
+    frames: frameRows.map((frame) => ({
+      artifactId: frame.artifactId,
+      pageUrl: frame.pageUrl,
+      capturedAt: frame.capturedAt,
+    })),
     pendingHandoffs: handoffRows.map((handoff) => ({
       id: handoff.id,
       kind: handoff.kind,

@@ -24,6 +24,7 @@ import {
   toPatchCards,
   toRunSummary,
   type FindingWire,
+  type FrameWire,
   type HandoffWire,
   type JobWire,
   type PatchWire,
@@ -48,6 +49,14 @@ export interface RunLiveViewProps {
   patches: PatchWire[];
   pendingHandoffs: HandoffWire[];
   pageCount: number;
+  /**
+   * The browser frames captured so far, as artifact references.
+   *
+   * References, never bytes. The grid renders `<img src="/api/artifacts/{id}">`
+   * so a frame crosses the network once and then caches; carrying the PNG in
+   * this prop would re-serialise megabytes into the page on every update.
+   */
+  frames: FrameWire[];
   activeModel?: string;
 }
 
@@ -127,6 +136,7 @@ export function RunLiveView(props: RunLiveViewProps) {
   const [patches, setPatches] = useState<PatchWire[]>(props.patches);
   const [handoffs, setHandoffs] = useState<HandoffWire[]>(props.pendingHandoffs);
   const [pageCount, setPageCount] = useState<number>(props.pageCount);
+  const [frames, setFrames] = useState<FrameWire[]>(props.frames);
   const [events, setEvents] = useState<RunEventWire[]>(props.events);
   // Seeded rather than corrected in an effect: a run that was already finished
   // when the server rendered it is never "connecting", not even for a frame.
@@ -183,6 +193,7 @@ export function RunLiveView(props: RunLiveViewProps) {
         finalScore: RunScoreWire | null;
         patches: PatchWire[];
         pages: unknown[];
+        frames?: FrameWire[];
         pendingHandoffs: HandoffWire[];
         jobs?: JobWire[];
       };
@@ -193,6 +204,10 @@ export function RunLiveView(props: RunLiveViewProps) {
       setPatches(detail.patches ?? []);
       setHandoffs(detail.pendingHandoffs ?? []);
       setPageCount(Array.isArray(detail.pages) ? detail.pages.length : 0);
+      // Frames arrive as pages land, so a live run fills its cards in one by
+      // one. An older server that does not send the field leaves what we have
+      // standing rather than blanking every card that already has a frame.
+      if (Array.isArray(detail.frames)) setFrames(detail.frames);
       if (detail.jobs) setJobs(detail.jobs);
 
       if (findingsResponse.ok) {
@@ -331,7 +346,7 @@ export function RunLiveView(props: RunLiveViewProps) {
     },
   );
 
-  const environments = jobsToEnvironments(jobs, findingsByPage(findings));
+  const environments = jobsToEnvironments(jobs, findingsByPage(findings), frames);
   const groups = groupByCriterion(findings);
   const matrixRows = scoreToMatrixRows(score, finalScore);
   const timeline = eventsToTimeline(events);

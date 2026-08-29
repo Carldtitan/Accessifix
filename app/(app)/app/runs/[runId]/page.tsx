@@ -66,6 +66,7 @@ export default async function RunDetailPage({
         patches={detail.patches}
         pendingHandoffs={detail.pendingHandoffs}
         pageCount={detail.pages.length}
+        frames={detail.frames}
         {...(detail.activeModel ? { activeModel: detail.activeModel } : {})}
       />
     </main>
