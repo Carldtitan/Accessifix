@@ -45,6 +45,7 @@ import { and, eq, inArray, ne } from 'drizzle-orm';
 
 import type { InteractionPath } from '@/lib/browser/types';
 import { operationMismatch, type ApprovalOperation } from '@/lib/fix/gate';
+import { locateFindingSourcesDetailed } from '@/lib/fix/locate';
 import { normalizeRepoPath } from '@/lib/fix/source';
 import { db } from '@/lib/db';
 import { findings, patches, runs, targets, type Finding, type RunPhase } from '@/lib/db/schema';
@@ -890,6 +891,80 @@ async function openDecideFindings(runId: string, phase: RunPhase): Promise<Findi
 }
 
 /**
+ * Attach a source file to every finding that does not already have one.
+ *
+ * The audit lanes that matter most — VIS and ACT — never see the repository.
+ * They see a rendered page, so what they can name is an element, not a file.
+ * CODE is the only lane that sets `sourcePath` itself, and CODE covers three
+ * criteria. Everything else arrives here with `sourcePath: null`, which
+ * `groupFindingsForFix` reads as "not patchable" and routes to the human queue.
+ *
+ * The paths are attached in memory, on the copies handed to FIX. Nothing is
+ * written back to the `findings` table: `recordFindings()` stays the only
+ * writer, and a located path is an inference about the repository at this
+ * commit rather than a fact the audit observed.
+ *
+ * A failure here is not fatal. The findings simply keep the paths they came
+ * with, and the ones without go to the human queue exactly as they did before.
+ */
+async function locateSources(
+  context: PipelineContext,
+  token: string,
+  fixable: readonly Finding[],
+): Promise<Finding[]> {
+  const unlocated = fixable.filter((finding) => !finding.sourcePath);
+  if (unlocated.length === 0) return [...fixable];
+
+  try {
+    const located = await locateFindingSourcesDetailed({
+      repoFullName: context.repoFullName,
+      accessToken: token,
+      // No ref: the locator resolves the repository's default branch, which is
+      // the same commit `readRepoFile` and the patch branch are taken from.
+      signal: context.signal,
+      findings: unlocated.map((finding) => ({
+        id: finding.id,
+        criterion: finding.criterion,
+        summary: finding.summary,
+        detail: finding.detail,
+        sourcePath: finding.sourcePath,
+        pageUrl: finding.pageUrl,
+      })),
+      onLog: (line) => {
+        void emitEvent({ runId: context.runId, type: 'log', agent: 'FIX', summary: line });
+      },
+    });
+
+    const paths = new Map(located.map((item) => [item.findingId, item.sourcePath]));
+    const resolved = located.filter((item) => item.sourcePath !== null);
+
+    await emitEvent({
+      runId: context.runId,
+      type: 'log',
+      agent: 'FIX',
+      summary: `Located source files for ${resolved.length} of ${unlocated.length} live-audit finding(s).`,
+      detail:
+        resolved.length > 0
+          ? resolved.map((item) => `${item.sourcePath} — ${item.reason}`).join('\n')
+          : 'None could be traced to a file with enough confidence to patch.',
+    });
+
+    return fixable.map((finding) =>
+      finding.sourcePath ? finding : { ...finding, sourcePath: paths.get(finding.id) ?? null },
+    );
+  } catch (error) {
+    await emitEvent({
+      runId: context.runId,
+      type: 'log',
+      agent: 'FIX',
+      summary: 'Source location failed; findings keep whatever path they arrived with.',
+      detail: (error as Error).message,
+    });
+    return [...fixable];
+  }
+}
+
+/**
  * FIX writes patches, batched per source file (A5.2), from findings in the
  * ledger rather than from raw page content (A5.1).
  */
@@ -931,10 +1006,18 @@ async function fixPhase(
     }));
   }
 
+  // VIS and ACT audited the deployed site, so their findings name an element
+  // and a selector but no file. Without this step every one of them falls into
+  // the `withSource` filter below as a miss, FIX is handed nothing, and no pull
+  // request is ever opened. `locateFindingSources` maps each back to the file
+  // that renders it — or to `null`, which is the honest answer and keeps the
+  // finding in the human queue rather than pointing FIX at the wrong component.
+  const fixableWithPaths = await locateSources(context, token, fixable);
+
   // A5.2: the batching is by file. Findings with no known source path go to the
   // human queue instead of being guessed at.
-  const withSource = fixable.filter((finding) => finding.sourcePath);
-  const withoutSource = fixable.length - withSource.length;
+  const withSource = fixableWithPaths.filter((finding) => finding.sourcePath);
+  const withoutSource = fixableWithPaths.length - withSource.length;
 
   if (withoutSource > 0) {
     await emitEvent({
