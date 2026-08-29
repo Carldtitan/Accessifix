@@ -139,6 +139,29 @@ export async function POST(
 
   if (!decision) return NextResponse.json(NOT_FOUND, { status: 404 });
 
+  /*
+   * Two people can press approve and reject at the same moment. The conditional
+   * update in `answerHandoff` lets exactly one of them win, and the loser must
+   * not carry on as if it had: forwarding its own decision to TrueForge here
+   * would deny a tool call the ledger records as approved.
+   *
+   * So the loser reports the decision that actually stands, and does nothing
+   * else. `applied: false` says which of the two this response is.
+   */
+  if (!decision.applied) {
+    return NextResponse.json(
+      {
+        handoff: decision.handoff,
+        approved: decision.approved,
+        applied: false,
+        note:
+          `Another decision was recorded first; this handoff is ${decision.handoff.status}. ` +
+          'The standing decision is returned unchanged.',
+      },
+      { status: 200 },
+    );
+  }
+
   /* ---- 2. Tell TrueForge, when the pause was a harness tool gate. --------- */
 
   const job = await findJobByHandoff(handoffId);
@@ -153,7 +176,10 @@ export async function POST(
         job.sessionId,
         job.turnId,
         { threadId: job.threadId, toolCallId: job.toolCallId },
-        approved,
+        // The persisted decision, never the requested one. They are the same
+        // here because this request won the update, and saying so keeps them
+        // from drifting apart if that ever stops being true.
+        decision.approved,
         { reason: parsed.data.reason },
       );
       harness = { forwarded: true, reason: `Answered tool call ${job.toolCallId}.` };
@@ -186,7 +212,7 @@ export async function POST(
 
   return NextResponse.json({
     handoff: decision.handoff,
-    approved,
+    approved: decision.approved,
     applied: true,
     harness,
     resumed,

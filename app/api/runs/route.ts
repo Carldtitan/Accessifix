@@ -154,7 +154,11 @@ export async function POST(request: Request): Promise<NextResponse> {
     .returning();
 
   // Long work must not block the response. Start it and return.
-  const { started } = startRun(run.id, {
+  //
+  // The await is the conductor *claim*, not the run: `startRun` takes the
+  // durable lease that stops a second process conducting the same run, then
+  // hands the pipeline off to the background and returns.
+  const { started, reason: conductor } = await startRun(run.id, {
     baselineOnly: parsed.data.baselineOnly,
     maxPages: parsed.data.maxPages,
   });
@@ -163,6 +167,7 @@ export async function POST(request: Request): Promise<NextResponse> {
     {
       run,
       started,
+      conductor,
       target: { id: target.id, repoFullName: target.repoFullName, deployedUrl: target.deployedUrl },
       events: `/api/runs/${run.id}/events`,
     },

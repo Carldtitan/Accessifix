@@ -14,6 +14,7 @@ import { NextResponse } from 'next/server';
 
 import { readRunEvents, subscribeToRun, type RunEventPayload } from '@/lib/pipeline/events';
 import { currentUser, NOT_FOUND, runForUser, UNAUTHORIZED } from '@/lib/pipeline/access';
+import { isLeased } from '@/lib/pipeline/lease';
 import { isRunning } from '@/lib/pipeline/orchestrate';
 import { isTerminal, readState } from '@/lib/pipeline/state';
 
@@ -99,7 +100,33 @@ export async function GET(
       // Tell EventSource how long to wait before reconnecting.
       write('retry: 3000\n\n');
 
-      // 1. Replay. Everything the client missed, in order.
+      /*
+       * 1. Subscribe *before* replaying.
+       *
+       * The order used to be the other way round, and it left a window: an
+       * event committed between the replay query and the subscription belonged
+       * to neither, and was simply lost. The event that falls into that window
+       * most often is the last one, because `transition()` writes `runs.status`
+       * and *then* appends the state event - so a request arriving in between
+       * read a terminal run, closed, and never delivered the `done` the client
+       * was waiting for.
+       *
+       * Everything that arrives on the bus before the replay finishes is held
+       * here and flushed after it, in id order. `send` drops anything at or
+       * below the high-water mark, so an event that appears in both the buffer
+       * and the replay is written once.
+       */
+      const buffered: RunEventPayload[] = [];
+      let replaying = true;
+
+      cleanup.push(
+        subscribeToRun(runId, (event) => {
+          if (replaying) buffered.push(event);
+          else send(event);
+        }),
+      );
+
+      // 2. Replay. Everything the client missed, in order.
       try {
         for (const event of await readRunEvents(runId, { afterId })) send(event);
       } catch (error) {
@@ -111,41 +138,52 @@ export async function GET(
         );
       }
 
-      // 2. A terminal run has nothing more to say. Close rather than hold a
-      //    connection open forever on a finished audit.
-      const state = await readState(runId).catch(() => null);
-      if (state && isTerminal(state.state) && !isRunning(runId)) {
+      // 3. Flush whatever landed while the replay was in flight.
+      replaying = false;
+      for (const event of buffered.sort((a, b) => a.id - b.id)) send(event);
+      buffered.length = 0;
+
+      /**
+       * Close the stream on a terminal run - but never before one last read.
+       *
+       * The state column moves before its event is appended, so "the run is
+       * done" is knowable a moment earlier than "here is the event that says
+       * so". Catching up first is what guarantees the client's last frame is
+       * the terminal state event rather than a silent disconnect.
+       *
+       * `isRunning` is process-local; the lease is not. A conductor working
+       * this run in another process still holds one, and the stream stays open
+       * for it.
+       */
+      const finishIfTerminal = async (): Promise<boolean> => {
+        const current = await readState(runId);
+        if (!isTerminal(current.state)) return false;
+        if (isRunning(runId) || (await isLeased(runId))) return false;
+
+        for (const event of await readRunEvents(runId, { afterId: highWater })) send(event);
+
         write(
           `event: end\ndata: ${JSON.stringify({
             runId,
-            state: state.state,
-            reason: state.run.failureReason ?? null,
+            state: current.state,
+            reason: current.run.failureReason ?? null,
           })}\n\n`,
         );
         close();
-        return;
-      }
+        return true;
+      };
 
-      // 3. Live. In-process events arrive immediately.
-      cleanup.push(subscribeToRun(runId, send));
+      // 4. A terminal run has nothing more to say. Close rather than hold a
+      //    connection open forever on a finished audit.
+      const finished = await finishIfTerminal().catch(() => false);
+      if (finished) return;
 
-      // 4. Catch-up, for a conductor in another process, and the end condition.
+      // 5. Catch-up, for a conductor in another process, and the end condition.
       const poll = setInterval(() => {
         void (async () => {
           try {
             for (const event of await readRunEvents(runId, { afterId: highWater })) send(event);
-
-            const current = await readState(runId);
-            if (isTerminal(current.state) && !isRunning(runId)) {
-              write(
-                `event: end\ndata: ${JSON.stringify({
-                  runId,
-                  state: current.state,
-                  reason: current.run.failureReason ?? null,
-                })}\n\n`,
-              );
-              close();
-            }
+            await finishIfTerminal();
           } catch {
             // A transient database error must not kill the stream; the next
             // tick tries again.

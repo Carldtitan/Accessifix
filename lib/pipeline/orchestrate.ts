@@ -68,13 +68,15 @@ import {
   type AuditPageInput,
 } from './lanes';
 import { emitEvent } from './events';
-import { awaitHandoff, raiseHandoff } from './handoff';
+import { awaitHandoff, loadHandoff, raiseHandoff } from './handoff';
+import { claimRun, holdLease, type LeaseHandle } from './lease';
 import {
   attachSession,
   beginJob,
   completeJob,
   failJob,
   findJob,
+  JobLockedError,
   pauseJobForApproval,
   runJob,
   skipJob,
@@ -109,6 +111,13 @@ export interface RunPipelineOptions {
   baselineOnly?: boolean;
   /** Page cap override. Never exceeds `MAX_PAGES_PER_CRAWL`. */
   maxPages?: number;
+  /**
+   * The conductor lease this run is being executed under.
+   *
+   * Set by `startRun`. When absent, `executeRun` claims one itself, so calling
+   * it directly (a test, a script) is still exclusive.
+   */
+  lease?: LeaseHandle;
 }
 
 interface ActiveRun {
@@ -134,11 +143,24 @@ export function activeRunIds(): string[] {
   return [...activeRuns.keys()];
 }
 
+export interface StartRunOutcome {
+  started: boolean;
+  alreadyRunning: boolean;
+  /** Prose, for the route to pass on when a start is refused. */
+  reason: string;
+}
+
 /**
  * Start the pipeline and return immediately.
  *
  * The HTTP response must not wait for a run — a baseline over 25 pages takes
  * minutes. The route returns 202 and the browser watches the SSE stream.
+ *
+ * Exclusivity is settled twice, and both are needed. `activeRuns` is a
+ * process-local map and is only a fast path; the guarantee is the `run_leases`
+ * row claimed below, because two Node processes share no memory and this
+ * application runs in more than one behind a load balancer or across a deploy.
+ * A second conductor over one run means a second pull request.
  *
  * DEPLOYMENT NOTE: this holds the work in the Node process that accepted the
  * request. That is correct for the local/long-lived server topology this
@@ -146,11 +168,24 @@ export function activeRunIds(): string[] {
  * response, this needs a durable worker; `resumeRun()` already covers the
  * recovery half, so the change is where the loop lives, not what it does.
  */
-export function startRun(
+export async function startRun(
   runId: string,
   options: RunPipelineOptions = {},
-): { started: boolean; alreadyRunning: boolean } {
-  if (activeRuns.has(runId)) return { started: false, alreadyRunning: true };
+): Promise<StartRunOutcome> {
+  if (activeRuns.has(runId)) {
+    return {
+      started: false,
+      alreadyRunning: true,
+      reason: 'A conductor in this process is already running this run.',
+    };
+  }
+
+  // The durable half. A lease held by a live conductor in any process refuses
+  // the claim; one whose owner died has expired and is taken over here.
+  const claim = await claimRun(runId);
+  if (!claim.ok) {
+    return { started: false, alreadyRunning: true, reason: claim.reason };
+  }
 
   const controller = new AbortController();
   if (options.signal) {
@@ -158,16 +193,22 @@ export function startRun(
     else options.signal.addEventListener('abort', () => controller.abort(options.signal?.reason), { once: true });
   }
 
-  const promise = executeRun(runId, { ...options, signal: controller.signal })
+  const lease = holdLease(runId, {
+    owner: claim.owner,
+    onLost: (reason) => controller.abort(new Error(reason)),
+  });
+
+  const promise = executeRun(runId, { ...options, signal: controller.signal, lease })
     .catch((error) => {
       console.error(`[pipeline] run ${runId} ended in an unhandled error`, error);
     })
     .finally(() => {
       activeRuns.delete(runId);
+      void lease.release();
     });
 
   activeRuns.set(runId, { controller, promise, startedAt: Date.now() });
-  return { started: true, alreadyRunning: false };
+  return { started: true, alreadyRunning: false, reason: claim.reason };
 }
 
 /** Ask a running pipeline to stop. The run is then failed with the reason. */
@@ -204,6 +245,50 @@ export type { AuditPageInput } from './lanes';
  * Awaitable, for tests and for the resume path. Route handlers use `startRun`.
  */
 export async function executeRun(runId: string, options: RunPipelineOptions = {}): Promise<void> {
+  /*
+   * `startRun` normally owns the lease and passes it down. A direct call has to
+   * claim its own, or two direct calls would conduct the same run — the exact
+   * failure the lease exists to stop.
+   */
+  let ownLease: LeaseHandle | null = null;
+  let signal = options.signal;
+
+  if (!options.lease) {
+    const claim = await claimRun(runId);
+    if (!claim.ok) {
+      await emitEvent({
+        runId,
+        type: 'log',
+        summary: 'Another conductor already holds this run.',
+        detail: claim.reason,
+      });
+      return;
+    }
+
+    const controller = new AbortController();
+    if (options.signal) {
+      if (options.signal.aborted) controller.abort(options.signal.reason);
+      else {
+        options.signal.addEventListener('abort', () => controller.abort(options.signal?.reason), {
+          once: true,
+        });
+      }
+    }
+    ownLease = holdLease(runId, {
+      owner: claim.owner,
+      onLost: (reason) => controller.abort(new Error(reason)),
+    });
+    signal = controller.signal;
+  }
+
+  try {
+    await conductRun(runId, { ...options, signal });
+  } finally {
+    await ownLease?.release();
+  }
+}
+
+async function conductRun(runId: string, options: RunPipelineOptions = {}): Promise<void> {
   const [row] = await db
     .select({ run: runs, target: targets })
     .from(runs)
@@ -317,6 +402,22 @@ export async function executeRun(runId: string, options: RunPipelineOptions = {}
 
     await transition(runId, 'done');
   } catch (error) {
+    /*
+     * A locked job means another conductor is holding work on this run. That is
+     * not a run failure - failing it here would kill a run someone else is
+     * successfully conducting - so this conductor stands down and leaves the
+     * state alone.
+     */
+    if (error instanceof JobLockedError) {
+      await emitEvent({
+        runId,
+        type: 'log',
+        summary: 'Another conductor is working this run; standing down.',
+        detail: error.message,
+      });
+      return;
+    }
+
     const reason = error instanceof Error ? error.message : String(error);
     await failRun(runId, reason).catch(() => undefined);
     throw error;
@@ -1002,32 +1103,85 @@ async function verifyPhase(
 /**
  * A7.1: the run pauses before pushing a branch and before opening a pull
  * request. The card states the intent, the reason, and the evidence (A7.2).
+ *
+ * The gate is *recovered*, not re-raised. A restart between the card going up
+ * and the PR being opened used to produce a second card over the same decision
+ * — and, once approved twice, a second branch and a second pull request on the
+ * user's repository. So the fixed `pr`/`approval` job row is the continuation
+ * point: it remembers the handoff, and a resumed run re-enters that same wait
+ * rather than starting a new conversation (A7.4, A12.2).
  */
-async function pullRequestGate(context: PipelineContext, verificationSummary: string): Promise<boolean> {
-  const handoff = await raiseHandoff({
-    runId: context.runId,
-    kind: 'approval',
-    agent: 'APP',
-    intent: `Push a branch to ${context.repoFullName} and open a pull request with the accessibility fixes.`,
-    reason:
-      `${verificationSummary} Pushing a branch and opening a pull request are ` +
-      'irreversible actions on your repository, so AccessiFix will not do either ' +
-      'without your say-so (A7.1). The pull request is opened with your own GitHub ' +
-      'token, not a bot account.',
-  });
+async function pullRequestGate(
+  context: PipelineContext,
+  verificationSummary: string,
+): Promise<boolean> {
+  const previous = await findJob(context.runId, 'pr', 'approval');
 
-  const job = await beginJob({
-    runId: context.runId,
-    phase: 'pr',
-    jobKey: 'approval',
-    agent: 'APP',
-  });
-  await pauseJobForApproval(job.id, { handoffId: handoff.id });
+  // The decision was already reached and recorded. Nothing to ask again.
+  if (previous?.status === 'succeeded' || previous?.status === 'skipped') {
+    const approved = previous.status === 'succeeded';
+    await emitEvent({
+      runId: context.runId,
+      type: 'approval',
+      capability: 'approval',
+      summary: approved
+        ? 'The pull request was already approved for this run.'
+        : 'The pull request was already declined for this run.',
+      detail: 'Recovered from the ledger rather than asking a second time (A12.2).',
+      data: { handoffId: previous.handoffId, resumed: true },
+    });
+    return approved;
+  }
 
-  await transition(context.runId, 'awaiting_approval', {
-    reason: 'Waiting for approval to open a pull request.',
-    data: { handoffId: handoff.id },
-  });
+  // A card is already up for this run. Re-enter its wait.
+  let handoff = previous?.handoffId ? await loadHandoff(previous.handoffId) : null;
+  if (handoff && handoff.runId !== context.runId) handoff = null;
+
+  let jobId = previous?.id ?? null;
+
+  if (!handoff) {
+    handoff = await raiseHandoff({
+      runId: context.runId,
+      kind: 'approval',
+      agent: 'APP',
+      intent: `Push a branch to ${context.repoFullName} and open a pull request with the accessibility fixes.`,
+      reason:
+        `${verificationSummary} Pushing a branch and opening a pull request are ` +
+        'irreversible actions on your repository, so AccessiFix will not do either ' +
+        'without your say-so (A7.1). The pull request is opened with your own GitHub ' +
+        'token, not a bot account.',
+    });
+
+    const job = await beginJob({
+      runId: context.runId,
+      phase: 'pr',
+      jobKey: 'approval',
+      agent: 'APP',
+    });
+    jobId = job.id;
+    await pauseJobForApproval(job.id, { handoffId: handoff.id });
+  } else {
+    await emitEvent({
+      runId: context.runId,
+      type: 'approval',
+      capability: 'approval',
+      summary: 'Re-entered the existing approval for this pull request.',
+      detail:
+        'A card was already raised for this run before the interruption; the same ' +
+        'decision is awaited rather than a second one being asked for (A7.4).',
+      data: { handoffId: handoff.id, status: handoff.status, resumed: true },
+    });
+  }
+
+  // Only pause the run if the answer is not already in. `enterState` rather
+  // than `transition`, because a resumed run may still be sitting in
+  // `awaiting_approval` and a no-op move is not a legal transition.
+  if (handoff.status === 'pending') {
+    await enterState(context.runId, 'awaiting_approval', {
+      reason: 'Waiting for approval to open a pull request.',
+      data: { handoffId: handoff.id },
+    });
+  }
 
   // The wait is the `handoffs` row, not this promise: a restart re-enters the
   // same wait and sees the same answer (A7.4).
@@ -1037,8 +1191,16 @@ async function pullRequestGate(context: PipelineContext, verificationSummary: st
     reason: decision.approved ? 'Pull request approved.' : 'Pull request declined.',
   });
 
-  if (decision.approved) await completeJob(job.id);
-  else await skipJob(job.id, decision.response ?? 'Declined by the user.');
+  /*
+   * Record the answer on the job row *before* returning, so the durable
+   * continuation point is set: a crash between here and `prPhase` re-enters
+   * this function, reads `succeeded`, and goes straight to opening the pull
+   * request instead of asking again.
+   */
+  if (jobId) {
+    if (decision.approved) await completeJob(jobId, { result: { approved: true } });
+    else await skipJob(jobId, decision.response ?? 'Declined by the user.');
+  }
 
   return decision.approved;
 }
@@ -1091,7 +1253,20 @@ async function prPhase(
 
       return pr;
     },
-    { toResult: (pr) => ({ url: pr.url, number: pr.number }) },
+    {
+      toResult: (pr) => ({ url: pr.url, number: pr.number, branch: pr.branch }),
+      /*
+       * Without this, `runJob`'s reuse path never fires and a resumed run opens
+       * a *second* pull request against the user's repository. Opening a PR is
+       * the least idempotent thing this pipeline does, so the stored result is
+       * the authority: if the row says it was opened, it was opened.
+       */
+      fromResult: (result) => ({
+        url: String(result.url ?? ''),
+        number: Number(result.number ?? 0),
+        branch: String(result.branch ?? ''),
+      }),
+    },
   );
 }
 

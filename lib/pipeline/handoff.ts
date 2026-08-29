@@ -44,6 +44,18 @@ export interface HandoffDecision {
   response: string | null;
 }
 
+export interface AnswerOutcome extends HandoffDecision {
+  /**
+   * True when *this* call is the one that recorded the decision.
+   *
+   * False means someone else answered first and the standing decision is what
+   * is being returned. The caller must not act on its own `approved` value in
+   * that case: two clicks that disagree would otherwise persist one answer and
+   * forward the other to the harness.
+   */
+  applied: boolean;
+}
+
 /** Create the card. Does not move the run state — the caller owns that. */
 export async function raiseHandoff(input: RaiseHandoffInput): Promise<Handoff> {
   const [row] = await db
@@ -88,24 +100,38 @@ export async function pendingHandoffs(runId: string): Promise<Handoff[]> {
     .where(and(eq(handoffs.runId, runId), eq(handoffs.status, 'pending')));
 }
 
+/** Whether a stored handoff status means the request was granted. */
+function decidedApproved(handoff: Handoff): boolean {
+  return handoff.status === 'approved' || handoff.status === 'answered';
+}
+
 /**
- * Record a decision. Idempotent: answering an already-answered handoff returns
- * the existing decision rather than overwriting it, so a double-click on the
- * approve button cannot approve twice.
+ * Record a decision.
+ *
+ * Idempotent, and — the part that matters — *honest about who won*. The update
+ * is conditional on the row still being `pending`, so of two concurrent
+ * requests exactly one changes the row. The loser does not get to pretend
+ * otherwise: it reloads the row, returns the decision that was actually
+ * persisted, and reports `applied: false` so the caller emits no event, tells
+ * no agent, and resumes nothing.
+ *
+ * Without that, two clicks that disagree would persist one answer and forward
+ * the opposite one to TrueForge, and both callers would claim success.
  */
 export async function answerHandoff(
   handoffId: string,
   approved: boolean,
   options: { response?: string | null; kind?: HandoffKind } = {},
-): Promise<HandoffDecision | null> {
+): Promise<AnswerOutcome | null> {
   const existing = await loadHandoff(handoffId);
   if (!existing) return null;
 
   if (existing.status !== 'pending') {
     return {
       handoff: existing,
-      approved: existing.status === 'approved' || existing.status === 'answered',
+      approved: decidedApproved(existing),
       response: existing.response,
+      applied: false,
     };
   }
 
@@ -122,18 +148,34 @@ export async function answerHandoff(
     .where(and(eq(handoffs.id, handoffId), eq(handoffs.status, 'pending')))
     .returning();
 
-  const row = updated ?? existing;
+  if (!updated) {
+    // Someone answered between the read and the write. Their decision stands.
+    const settled = (await loadHandoff(handoffId)) ?? existing;
+    return {
+      handoff: settled,
+      approved: decidedApproved(settled),
+      response: settled.response,
+      applied: false,
+    };
+  }
 
   await emitEvent({
-    runId: row.runId,
+    runId: updated.runId,
     type: 'approval',
     capability: 'approval',
-    summary: approved ? `Approved: ${row.intent}` : `Rejected: ${row.intent}`,
+    summary: decidedApproved(updated)
+      ? `Approved: ${updated.intent}`
+      : `Rejected: ${updated.intent}`,
     detail: options.response ?? null,
-    data: { handoffId: row.id, status, approved },
+    data: { handoffId: updated.id, status: updated.status, approved: decidedApproved(updated) },
   });
 
-  return { handoff: row, approved, response: row.response };
+  return {
+    handoff: updated,
+    approved: decidedApproved(updated),
+    response: updated.response,
+    applied: true,
+  };
 }
 
 export class HandoffAbortedError extends Error {
@@ -175,11 +217,7 @@ export async function awaitHandoff(
       if (!row) throw new Error(`Handoff ${handoffId} disappeared while waiting.`);
 
       if (row.status !== 'pending') {
-        return {
-          handoff: row,
-          approved: row.status === 'approved' || row.status === 'answered',
-          response: row.response,
-        };
+        return { handoff: row, approved: decidedApproved(row), response: row.response };
       }
 
       if (Date.now() - lastReminder >= REMINDER_AFTER_MS) {
