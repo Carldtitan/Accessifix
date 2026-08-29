@@ -32,7 +32,9 @@ import {
   buildFallbackSpec,
   isAgentName,
   resolveModel,
+  type AgentDefinition,
   type AgentName,
+  type BuildAgentSpecOptions,
 } from "./agents";
 
 // ---------------------------------------------------------------------------
@@ -41,6 +43,13 @@ import {
 
 /** A saved agent's name, or an inline manifest for the fallback lane. */
 export type AgentTarget = string | AgentSpec;
+
+/**
+ * A fallback that is only constructed if the primary lane actually fails.
+ * Building it lazily means the happy path costs nothing, and it lets the
+ * fallback be read back from the server rather than guessed at.
+ */
+export type FallbackFactory = () => AgentTarget | null | Promise<AgentTarget | null>;
 
 export interface RunAgentOptions<T = unknown> {
   client?: TrueForgeClient;
@@ -313,7 +322,7 @@ export interface FallbackOptions<T = unknown> extends RunAgentOptions<T> {
  */
 export async function runAgentWithFallback<T = unknown>(
   primary: AgentTarget,
-  fallback: AgentTarget | null,
+  fallback: AgentTarget | null | FallbackFactory,
   prompt: string,
   options: FallbackOptions<T> = {},
 ): Promise<AgentRunResult<T>> {
@@ -341,27 +350,83 @@ export async function runAgentWithFallback<T = unknown>(
     }
   }
 
-  if (!fallback) throw lastError;
+  const resolved = typeof fallback === "function" ? await fallback() : fallback;
+  if (!resolved) throw lastError;
 
   // A fresh session: the fallback model must not inherit a poisoned context.
-  const result = await runAgent<T>(fallback, prompt, { ...options, sessionId: undefined });
+  const result = await runAgent<T>(resolved, prompt, { ...options, sessionId: undefined });
   return { ...result, usedFallback: true, attempts: attempts + 1 };
+}
+
+/** What the server told us it can do, so the fallback is configured like the primary. */
+export interface RosterRunOptions<T = unknown> extends FallbackOptions<T> {
+  /** Model FQNs this TrueForge can serve, from `GET /models`. */
+  availableModels?: readonly string[];
+  /** Whether a sandbox provider is configured, from `GET /capabilities`. */
+  sandboxAvailable?: boolean;
+  /** Skill names configured on this TrueForge, from `GET /settings/skills`. */
+  availableSkills?: readonly string[];
 }
 
 /**
  * The roster-aware form: looks the agent up by name, and builds its fallback
- * manifest — the same instructions on the second model — automatically.
+ * manifest — the same agent on its second model — automatically.
+ *
+ * The fallback must be the primary with a different model and nothing else.
+ * Sandbox availability and mountable skills are the server's decision, not the
+ * roster's, so rebuilding a manifest without them turns the fallback into a
+ * different agent: ACT, FIX and VERIFY would ask for a sandbox that is not
+ * configured, and every lane would drop the skills the primary had mounted.
+ * That is a silent behaviour change on the one path where the result matters
+ * most, so the fallback is taken from the saved agent's own manifest wherever
+ * it can be read back, and only built locally as a last resort.
  */
 export async function runRosterAgent<T = unknown>(
   name: AgentName,
   prompt: string,
-  options: FallbackOptions<T> & { availableModels?: readonly string[] } = {},
+  options: RosterRunOptions<T> = {},
 ): Promise<AgentRunResult<T>> {
   const definition = AGENT_ROSTER[name];
-  const fallback = buildFallbackSpec(definition, {
+  const client = options.client ?? getTrueForgeClient();
+  const specOptions: BuildAgentSpecOptions = {
     availableModels: options.availableModels,
-  });
-  return runAgentWithFallback<T>(name, fallback, prompt, options);
+    sandboxAvailable: options.sandboxAvailable,
+    availableSkills: options.availableSkills,
+  };
+  return runAgentWithFallback<T>(
+    name,
+    () => resolveFallbackSpec(name, definition, client, specOptions, options.signal),
+    prompt,
+    options,
+  );
+}
+
+/**
+ * The saved agent's own manifest with the model swapped, so the retry differs
+ * from the original call in exactly one field. Falls back to the locally built
+ * manifest when the saved agent cannot be read — a fallback built from the
+ * roster is still better than no fallback at all.
+ */
+async function resolveFallbackSpec(
+  name: AgentName,
+  definition: AgentDefinition,
+  client: TrueForgeClient,
+  specOptions: BuildAgentSpecOptions,
+  signal?: AbortSignal,
+): Promise<AgentSpec | null> {
+  const local = buildFallbackSpec(definition, specOptions);
+  // No second model, or the primary already resolved to it.
+  if (!local) return null;
+
+  try {
+    const saved = (await client.listAgents(signal)).find((agent) => agent.name === name);
+    if (saved) {
+      return { ...saved.manifest, model: { ...saved.manifest.model, name: local.model.name } };
+    }
+  } catch {
+    // The control plane could not tell us; use what the roster knows.
+  }
+  return local;
 }
 
 function isRetryable(error: unknown): boolean {
