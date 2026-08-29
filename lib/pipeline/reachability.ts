@@ -29,6 +29,39 @@ import { isIP } from 'node:net';
 
 const TIMEOUT_MS = 15_000;
 
+/**
+ * The DNS budget when no wider deadline applies.
+ *
+ * `dns.lookup` takes neither a signal nor a timeout: it is the platform
+ * resolver, and it answers when it answers. A hostile or merely broken
+ * authoritative server can therefore hold a request open indefinitely, which is
+ * how a check advertised as fifteen seconds came to have no upper bound at all
+ * - and it happened once per redirect hop, so six times over.
+ *
+ * Racing the lookup against a timer does not cancel it; the resolution keeps
+ * running and is discarded. That is the whole of what can be done here, and it
+ * is enough: what matters is that the *caller* is released on schedule.
+ */
+const DNS_TIMEOUT_MS = 5_000;
+
+/** Wait for `work`, or give up with `onTimeout` once `ms` has passed. */
+async function withDeadline<T>(work: Promise<T>, ms: number, onTimeout: () => T): Promise<T> {
+  if (ms <= 0) return onTimeout();
+
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      work,
+      new Promise<T>((resolve) => {
+        timer = setTimeout(() => resolve(onTimeout()), ms);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 /** Redirect hops followed by hand. Each one is re-validated before it is taken. */
 const MAX_REDIRECTS = 5;
 
@@ -297,7 +330,10 @@ export interface AddressCheck {
  * loopback address is a rebinding attempt, and picking the public one would be
  * picking the answer the attacker wants us to see.
  */
-export async function resolveToPublicAddresses(host: string): Promise<AddressCheck> {
+export async function resolveToPublicAddresses(
+  host: string,
+  options: { timeoutMs?: number } = {},
+): Promise<AddressCheck> {
   if (isIP(host)) {
     const blocked = blockedAddressReason(host);
     return blocked
@@ -305,12 +341,29 @@ export async function resolveToPublicAddresses(host: string): Promise<AddressChe
       : { ok: true, addresses: [host], reason: `${host} is a public address.` };
   }
 
-  let records: { address: string }[];
+  const budget = Math.min(options.timeoutMs ?? DNS_TIMEOUT_MS, DNS_TIMEOUT_MS);
+  const timedOut = Symbol('dns-timeout');
+
+  let records: { address: string }[] | typeof timedOut;
   try {
-    records = await lookup(host, { all: true, verbatim: true });
+    records = await withDeadline<{ address: string }[] | typeof timedOut>(
+      lookup(host, { all: true, verbatim: true }),
+      budget,
+      () => timedOut,
+    );
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
     return { ok: false, addresses: [], reason: `"${host}" does not resolve (${message}).` };
+  }
+
+  if (records === timedOut) {
+    return {
+      ok: false,
+      addresses: [],
+      reason:
+        `Looking up "${host}" took longer than ${(budget / 1000).toFixed(1)}s. The name may not ` +
+        'exist, or its nameservers may not be answering.',
+    };
   }
 
   if (records.length === 0) {
@@ -348,12 +401,22 @@ export async function resolveToPublicAddresses(host: string): Promise<AddressChe
  * whose body is never returned to the caller, so the residual exposure is a
  * status code.
  */
-async function vetHop(raw: string): Promise<{ ok: true; url: URL } | { ok: false; reason: string }> {
+async function vetHop(
+  raw: string,
+  deadline: number,
+): Promise<{ ok: true; url: URL } | { ok: false; reason: string }> {
   const validated = validateDeployedUrl(raw);
   if (!validated.ok) return validated;
 
   const url = new URL(validated.url);
-  const resolution = await resolveToPublicAddresses(hostnameOf(url));
+  /*
+   * The lookup draws on the *request's* remaining budget, not a fresh one per
+   * hop. Six hops each entitled to their own DNS timeout is how a check with a
+   * fifteen-second contract came to be able to run for half a minute.
+   */
+  const resolution = await resolveToPublicAddresses(hostnameOf(url), {
+    timeoutMs: deadline - Date.now(),
+  });
   if (!resolution.ok) return { ok: false, reason: resolution.reason };
 
   return { ok: true, url };
@@ -383,12 +446,18 @@ export async function checkDeployedUrl(raw: string): Promise<ReachabilityResult>
     elapsedMs: Date.now() - started,
   });
 
-  const first = await vetHop(entry);
+  /*
+   * One deadline for the whole check, computed before the first thing that can
+   * block. It used to be computed *after* the first `vetHop`, which meant the
+   * opening DNS lookup sat outside the budget it was supposed to be inside.
+   */
+  const deadline = started + TIMEOUT_MS;
+
+  const first = await vetHop(entry, deadline);
   if (!first.ok) return refuse(first.reason);
 
   const requested = first.url.toString();
   let current = first.url;
-  const deadline = started + TIMEOUT_MS;
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop += 1) {
     const remaining = deadline - Date.now();
@@ -444,7 +513,7 @@ export async function checkDeployedUrl(raw: string): Promise<ReachabilityResult>
       }
 
       // The whole point: a public first hop does not buy a private second one.
-      const vetted = await vetHop(next);
+      const vetted = await vetHop(next, deadline);
       if (!vetted.ok) {
         return refuse(
           `${current.toString()} redirected to ${next}, which was refused: ${vetted.reason}`,

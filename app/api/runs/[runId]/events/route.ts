@@ -31,6 +31,16 @@ const HEARTBEAT_MS = 15_000;
  */
 const POLL_MS = 3_000;
 
+/**
+ * How many live events are held while the durable replay is still failing.
+ *
+ * Overflow is safe rather than lossy: every event on the bus is also a row in
+ * the table, and the replay cursor only advances over rows a successful read
+ * returned - so anything dropped here is delivered by the next poll instead.
+ * The cap exists so a database outage cannot grow this array without bound.
+ */
+const MAX_BUFFERED_EVENTS = 2_000;
+
 export async function GET(
   request: Request,
   { params }: { params: Promise<{ runId: string }> },
@@ -49,7 +59,30 @@ export async function GET(
   const afterId = Number.isFinite(since) && since > 0 ? since : 0;
 
   const encoder = new TextEncoder();
-  let highWater = afterId;
+
+  /**
+   * How far the durable log has been read *contiguously*: every event at or
+   * below this id has been delivered to this client.
+   *
+   * Only a successful `readRunEvents` advances it, and only over rows that read
+   * actually returned - so a read that fails is retried from the same place
+   * rather than skipped past. This is the replay cursor, and keeping it
+   * separate from "what has been written" is the whole fix: a live event
+   * arriving off the bus says nothing about how much of the log has been read,
+   * and letting one advance the other punches a permanent hole in the timeline.
+   */
+  let replayedThrough = afterId;
+
+  /**
+   * Ids written *above* the contiguous cursor, so they are not written twice.
+   *
+   * A set rather than a second high-water mark, because delivery above the
+   * cursor is not ordered: a live event from the bus and a row from another
+   * process's poll can arrive either way round, and a threshold would silently
+   * discard whichever came second. Pruned every time the cursor advances over
+   * it, so it holds at most one poll interval's worth of ids.
+   */
+  const deliveredAbove = new Set<number>();
 
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
@@ -71,8 +104,8 @@ export async function GET(
       };
 
       const send = (event: RunEventPayload): void => {
-        if (event.id <= highWater) return;
-        highWater = event.id;
+        if (event.id <= replayedThrough || deliveredAbove.has(event.id)) return;
+        deliveredAbove.add(event.id);
         write(
           `id: ${event.id}\nevent: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`,
         );
@@ -112,36 +145,73 @@ export async function GET(
        * was waiting for.
        *
        * Everything that arrives on the bus before the replay finishes is held
-       * here and flushed after it, in id order. `send` drops anything at or
-       * below the high-water mark, so an event that appears in both the buffer
-       * and the replay is written once.
+       * here and flushed after it, in id order - and only once the durable read
+       * has actually succeeded. `send` skips anything already delivered, so an
+       * event that appears in both the buffer and the replay is written once.
        */
       const buffered: RunEventPayload[] = [];
       let replaying = true;
+      let replayErrorReported = false;
 
       cleanup.push(
         subscribeToRun(runId, (event) => {
-          if (replaying) buffered.push(event);
-          else send(event);
+          if (!replaying) {
+            send(event);
+            return;
+          }
+          if (buffered.length < MAX_BUFFERED_EVENTS) buffered.push(event);
         }),
       );
 
+      /**
+       * Read the durable log forward from the replay cursor, and release the
+       * buffer once - and only once - that read has succeeded.
+       *
+       * The buffer is not flushed on a failed replay, and that is the point.
+       * Flushing it would write live ids and drag `highWater` past history the
+       * client never received; every later query would then start after those
+       * ids and the missing rows would be unreachable for the life of the
+       * connection - a permanent hole punched by one transient database error.
+       * Holding the buffer instead costs latency, which a retry three seconds
+       * later repays, and history is not skipped.
+       *
+       * Throws on a read failure. Callers decide whether that is worth
+       * reporting; the cursor is untouched either way.
+       */
+      const drainDurable = async (): Promise<void> => {
+        const rows = await readRunEvents(runId, { afterId: replayedThrough });
+
+        // Written first, then the cursor moves over the whole batch at once:
+        // `send` skips anything already delivered off the bus.
+        for (const event of rows) send(event);
+
+        for (const event of rows) {
+          if (event.id > replayedThrough) replayedThrough = event.id;
+        }
+        for (const id of deliveredAbove) {
+          if (id <= replayedThrough) deliveredAbove.delete(id);
+        }
+
+        if (!replaying) return;
+
+        // 3. The log is caught up; live events may now go straight out.
+        replaying = false;
+        for (const event of buffered.sort((a, b) => a.id - b.id)) send(event);
+        buffered.length = 0;
+      };
+
       // 2. Replay. Everything the client missed, in order.
       try {
-        for (const event of await readRunEvents(runId, { afterId })) send(event);
+        await drainDurable();
       } catch (error) {
+        replayErrorReported = true;
         write(
           `event: error\ndata: ${JSON.stringify({
-            error: 'Could not replay the run log.',
+            error: 'Could not replay the run log; retrying.',
             reason: error instanceof Error ? error.message : String(error),
           })}\n\n`,
         );
       }
-
-      // 3. Flush whatever landed while the replay was in flight.
-      replaying = false;
-      for (const event of buffered.sort((a, b) => a.id - b.id)) send(event);
-      buffered.length = 0;
 
       /**
        * Close the stream on a terminal run - but never before one last read.
@@ -160,7 +230,15 @@ export async function GET(
         if (!isTerminal(current.state)) return false;
         if (isRunning(runId) || (await isLeased(runId))) return false;
 
-        for (const event of await readRunEvents(runId, { afterId: highWater })) send(event);
+        /*
+         * Never end a stream that still owes the client history. While
+         * `replaying` is true the initial durable read has not succeeded, so
+         * closing now would deliver an `end` frame over a gap - the exact
+         * silent hole the split cursor exists to prevent. The connection stays
+         * open and the poll keeps retrying until the log can be read.
+         */
+        await drainDurable();
+        if (replaying) return false;
 
         write(
           `event: end\ndata: ${JSON.stringify({
@@ -182,11 +260,26 @@ export async function GET(
       const poll = setInterval(() => {
         void (async () => {
           try {
-            for (const event of await readRunEvents(runId, { afterId: highWater })) send(event);
+            await drainDurable();
             await finishIfTerminal();
-          } catch {
-            // A transient database error must not kill the stream; the next
-            // tick tries again.
+            replayErrorReported = false;
+          } catch (error) {
+            /*
+             * A transient database error must not kill the stream; the next
+             * tick tries again, and from the same cursor, so nothing is
+             * skipped. Reported once per outage rather than every three
+             * seconds - a client that saw the first frame does not need
+             * twenty more saying the same thing.
+             */
+            if (!replayErrorReported) {
+              replayErrorReported = true;
+              write(
+                `event: error\ndata: ${JSON.stringify({
+                  error: 'Could not read the run log; retrying.',
+                  reason: error instanceof Error ? error.message : String(error),
+                })}\n\n`,
+              );
+            }
           }
         })();
       }, POLL_MS);

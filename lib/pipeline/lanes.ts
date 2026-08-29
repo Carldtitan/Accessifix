@@ -42,8 +42,27 @@ import type { FindingClaim } from './ledger';
 /* Audit lanes                                                                */
 /* -------------------------------------------------------------------------- */
 
+/**
+ * Cancellation, offered to everything the conductor dispatches.
+ *
+ * The conductor aborts when the run is cancelled and when it loses its
+ * conductor lease to another process. Neither reaches work that never accepted
+ * a signal, and until this field existed none of the contracts below did - so a
+ * displaced conductor kept writing findings, running builds and opening pull
+ * requests beside its successor.
+ *
+ * Optional, so an implementation that does not yet honour it still satisfies
+ * the contract. Honouring it is the difference between the conductor asking
+ * work to stop and the work actually stopping; `orchestrate.ts` additionally
+ * re-confirms ownership against the database before every durable and external
+ * write, which is what bounds the damage until every lane reads this.
+ */
+export interface Cancellable {
+  signal?: AbortSignal;
+}
+
 /** What a per-page lane is handed. */
-export interface AuditPageInput {
+export interface AuditPageInput extends Cancellable {
   runId: string;
   phase: RunPhase;
   pageId: string;
@@ -67,11 +86,13 @@ export type ActLane = (
 ) => Promise<AuditLaneResult>;
 
 /** PAGES receives the whole crawl at once (A3.5). */
-export type PagesLane = (input: {
-  runId: string;
-  phase: RunPhase;
-  pages: readonly AuditPageInput[];
-}) => Promise<AuditLaneResult>;
+export type PagesLane = (
+  input: Cancellable & {
+    runId: string;
+    phase: RunPhase;
+    pages: readonly AuditPageInput[];
+  },
+) => Promise<AuditLaneResult>;
 
 /* -------------------------------------------------------------------------- */
 /* FIX (A5)                                                                   */
@@ -91,7 +112,7 @@ export interface ProposedPatch {
   findingIds?: readonly string[];
 }
 
-export type WritePatches = (input: {
+export type WritePatches = (input: Cancellable & {
   runId: string;
   repoFullName: string;
   /** The user's own GitHub token (A1.4). */
@@ -109,7 +130,7 @@ export type WritePatches = (input: {
 /* VERIFY (A6)                                                                */
 /* -------------------------------------------------------------------------- */
 
-export type VerifyPatches = (input: {
+export type VerifyPatches = (input: Cancellable & {
   runId: string;
   repoFullName: string;
   accessToken: string;
@@ -134,7 +155,7 @@ export type VerifyPatches = (input: {
 /* GitHub (A1.4, A10.5)                                                       */
 /* -------------------------------------------------------------------------- */
 
-export type OpenPullRequest = (input: {
+export type OpenPullRequest = (input: Cancellable & {
   runId: string;
   repoFullName: string;
   accessToken: string;
@@ -184,7 +205,7 @@ export const runPagesLane: PagesLane = pagesLane;
  * produced — a control vision can see that the accessibility tree cannot is a
  * finding the moment it is noticed, not something ACT has to confirm.
  */
-export const enumerateInteractionPaths: (input: {
+export const enumerateInteractionPaths: (input: Cancellable & {
   runId: string;
   pageUrl: string;
   capture: PageCapture;
