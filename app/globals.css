@@ -876,27 +876,38 @@ code, pre, kbd, samp { font-family: var(--font-mono); }
 /* ---------- Landing ---------- */
 
 .landing-page {
-  min-height: 100svh;
+  /*
+   * The whole page fits one viewport at 100% zoom. Nothing here is worth a
+   * scroll: a visitor either signs in or leaves, and making them scroll to
+   * reach the button costs more than any extra sentence could earn.
+   * 100svh, not vh, so mobile browser chrome does not push the CTA off screen.
+   */
+  height: 100svh;
+  overflow: hidden;
   display: flex; flex-direction: column;
-  padding: 26px clamp(20px, 4.5vw, 72px) 40px;
+  padding: 22px clamp(20px, 4.5vw, 72px) 22px;
   background: var(--mineral);
 }
-.landing-header { width: min(1180px, 100%); margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 20px; }
-.landing-brand { display: inline-flex; align-items: center; gap: 11px; font-family: var(--font-display); font-size: 20px; font-weight: 720; letter-spacing: -0.03em; }
-.landing-main { width: min(1180px, 100%); flex: 1; margin: 0 auto; padding: clamp(52px, 9vh, 104px) 0 40px; }
+.landing-header { width: min(1120px, 100%); margin: 0 auto; display: flex; align-items: center; justify-content: space-between; gap: 20px; flex: 0 0 auto; }
+.landing-brand { display: inline-flex; align-items: center; gap: 11px; font-family: var(--font-display); font-size: 19px; font-weight: 720; letter-spacing: -0.03em; }
+.landing-main {
+  width: min(1120px, 100%); margin: 0 auto; padding: 0;
+  flex: 1 1 auto; min-height: 0;
+  display: flex; flex-direction: column; justify-content: center; gap: clamp(28px, 5vh, 56px);
+}
 .landing-copy h1 {
-  max-width: 17ch; margin: 0;
-  font-size: clamp(40px, 5.2vw, 70px); line-height: 1.02;
+  max-width: 20ch; margin: 0;
+  /* Capped with vh as well as vw so a short viewport shrinks the headline
+     rather than pushing the proof row out of sight. */
+  font-size: clamp(32px, min(4.6vw, 7.2vh), 60px); line-height: 1.03;
   letter-spacing: -0.035em; font-weight: 660;
   text-wrap: balance;
 }
-.landing-lede { max-width: 62ch; margin: 24px 0 0; color: var(--brown-700); font-size: clamp(16px, 1.2vw, 19px); line-height: 1.5; }
-.landing-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 14px; margin-top: 32px; }
-.landing-actions small { max-width: 46ch; color: var(--text-muted); font-size: var(--text-caption); line-height: 1.5; }
-.landing-actions small a { color: var(--terracotta-dark); font-weight: 700; text-decoration: underline; }
+.landing-lede { max-width: 54ch; margin: 18px 0 0; color: var(--brown-700); font-size: clamp(15px, 1.15vw, 18px); line-height: 1.5; text-wrap: pretty; }
+.landing-copy .button.large { margin-top: clamp(20px, 3vh, 30px); }
 .landing-proof {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(238px, 1fr)); gap: 14px;
-  margin: clamp(46px, 7vh, 80px) 0 0; padding: 0; list-style: none;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px;
+  margin: 0; padding: 0; list-style: none;
 }
 .proof-module {
   display: grid; gap: 8px; align-content: start;
@@ -905,8 +916,8 @@ code, pre, kbd, samp { font-family: var(--font-mono); }
   background: rgba(255, 253, 249, 0.96);
   box-shadow: 0 1px 0 rgba(255, 255, 255, 0.92) inset, 0 20px 52px rgba(57, 34, 23, 0.09), 0 4px 12px rgba(57, 34, 23, 0.05);
 }
-.proof-module h2 { margin: 4px 0 0; font-size: 17px; font-weight: 670; letter-spacing: -0.02em; }
-.proof-module p { margin: 0; color: var(--brown-700); font-size: 13px; line-height: 1.55; }
+.proof-module h2 { margin: 3px 0 0; font-size: 16px; font-weight: 670; letter-spacing: -0.02em; }
+.proof-module p { margin: 0; color: var(--brown-700); font-size: 12.5px; line-height: 1.5; }
 .proof-module code { font-size: var(--text-caption); color: var(--brown-700); line-height: 1.7; }
 .proof-module.is-dark {
   color: #fff6ed; border-color: rgba(255, 255, 255, 0.07); background: var(--espresso-800);
@@ -915,7 +926,7 @@ code, pre, kbd, samp { font-family: var(--font-mono); }
 .proof-module.is-dark .eyebrow { color: #d8c3b6; }
 .proof-module.is-dark p { color: #e8d6c9; }
 .proof-module.is-dark code { color: #fff6ed; }
-.landing-footer { width: min(1180px, 100%); max-width: 78ch; margin: 0 auto; padding-top: 26px; color: var(--text-muted); font-size: var(--text-caption); line-height: 1.6; }
+.landing-footer { width: min(1120px, 100%); max-width: 78ch; margin: 0 auto; padding-top: 16px; flex: 0 0 auto; color: var(--text-muted); font-size: var(--text-caption); line-height: 1.5; }
 
 /* ---------- Responsive ---------- */
 
