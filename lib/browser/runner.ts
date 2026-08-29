@@ -232,6 +232,7 @@ export async function capturePage(
     axTree: result.axTree,
     screenshot,
     axeViolations: result.axeViolations,
+    axeRan: result.axeRan,
     links: result.links,
     warnings: result.warnings,
   };
@@ -304,6 +305,7 @@ export async function auditPage(
       axTree: result.axTree,
       screenshot,
       axeViolations: result.axeViolations,
+      axeRan: result.axeRan,
       links: result.links,
       warnings: result.warnings,
     },
