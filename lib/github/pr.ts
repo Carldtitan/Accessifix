@@ -177,7 +177,22 @@ function lead(
         'suite proved nothing either. That is stated here rather than presented as a pass.'
       : 'This repository has no unit test suite, so nothing else ran — which is stated here ' +
         'rather than presented as a pass.'
-    : "This repository's own test suite still passes.";
+    : /*
+       * VERIFY's own sentence, when it wrote one.
+       *
+       * `testsPassed` is baseline-aware: it means "no test this change touched
+       * regressed", not "every test is green". Clearway's suite is red on main,
+       * and this body used to answer that with "This repository's own test
+       * suite still passes" — a claim a reviewer disproves by running it once,
+       * in the one document whose whole purpose is to be believed.
+       *
+       * `tests.summary` is what the verifier concluded, having run the suite
+       * over the base tree first and compared it test by test. It says the
+       * suite is red and says the red is not ours.
+       */
+      input.tests.summary.trim().length > 0
+      ? input.tests.summary.trim()
+      : "This repository's own test suite still passes.";
 
   const verified = [
     `${buildSentence} ${testSentence}`,
