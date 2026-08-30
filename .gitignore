@@ -11,3 +11,6 @@ next-env.d.ts
 
 .vercel
 .env*
+
+# Local-only dev scripts (not part of the product).
+.local/
