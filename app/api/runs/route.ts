@@ -12,13 +12,14 @@
  * connect a target".
  */
 import { and, desc, eq, inArray, sql } from 'drizzle-orm';
-import { NextResponse } from 'next/server';
+import { after, NextResponse } from 'next/server';
 import { z } from 'zod';
 
 import { db } from '@/lib/db';
 import { findings, runs, targets, RUN_STATUSES } from '@/lib/db/schema';
 import { currentUser, errorBody, targetForUser, UNAUTHORIZED } from '@/lib/pipeline/access';
-import { startRun } from '@/lib/pipeline/orchestrate';
+import { executeRun, startRun } from '@/lib/pipeline/orchestrate';
+import { demoReady, DEMO_TARGET_ID } from '@/lib/demo';
 import { checkDeployedUrl } from '@/lib/pipeline/reachability';
 import { DEFAULT_MAX_CONCURRENT_SANDBOXES, MAX_PAGES_PER_CRAWL } from '@/lib/sandbox/config';
 
@@ -103,6 +104,22 @@ export async function POST(request: Request): Promise<NextResponse> {
     );
   }
 
+  /*
+   * The demo runs one target, and runs it as far as a shared identity honestly
+   * can. A visitor supplies nothing: the target is pinned, the crawl is capped
+   * at the landing page, and `baselineOnly` stops the pipeline at the score,
+   * before anything would be written to a repository they do not own.
+   */
+  const demo = demoReady();
+  if (demo) {
+    (body as Record<string, unknown>) = {
+      ...(typeof body === 'object' && body !== null ? body : {}),
+      ...(DEMO_TARGET_ID ? { targetId: DEMO_TARGET_ID } : {}),
+      baselineOnly: true,
+      maxPages: 1,
+    };
+  }
+
   const parsed = StartRun.safeParse(body);
   if (!parsed.success) {
     return NextResponse.json(
@@ -158,6 +175,35 @@ export async function POST(request: Request): Promise<NextResponse> {
   // The await is the conductor *claim*, not the run: `startRun` takes the
   // durable lease that stops a second process conducting the same run, then
   // hands the pipeline off to the background and returns.
+  /*
+   * On a serverless host the function is frozen once the response is written,
+   * which would kill the pipeline `startRun` hands to the background a second
+   * after it began. `after()` keeps the invocation alive until the work
+   * finishes, so the run the visitor is watching actually progresses.
+   *
+   * A long-lived server does not need this and does not use it: there the
+   * conductor outlives the request on its own.
+   */
+  if (demo) {
+    after(async () => {
+      await executeRun(run.id, {
+        baselineOnly: true,
+        ...(parsed.data.maxPages === undefined ? {} : { maxPages: parsed.data.maxPages }),
+      }).catch(() => undefined);
+    });
+
+    return NextResponse.json(
+      {
+        run,
+        started: true,
+        conductor: 'Demo run: baseline audit only, no repository is written to.',
+        target: { id: target.id, repoFullName: target.repoFullName, deployedUrl: target.deployedUrl },
+        events: `/api/runs/${run.id}/events`,
+      },
+      { status: 202 },
+    );
+  }
+
   const { started, reason: conductor } = await startRun(run.id, {
     baselineOnly: parsed.data.baselineOnly,
     maxPages: parsed.data.maxPages,

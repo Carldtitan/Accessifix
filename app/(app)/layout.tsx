@@ -1,4 +1,5 @@
 import { AppShell } from "@/components/AppShell";
+import { demoReady } from "@/lib/demo";
 
 import { listTargets, sessionUser } from "./_data";
 
@@ -32,6 +33,8 @@ export default async function AppLayout({
     <AppShell
       user={{ name: user.name, ...(user.email ? { email: user.email } : {}) }}
       targetName={targets[0]?.repoFullName ?? "None connected"}
+      demo={demoReady()}
+      repoUrl="https://github.com/Carldtitan/Accessifix"
     >
       {children}
     </AppShell>

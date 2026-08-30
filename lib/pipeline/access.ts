@@ -10,6 +10,7 @@
 import { and, eq } from 'drizzle-orm';
 
 import { auth } from '@/auth';
+import { demoReady, demoUser } from '@/lib/demo';
 import { db } from '@/lib/db';
 import { accounts, runs, targets, type Run, type Target } from '@/lib/db/schema';
 
@@ -20,6 +21,11 @@ export interface SignedInUser {
 
 /** The signed-in user, or `null`. Routes turn `null` into a 401. */
 export async function currentUser(): Promise<SignedInUser | null> {
+  // The hosted demo has no sign-in. Every visitor acts as the one account that
+  // owns the Clearway target; see `lib/demo.ts` for what that does and does not
+  // permit. Off in every other deployment, including a local checkout.
+  if (demoReady()) return { id: demoUser().id, email: null };
+
   const session = await auth();
   const id = session?.user?.id;
   if (!id) return null;

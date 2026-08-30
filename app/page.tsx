@@ -3,6 +3,7 @@ import { redirect } from "next/navigation";
 
 import { auth } from "@/auth";
 import { BrandMark, Icon } from "@/components/Icon";
+import { demoReady } from "@/lib/demo";
 
 export const metadata: Metadata = {
   title: "AccessiFix",
@@ -48,6 +49,10 @@ export default async function LandingPage() {
    * A signed-in visitor asking for the landing page wants their workspace, not
    * a pitch and a sign-in button they have already used.
    */
+  // The hosted demo has no sign-in to offer, so the pitch page would be a
+  // dead end with a button that asks for a GitHub scope nobody needs to grant.
+  if (demoReady()) redirect("/app");
+
   const session = await auth();
   if (session?.user) redirect("/app");
 

@@ -33,10 +33,16 @@ export function AppShell({
   children,
   user = { name: "Demo Reviewer", email: "reviewer@example.com" },
   targetName = "Clearway",
+  demo = false,
+  repoUrl,
 }: {
   children: React.ReactNode;
   user?: ShellUser;
   targetName?: string;
+  /** Public demo: there is no session, so there is nothing to sign out of. */
+  demo?: boolean;
+  /** Where to read the code. The demo's visitors are here to review it. */
+  repoUrl?: string;
 }) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
@@ -167,12 +173,33 @@ export function AppShell({
             posting without it fails with MissingCSRF and redirects to the
             sign-in page with an error - which reads as a broken sign-in.
           */}
-          <form action={signOutAction} className="signout-form">
-            <button className="signout-button" type="submit" onClick={closeMenu}>
-              <Icon name="back" size={15} />
-              <span>Sign out</span>
-            </button>
-          </form>
+          {/*
+            No session in the demo, so no sign-out: a control that clears
+            nothing and returns you to the same page reads as broken. The
+            source link takes its place, because a reviewer arriving without
+            an account is here to read the code.
+          */}
+          {demo ? (
+            repoUrl ? (
+              <a
+                className="signout-button"
+                href={repoUrl}
+                target="_blank"
+                rel="noreferrer noopener"
+                onClick={closeMenu}
+              >
+                <Icon name="github" size={15} />
+                <span>View the source</span>
+              </a>
+            ) : null
+          ) : (
+            <form action={signOutAction} className="signout-form">
+              <button className="signout-button" type="submit" onClick={closeMenu}>
+                <Icon name="back" size={15} />
+                <span>Sign out</span>
+              </button>
+            </form>
+          )}
         </div>
       </aside>
 

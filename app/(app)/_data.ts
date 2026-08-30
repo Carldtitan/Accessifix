@@ -14,6 +14,7 @@ import { and, desc, eq, inArray, sql } from "drizzle-orm";
 import { redirect } from "next/navigation";
 
 import { auth } from "@/auth";
+import { demoReady, demoUser } from "@/lib/demo";
 import { db } from "@/lib/db";
 import { getCriterion } from "@/lib/db/criteria";
 import {
@@ -60,6 +61,9 @@ export interface SessionUser {
 
 /** The signed-in user, or `null`. */
 export async function sessionUser(): Promise<SessionUser | null> {
+  // The hosted demo shows the workspace without a sign-in (see `lib/demo.ts`).
+  if (demoReady()) return demoUser();
+
   const session = await auth();
   const id = session?.user?.id;
   if (!id) return null;
