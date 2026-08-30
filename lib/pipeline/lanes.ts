@@ -180,6 +180,14 @@ export type VerifyPatches = (input: {
    * way to the pull-request gate, which treats the two differently.
    */
   buildRan: boolean;
+  /**
+   * Whether the suite is a reason to refuse — not whether every test is green.
+   *
+   * VERIFY runs the suite on the base tree as well as the patched one, so a
+   * test that was already failing before the change is reported rather than
+   * treated as a failure of this patch. A test the patch *broke* always sets
+   * this false; `baseline` below says which is which.
+   */
   testsPassed: boolean;
   /** Whether any test actually ran. A missing suite is unproven, never a pass. */
   testsRan: boolean;
@@ -187,6 +195,26 @@ export type VerifyPatches = (input: {
   testCommand: string;
   /** Trimmed tail of the output. The full log stays in the sandbox (A9.2). */
   testSummary: string;
+  /** Every test failing on the patched tree, whoever's fault it is (A6.4). */
+  failingTests?: readonly {
+    id: string;
+    file: string;
+    name: string;
+    message: string | null;
+  }[];
+  /**
+   * A6.4: the base-tree run, and what comparing it against the patched run
+   * showed. This is what tells a maintainer whether the change is at fault.
+   */
+  baseline?: {
+    ran: boolean;
+    comparable: boolean;
+    reason: string;
+    preExisting: readonly { id: string; message: string | null }[];
+    regressions: readonly { id: string; message: string | null }[];
+    introduced: readonly { id: string; message: string | null }[];
+    fixed: readonly { id: string; message: string | null }[];
+  };
   /** A6.3: per-criterion re-check for every criterion a patch claimed. */
   recheck: readonly { criterion: string; resolved: boolean; note: string }[];
   /** A6.4: VERIFY's gate on the pull request. */

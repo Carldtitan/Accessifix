@@ -1368,21 +1368,24 @@ async function verifyPhase(
         .where(and(eq(findings.runId, context.runId), inArray(findings.id, coveredFindingIds)));
     }
 
+    // "tests failed" on its own sent a maintainer to read a diff that was fine.
+    // The line has to answer the only question they have — *is our change at
+    // fault?* — so it names the tests and says whether they were already red.
     await emitEvent({
       runId: context.runId,
       type: 'log',
       agent: 'VERIFY',
       capability: 'sandbox',
-      summary: passed
-        ? `Build and ${outcome.testCommand} passed; ${criteriaFixed.length} criterion(s) re-checked clean.`
-        : `Verification failed: ${outcome.buildPassed ? 'build ok' : 'build failed'}, ${outcome.testsPassed ? 'tests ok' : 'tests failed'}.`,
-      detail: outcome.testSummary,
+      summary: verifySummaryLine(outcome, passed, criteriaFixed.length),
+      detail: verifyDetail(outcome),
       data: {
         buildPassed: outcome.buildPassed,
         testsPassed: outcome.testsPassed,
         testCommand: outcome.testCommand,
         recommendation: outcome.recommendation,
         recheck: outcome.recheck,
+        failingTests: outcome.failingTests ?? [],
+        baseline: outcome.baseline ?? null,
       },
     });
 
@@ -1397,14 +1400,17 @@ async function verifyPhase(
         recommendation: outcome.recommendation,
         criteriaFixed,
         previewUrl: outcome.previewUrl ?? null,
+        failingTests: outcome.failingTests ?? [],
+        baseline: outcome.baseline ?? null,
       },
     });
 
     return {
       ok: passed,
       reason: passed
-        ? `Build and ${outcome.testCommand} passed. ${criteriaFixed.length} criterion(s) re-checked clean.`
-        : `The target's own test suite did not pass (${outcome.testCommand}), so no pull request was opened (A6.4). ${outcome.testSummary}`,
+        ? `Build and ${outcome.testCommand} passed. ${criteriaFixed.length} criterion(s) re-checked clean.` +
+          preExistingNote(outcome)
+        : `${verifySummaryLine(outcome, passed, criteriaFixed.length)} ${outcome.testSummary}`,
       criteriaFixed,
       previewUrl: outcome.previewUrl ?? null,
       evidence: {
@@ -1437,6 +1443,86 @@ async function verifyPhase(
       },
     };
   }
+}
+
+/** The shape the verify seam hands back, narrowed to what the timeline reads. */
+type VerifySeamOutcome = Awaited<ReturnType<typeof verifyPatches>>;
+
+/**
+ * The one line a maintainer sees in the timeline.
+ *
+ * "Verification failed: build ok, tests failed" told them nothing they could
+ * act on — not which tests, and above all not whether the change was at fault.
+ * Every branch below answers that, because reading it is how a maintainer
+ * decides whether to look at the diff or at their own `main`.
+ */
+function verifySummaryLine(
+  outcome: VerifySeamOutcome,
+  passed: boolean,
+  criteriaCount: number,
+): string {
+  const baseline = outcome.baseline;
+  const command = outcome.testCommand || 'the test suite';
+
+  if (passed) {
+    const preExisting = baseline?.preExisting.length ?? 0;
+    return preExisting > 0
+      ? `Build passed and ${command} regressed nothing; ` +
+          `${preExisting} test(s) were already failing on the base branch. ` +
+          `${criteriaCount} criterion(s) re-checked clean.`
+      : `Build and ${command} passed; ${criteriaCount} criterion(s) re-checked clean.`;
+  }
+
+  const broke = [...(baseline?.regressions ?? []), ...(baseline?.introduced ?? [])];
+  if (broke.length > 0) {
+    return (
+      `Verification failed: this change broke ${broke.length} test(s) that passed on the ` +
+      `base branch — ${broke.slice(0, 3).map((test) => test.id).join(', ')}` +
+      `${broke.length > 3 ? `, and ${broke.length - 3} more` : ''}.`
+    );
+  }
+  if (!outcome.buildPassed) {
+    return `Verification failed: the patched tree did not build (${command} not reached, or reached and separate).`;
+  }
+  if (baseline && !baseline.comparable && !outcome.testsPassed) {
+    return (
+      `Verification failed: ${command} failed and no baseline comparison was possible, so ` +
+      'every failure is counted against this change.'
+    );
+  }
+  return `Verification failed: build ok, ${command} did not clear the gate.`;
+}
+
+/** The paragraph under that line: the comparison, then the runner's own words. */
+function verifyDetail(outcome: VerifySeamOutcome): string {
+  const baseline = outcome.baseline;
+  const parts: string[] = [];
+  if (baseline) {
+    parts.push(baseline.ran ? baseline.reason : `No baseline run: ${baseline.reason}`);
+  }
+  if (outcome.testSummary) parts.push(outcome.testSummary);
+  const failing = outcome.failingTests ?? [];
+  if (failing.length > 0) {
+    parts.push(
+      'Failing now: ' +
+        failing
+          .slice(0, 10)
+          .map((test) => `${test.id}${test.message ? ` — ${test.message}` : ''}`)
+          .join('; ') +
+        (failing.length > 10 ? `; and ${failing.length - 10} more` : ''),
+    );
+  }
+  return parts.join('\n\n');
+}
+
+/** A pass that carried somebody else's broken tests past should say so. */
+function preExistingNote(outcome: VerifySeamOutcome): string {
+  const preExisting = outcome.baseline?.preExisting.length ?? 0;
+  if (preExisting === 0) return '';
+  return (
+    ` ${preExisting} test(s) were already failing on the base branch before this change and ` +
+    'still are; none of them are this change\'s doing.'
+  );
 }
 
 /* -------------------------------------------------------------------------- */
