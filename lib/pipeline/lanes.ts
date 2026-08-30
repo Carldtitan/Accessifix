@@ -37,6 +37,7 @@ import type { InteractionPath, PageCapture } from '@/lib/browser/types';
 import type { Finding, RunPhase } from '@/lib/db/schema';
 
 import type { FindingClaim } from './ledger';
+import type { FixableFinding } from '@/lib/fix/group';
 
 /* -------------------------------------------------------------------------- */
 /* Audit lanes                                                                */
@@ -152,6 +153,13 @@ export type WritePatches = (input: {
   patches: readonly ProposedPatch[];
   /** Findings FIX declined to touch, each with a reason. */
   skipped?: readonly { criterion: string; reason: string }[];
+  /**
+   * Repairs the response parser had to make on the way — a reply in the wrong
+   * shape, a path it had to reconcile. Not failures, but the run timeline wants
+   * them: contract drift between this seam and the saved agent manifest is
+   * invisible until it costs a whole run.
+   */
+  warnings?: readonly string[];
   sessionId?: string | null;
 }>;
 
@@ -173,6 +181,14 @@ export type VerifyPatches = (input: {
    * way to the pull-request gate, which treats the two differently.
    */
   buildRan: boolean;
+  /**
+   * Whether the suite is a reason to refuse — not whether every test is green.
+   *
+   * VERIFY runs the suite on the base tree as well as the patched one, so a
+   * test that was already failing before the change is reported rather than
+   * treated as a failure of this patch. A test the patch *broke* always sets
+   * this false; `baseline` below says which is which.
+   */
   testsPassed: boolean;
   /** Whether any test actually ran. A missing suite is unproven, never a pass. */
   testsRan: boolean;
@@ -180,6 +196,26 @@ export type VerifyPatches = (input: {
   testCommand: string;
   /** Trimmed tail of the output. The full log stays in the sandbox (A9.2). */
   testSummary: string;
+  /** Every test failing on the patched tree, whoever's fault it is (A6.4). */
+  failingTests?: readonly {
+    id: string;
+    file: string;
+    name: string;
+    message: string | null;
+  }[];
+  /**
+   * A6.4: the base-tree run, and what comparing it against the patched run
+   * showed. This is what tells a maintainer whether the change is at fault.
+   */
+  baseline?: {
+    ran: boolean;
+    comparable: boolean;
+    reason: string;
+    preExisting: readonly { id: string; message: string | null }[];
+    regressions: readonly { id: string; message: string | null }[];
+    introduced: readonly { id: string; message: string | null }[];
+    fixed: readonly { id: string; message: string | null }[];
+  };
   /** A6.3: per-criterion re-check for every criterion a patch claimed. */
   recheck: readonly { criterion: string; resolved: boolean; note: string }[];
   /** A6.4: VERIFY's gate on the pull request. */
@@ -200,7 +236,18 @@ export interface OpenPullRequestInput {
   branch: string;
   title: string;
   body: string;
-  patches: readonly { filePath: string; diff: string }[];
+  /**
+   * The stored patches together with the criteria and findings they were
+   * written for. Bytes alone compose a pull request that cites nothing.
+   */
+  patches: readonly {
+    filePath: string;
+    diff: string;
+    criteria?: readonly string[];
+    findingIds?: readonly string[];
+  }[];
+  /** The ledger rows behind those ids, for the title's count and the evidence. */
+  findings?: readonly FixableFinding[];
   /**
    * Verification evidence. The gates in `openVerifiedPullRequest` read this
    * rather than taking the conductor's word: a failing suite is a hard stop,

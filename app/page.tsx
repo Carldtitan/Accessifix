@@ -1,106 +1,125 @@
 import type { Metadata } from "next";
-import Link from "next/link";
+import { redirect } from "next/navigation";
+
+import { auth } from "@/auth";
 import { BrandMark, Icon } from "@/components/Icon";
+import { demoReady } from "@/lib/demo";
 
 export const metadata: Metadata = {
-  title: { absolute: "AccessiFix — accessibility auditing that walks the state machine" },
+  title: "AccessiFix",
+  description:
+    "Finds the accessibility bugs that break your site for blind users, fixes them, and opens a pull request.",
 };
 
-export default function LandingPage() {
+/**
+ * The four cards are the actual workflow, in order, in the user's words.
+ * One short sentence each. A visitor decides in about four seconds.
+ */
+interface Step {
+  readonly n: string;
+  readonly title: string;
+  readonly body: string;
+}
+
+const STEPS: readonly Step[] = [
+  {
+    n: "1",
+    title: "Connect your repo",
+    body: "Point it at your GitHub repository and your live site.",
+  },
+  {
+    n: "2",
+    title: "It clicks through everything",
+    body: "40 real browsers at once, checking all 55 WCAG rules.",
+  },
+  {
+    n: "3",
+    title: "It writes the fix",
+    body: "Patches your code, then runs your own tests to prove nothing broke.",
+  },
+  {
+    n: "4",
+    title: "You approve the PR",
+    body: "Nothing reaches your repository until you say yes.",
+  },
+];
+
+export default async function LandingPage() {
+  /*
+   * A signed-in visitor asking for the landing page wants their workspace, not
+   * a pitch and a sign-in button they have already used.
+   */
+  // The hosted demo has no sign-in to offer, so the pitch page would be a
+  // dead end with a button that asks for a GitHub scope nobody needs to grant.
+  if (demoReady()) redirect("/app");
+
+  const session = await auth();
+  if (session?.user) redirect("/app");
+
   return (
     <div className="landing-page">
       <header className="landing-header">
         <span className="landing-brand">
-          <BrandMark size={33} />
+          <BrandMark size={31} />
           AccessiFix
         </span>
-        <span className="eyebrow">WCAG 2.2 Level AA · 55 criteria</span>
+        <span className="eyebrow">WCAG 2.2 AA · 55 criteria</span>
       </header>
 
       <main id="main-content" className="landing-main">
-        <div className="landing-copy">
-          <h1>Every accessibility tool checks a page standing still. This one walks the state machine.</h1>
-          <p className="landing-lede">
-            Twelve of the 55 WCAG 2.2 Level AA criteria are only observable across a state transition.
-            AccessiFix drives your interface through its transitions in parallel browsers, reads the
-            accessibility tree on both sides of every interaction, writes the fix into your source,
-            proves your own test suite still passes, and opens a pull request you review.
-          </p>
+        <div className="landing-hero">
+          <div className="landing-copy">
+            <h1>
+              Find and fix your
+              <br />
+              <em>accessibility bugs.</em>
+            </h1>
+            <p className="landing-lede">
+              Connect your repo. AccessiFix clicks through your site in 40 browsers, finds
+              what is broken for disabled users, and opens a pull request with the fix.
+            </p>
 
-          <div className="landing-actions">
             {/* Auth.js route handler, not an app route: a real navigation is required. */}
             {/* eslint-disable-next-line @next/next/no-html-link-for-pages */}
-            <a className="button primary large" href="/api/auth/signin">
+            <a className="button primary large" href="/api/auth/signin?callbackUrl=%2Fapp">
               <Icon name="github" size={18} />
               Sign in with GitHub
             </a>
-            <small>
-              Read access to the repository, write access only through a pull request you approve.{" "}
-              <Link href="/app">Look around the interface first</Link>.
-            </small>
           </div>
+
+          {/*
+            The real finding from a live SSDI benefits application. Not a mockup:
+            the menu grew by 98 nodes while the button kept reporting "closed".
+          */}
+          <figure className="landing-evidence">
+            <figcaption>Found on a real benefits site</figcaption>
+            <div className="evidence-row">
+              <span>menu opened</span>
+              <strong>98 new items</strong>
+            </div>
+            <div className="evidence-row is-bad">
+              <span>button still says</span>
+              <strong>closed</strong>
+            </div>
+            <p>WCAG 4.1.2 · Name, Role, Value</p>
+          </figure>
         </div>
 
-        <h2 className="sr-only">One worked example</h2>
         <ol className="landing-proof">
-          <li className="proof-module">
-            <span className="eyebrow">Example · Step 1</span>
-            <h2>An interaction, not a snapshot</h2>
-            <p>
-              A control on the eligibility page opens a panel. AccessiFix snapshots the accessibility
-              tree, clicks, and snapshots again.
-            </p>
-            <p>
-              <code>Toggle · depth 1 · Chromium 1280x720</code>
-            </p>
-          </li>
-
-          <li className="proof-module is-dark">
-            <span className="eyebrow">Example · Step 2</span>
-            <h2>The tree tells on it</h2>
-            <p>
-              <code>
-                button &quot;What counts as a disability?&quot;
-                <br />
-                &nbsp;&nbsp;expanded: false — unchanged
-                <br />
-                group &quot;eligibility-panel&quot;
-                <br />
-                &nbsp;&nbsp;hidden: false — changed
-              </code>
-            </p>
-            <p>The panel opened. The control still says it is collapsed. That is SC 4.1.2.</p>
-          </li>
-
-          <li className="proof-module">
-            <span className="eyebrow">Example · Step 3</span>
-            <h2>The fix, written into the source</h2>
-            <p>
-              One patch per file, each recording the findings it addresses. The repository is built in
-              a sandbox and its own test suite has to pass before anything is proposed.
-            </p>
-            <p>
-              <code>components/Accordion.tsx · covers SC 4.1.2</code>
-            </p>
-          </li>
-
-          <li className="proof-module">
-            <span className="eyebrow">Example · Step 4</span>
-            <h2>You decide, then a pull request</h2>
-            <p>
-              The agent stops before every irreversible step and states what it intends to do, why, and
-              what evidence supports it. Nothing is pushed until you approve.
-            </p>
-            <p>
-              <code>148 tests passed · 3 criteria re-checked</code>
-            </p>
-          </li>
+          {STEPS.map((step) => (
+            <li key={step.n} className="proof-module">
+              <span className="proof-n" aria-hidden="true">
+                {step.n}
+              </span>
+              <h2>{step.title}</h2>
+              <p>{step.body}</p>
+            </li>
+          ))}
         </ol>
       </main>
 
       <footer className="landing-footer">
-        AccessiFix reports findings against numbered success criteria and measures a before and after.
-        It does not claim a conformance level, because no certifying body exists.
+        Every finding cites a numbered WCAG criterion and carries evidence.
       </footer>
     </div>
   );

@@ -65,7 +65,7 @@ export interface CriterionScoreWire {
   verdict: "DECIDE" | "FLAG" | "BLOCKED";
   findings: number;
   open: number;
-  state: "passing" | "failing" | "flagged" | "blocked";
+  state: "passing" | "failing" | "flagged" | "blocked" | "not_evaluated";
   reason?: string;
 }
 
@@ -76,6 +76,7 @@ export interface RunScoreWire {
   flaggedCriteria: number;
   blockedCriteria: number;
   passingCriteria: number;
+  notEvaluatedCriteria?: number;
   totalFindings: number;
   openFindings: number;
   bySeverity: Record<string, number>;
@@ -139,6 +140,20 @@ export interface PageWire {
   title: string | null;
 }
 
+/**
+ * One captured browser frame, as a reference rather than as bytes.
+ *
+ * A full-page PNG is measured in megabytes. It is never put on the SSE stream
+ * and never put in a React prop; the wire carries the artifact id, and the
+ * `<img>` fetches `/api/artifacts/{id}` like any other image.
+ */
+export interface FrameWire {
+  artifactId: string;
+  /** The page URL the frame depicts. Matches `pages.url`. */
+  pageUrl: string;
+  capturedAt: string;
+}
+
 export interface RunEventWire {
   id: number;
   runId: string;
@@ -158,6 +173,8 @@ export interface RunDetailWire {
   score: RunScoreWire;
   finalScore: RunScoreWire | null;
   pages: PageWire[];
+  /** The browser frames this run captured, one per page. */
+  frames: FrameWire[];
   patches: PatchWire[];
   pendingHandoffs: HandoffWire[];
   jobs?: JobWire[];
@@ -348,6 +365,77 @@ const PHASE_VERB: Record<string, string> = {
   verify: "Verify",
 };
 
+/**
+ * The page URL inside a job key.
+ *
+ * `pipeline_jobs` keys a page-scoped job as `${runPhase}:${pageUrl}` —
+ * `baseline:https://example.com/` — so that the baseline and the final audit of
+ * one page are two rows rather than one. Anything joining a job to a page has
+ * to strip that prefix first; a lookup on the raw key silently misses every
+ * time, which is why the cards reported no finding counts.
+ *
+ * A key that carries no phase prefix (`crawl`, `score`, a source path) comes
+ * back unchanged.
+ */
+export function pageKeyOf(jobKey: string): string {
+  return jobKey.replace(/^(?:baseline|final):/, "");
+}
+
+/** Where a stored artifact's bytes are served from. */
+export function artifactUrl(artifactId: string): string {
+  return `/api/artifacts/${encodeURIComponent(artifactId)}`;
+}
+
+/**
+ * Frames arranged for lookup by job key.
+ *
+ * `landing` is the first frame the run captured — the deployed URL itself,
+ * because the crawl is breadth-first from there. It is what the crawl card
+ * shows, that card being keyed by its phase rather than by a page.
+ */
+export interface FrameIndex {
+  byPage: ReadonlyMap<string, string>;
+  landing?: string;
+}
+
+export function indexFrames(frames: ReadonlyArray<FrameWire>): FrameIndex {
+  const byPage = new Map<string, string>();
+
+  for (const frame of frames) {
+    const href = artifactUrl(frame.artifactId);
+    byPage.set(frame.pageUrl, href);
+    // A job key spells a page with or without its trailing slash; index both.
+    const alt = frame.pageUrl.endsWith("/") ? frame.pageUrl.slice(0, -1) : frame.pageUrl + "/";
+    if (!byPage.has(alt)) byPage.set(alt, href);
+  }
+
+  return {
+    byPage,
+    ...(frames[0] ? { landing: artifactUrl(frames[0].artifactId) } : {}),
+  };
+}
+
+/**
+ * The frame to show on one card, or `undefined` for the honest placeholder.
+ *
+ * Only a phase that actually drove a browser can have one. A build-sandbox or
+ * ledger job is left with the placeholder even when its key happens to be a
+ * page URL — CODE reads source, and dressing its card with a browser frame
+ * would claim a capture that phase never made.
+ */
+function frameFor(job: JobWire, frames: FrameIndex): string | undefined {
+  if (!BROWSER_PHASES.has(job.phase)) return undefined;
+
+  const direct = frames.byPage.get(pageKeyOf(job.jobKey));
+  if (direct) return direct;
+
+  // The crawl job is keyed by its phase, not by a page, because it opened all
+  // of them. Its card shows the first frame it took: the deployed URL.
+  if (job.phase === "crawl" || job.phase === "final_audit") return frames.landing;
+
+  return undefined;
+}
+
 /** A URL's path, or the whole string when it is not a URL. */
 function shortKey(key: string): string {
   try {
@@ -379,14 +467,22 @@ function describeJob(phase: string, jobKey: string): string {
 /**
  * One `pipeline_jobs` row is one environment card.
  *
- * `pageFindings` lets a page-keyed job report how many findings came out of it.
- * A job whose key is not a page URL reports no count at all rather than zero,
- * because "none found" and "not counted here" are different claims.
+ * `laneFindings` lets each card report the findings *its own agent* recorded,
+ * on its own page, in its own run phase. A job that records no findings at all
+ * reports no count rather than zero, because "none found" and "not counted
+ * here" are different claims.
+ *
+ * `frames` is the run's captured screenshots, by page. A card gets one only if
+ * a browser phase actually captured that page; everything else keeps the
+ * placeholder, which says truthfully that no frame exists.
  */
 export function jobsToEnvironments(
   jobs: ReadonlyArray<JobWire>,
-  pageFindings: ReadonlyMap<string, number> = new Map(),
+  laneFindings: LaneFindingCounts = { byPage: new Map(), byPhase: new Map() },
+  frames: ReadonlyArray<FrameWire> = [],
 ): BrowserEnvironment[] {
+  const frameIndex = indexFrames(frames);
+
   const rank = (job: JobWire): number => {
     const state = JOB_STATE[job.status] ?? "queued";
     return state === "live" ? 0 : state === "failed" ? 1 : state === "queued" ? 2 : 3;
@@ -396,8 +492,9 @@ export function jobsToEnvironments(
     .sort((a, b) => rank(a) - rank(b) || a.phase.localeCompare(b.phase))
     .map((job) => {
       const state = JOB_STATE[job.status] ?? "queued";
-      const findings = pageFindings.get(job.jobKey);
+      const findings = laneFindingCount(job, laneFindings, state);
       const captured = formatUtcTime(job.completedAt ?? job.startedAt);
+      const screenshotUrl = frameFor(job, frameIndex);
       const environment: BrowserEnvironment = {
         id: job.id,
         engine: engineFor(job.phase),
@@ -406,6 +503,7 @@ export function jobsToEnvironments(
         state,
         ...(findings === undefined ? {} : { findings }),
         ...(captured ? { capturedAt: captured } : {}),
+        ...(screenshotUrl ? { screenshotUrl } : {}),
       };
       return environment;
     });
@@ -514,17 +612,89 @@ export function toFindingCards(rows: ReadonlyArray<FindingWire>): Finding[] {
   return rows.map(toFindingCard);
 }
 
-/** How many findings each page produced, for the environment cards. */
-export function findingsByPage(rows: ReadonlyArray<FindingWire>): Map<string, number> {
-  const counts = new Map<string, number>();
+/**
+ * How many findings each *lane* produced, for the environment cards.
+ *
+ * Not by page. A page-keyed count gives every lane that visited a page the
+ * page's whole total, so a run where ACT found three and VIS found two showed
+ * "7 findings" on all six cards — including MEDIA, which found none. The card
+ * names one agent, so the number beside it has to be that agent's.
+ *
+ * Keyed by run phase as well, because the final audit re-walks the same pages
+ * with the same lanes and its findings are a separate set from the baseline's.
+ *
+ * `byPhase` exists for PAGES, whose job is one singleton per phase rather than
+ * one per page (it is comparative, so it cannot be), while its findings are
+ * still recorded against individual pages.
+ */
+export interface LaneFindingCounts {
+  /** `phase   agent   pageUrl` */
+  readonly byPage: ReadonlyMap<string, number>;
+  /** `phase   agent`, summed over every page. */
+  readonly byPhase: ReadonlyMap<string, number>;
+}
+
+const SEP = " ";
+
+function bump(counts: Map<string, number>, key: string): void {
+  counts.set(key, (counts.get(key) ?? 0) + 1);
+}
+
+export function findingsByLane(rows: ReadonlyArray<FindingWire>): LaneFindingCounts {
+  const byPage = new Map<string, number>();
+  const byPhase = new Map<string, number>();
   for (const row of rows) {
+    const lane = `${row.phase}${SEP}${row.agent}`;
+    bump(byPhase, lane);
+
     const url = row.pageUrl;
-    counts.set(url, (counts.get(url) ?? 0) + 1);
-    // A job keys a page with or without its trailing slash; count both spellings.
+    bump(byPage, `${lane}${SEP}${url}`);
+    // A job keys a page with or without its trailing slash; index both
+    // spellings as aliases of the one finding.
     const alt = url.endsWith("/") ? url.slice(0, -1) : url + "/";
-    counts.set(alt, (counts.get(alt) ?? 0) + 1);
+    if (alt !== url) bump(byPage, `${lane}${SEP}${alt}`);
   }
-  return counts;
+  return { byPage, byPhase };
+}
+
+/**
+ * The run phase and page a job's key refers to.
+ *
+ * `null` for a key that names neither — `crawl`, `score`, a source path under
+ * `fix`. Those jobs record no findings, and a count of zero beside them would
+ * be a claim about accessibility rather than a statement that this job does
+ * not count findings.
+ */
+function laneKeyOf(jobKey: string): { phase: string; page: string | null } | null {
+  const scoped = /^(baseline|final):(.+)$/.exec(jobKey);
+  if (scoped) return { phase: scoped[1], page: scoped[2] };
+  if (jobKey === "baseline" || jobKey === "final") return { phase: jobKey, page: null };
+  return null;
+}
+
+/**
+ * The number for one card, or `undefined` to print nothing.
+ *
+ * A lane that finished is reported even at zero: "MEDIA found nothing" is a
+ * result, and the honest one. A lane still running or failed is reported only
+ * when it has something, because zero there means "not finished", which is a
+ * different claim and the one that has bitten this UI before.
+ */
+export function laneFindingCount(
+  job: JobWire,
+  counts: LaneFindingCounts,
+  state: EnvironmentState,
+): number | undefined {
+  if (!job.agent) return undefined;
+  const key = laneKeyOf(job.jobKey);
+  if (!key) return undefined;
+
+  const lane = `${key.phase}${SEP}${job.agent}`;
+  const found =
+    key.page === null ? counts.byPhase.get(lane) : counts.byPage.get(`${lane}${SEP}${key.page}`);
+
+  if (state === "done") return found ?? 0;
+  return found !== undefined && found > 0 ? found : undefined;
 }
 
 export interface CriterionGroup {

@@ -21,6 +21,7 @@ import { db } from '@/lib/db';
 import { pages, type Page } from '@/lib/db/schema';
 import { MAX_PAGES_PER_CRAWL } from '@/lib/sandbox/config';
 
+import { recordPageScreenshot } from './artifacts';
 import { emitEvent } from './events';
 
 /* -------------------------------------------------------------------------- */
@@ -137,6 +138,15 @@ export interface CrawledPage {
   title: string | null;
   /** Everything the audit lanes need, taken while the page was open. */
   capture: PageCapture;
+  /**
+   * The `artifacts` row holding this page's frame, or `null` when the browser
+   * returned no screenshot for it.
+   *
+   * The bytes are never carried on this object beyond `capture.screenshot`,
+   * which the audit lanes consume in memory. Anything that wants to *display*
+   * the frame fetches it by id from `/api/artifacts/{id}`.
+   */
+  screenshotArtifactId: string | null;
   /** Breadth-first distance from the start URL. 0 is the deployed URL itself. */
   depth: number;
 }
@@ -415,6 +425,34 @@ async function visit(
 
   const pageId = await upsertPage(runId, landed, capture.title || null);
 
+  /*
+   * The frame is written to the artifact store here, at the one moment it
+   * exists: the browser sandbox is already gone by the time any lane runs, and
+   * `capture.screenshot` lives only in this process's memory. Before this
+   * write, every screenshot the run took was discarded once the lanes had
+   * looked at it, and the run view had nothing to show.
+   *
+   * Never fatal. `recordPageScreenshot` reports its own failures to the run
+   * log and returns null; a page that was audited is a page that was audited,
+   * frame or no frame.
+   */
+  const screenshotArtifactId = await recordPageScreenshot({
+    runId,
+    pageUrl: landed,
+    base64: capture.screenshot,
+  });
+
+  if (screenshotArtifactId) {
+    await emitEvent({
+      runId,
+      type: 'log',
+      capability: 'sandbox',
+      summary: `Captured a browser frame for ${landed}.`,
+      detail: 'Stored as a screenshot artifact; the run view fetches it by id.',
+      data: { phase: 'crawl', url: landed, artifactId: screenshotArtifactId, kind: 'screenshot' },
+    });
+  }
+
   return {
     kind: 'captured',
     page: {
@@ -423,6 +461,7 @@ async function visit(
       requestedUrl: url,
       title: capture.title || null,
       capture,
+      screenshotArtifactId,
       depth,
     },
   };

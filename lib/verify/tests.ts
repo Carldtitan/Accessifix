@@ -7,6 +7,14 @@
  * a checklist item — it is the difference between a tool that fixes a site and
  * a tool that breaks one to satisfy a rule.
  *
+ * What that sentence protects is the repository's tests *as they were*. A suite
+ * that was already red before anything was touched proves nothing about the
+ * patch, and blocking on it refuses every fix on every repository with one
+ * broken test — which is what happened on the reference target. So the suite is
+ * run twice, on the base tree and on the patched tree, and `pullRequestGate`
+ * decides on the comparison in `./baseline`: a failure that was already there
+ * is reported, a failure that was not is absolute.
+ *
  * The suite is the target's, not ours. We detect what the repository already
  * runs and we run exactly that: `test`, then `test:unit`, then `vitest`. For
  * the reference target that resolves to `npm test` (vitest); its Playwright
@@ -14,8 +22,19 @@
  * needs a served application and is a different gate.
  */
 
-import { runCommand, type Sandbox } from '@/lib/sandbox/daytona';
+import { downloadFile, runCommand, shellQuote, type Sandbox } from '@/lib/sandbox/daytona';
 import { readPackageJson } from './build';
+import {
+  describeComparison,
+  extractFailedFromText,
+  looksLikeTestOutput,
+  nameList,
+  parseJsonTestReport,
+  type BaselineComparison,
+  type CaseSource,
+  type TestCaseResult,
+  type TestTotals,
+} from './baseline';
 
 /* -------------------------------------------------------------------------- */
 /* Detection                                                                  */
@@ -385,6 +404,18 @@ export interface TestRunResult {
   readonly durationMs: number;
   /** One sentence for the pull-request body and the approval card. */
   readonly summary: string;
+  /**
+   * Per-test results, when the runner could be made to report them (A6.4).
+   *
+   * Optional because the field is new and other call sites build a
+   * `TestRunResult` from flat evidence they never observed; an absent list is
+   * "no per-test detail", never "no failures".
+   */
+  readonly cases?: readonly TestCaseResult[];
+  /** Where `cases` came from. `none` means the run yielded no per-test detail. */
+  readonly caseSource?: CaseSource;
+  /** Totals as the runner reported them. Only from a JSON report. */
+  readonly totals?: TestTotals | null;
 }
 
 export interface RunTestsOptions {
@@ -396,10 +427,29 @@ export interface RunTestsOptions {
   readonly command?: string;
   /** Characters of output kept in the result. Default 12000. */
   readonly outputTail?: number;
+  /**
+   * Ask the runner for a machine-readable report, so the run can be compared
+   * test by test against another. Default true; ignored for a runner that has
+   * no such flag.
+   */
+  readonly report?: boolean;
+  /** Absolute path in the sandbox for that report. Defaults per `label`. */
+  readonly reportPath?: string;
+  /** Distinguishes two runs' report files, e.g. `baseline` and `patched`. */
+  readonly label?: string;
 }
 
 const DEFAULT_TEST_TIMEOUT_SEC = 900;
 const DEFAULT_OUTPUT_TAIL = 12_000;
+
+/**
+ * Where a run's machine-readable report is written.
+ *
+ * Outside the clone on purpose: the baseline run and the patched run happen in
+ * the same working tree, and dropping a file into it between them would mean
+ * the two suites ran against trees that differ by more than the patch.
+ */
+const REPORT_DIR = '/tmp/accessifix-verify';
 
 /**
  * Detect the suite and run it in the sandbox holding the patched build.
@@ -429,24 +479,88 @@ export async function runTargetTests(
       detection,
       durationMs: 0,
       summary: detection.reason,
+      cases: [],
+      caseSource: 'none',
+      totals: null,
     };
   }
 
-  const result = await runCommand(
+  // A6.4 needs to know *which* tests failed, not just that some did, so the
+  // runner is asked for a machine-readable report where it has one. The flags
+  // are additive to the repository's own command — the suite that runs is still
+  // the target's.
+  const reportable = options.report !== false && supportsJsonReport(detection.framework);
+  const reportPath = reportable
+    ? (options.reportPath ?? `${REPORT_DIR}/${options.label ?? 'tests'}.json`)
+    : null;
+
+  const invocation = withEnv(
+    reportPath === null
+      ? command
+      : withRunnerFlags(command, reportFlagsFor(detection.framework, reportPath)),
+    options.env,
+  );
+  // `rm -f` first: a crashed run must not be read from the previous run's file.
+  const shell =
+    reportPath === null
+      ? invocation
+      : `mkdir -p ${shellQuote(REPORT_DIR)} && rm -f ${shellQuote(reportPath)} && ${invocation}`;
+
+  let result = await runCommand(
     sandbox,
-    withEnv(command, options.env),
+    shell,
     repoDir,
     options.timeoutSec ?? DEFAULT_TEST_TIMEOUT_SEC,
   );
+  let report = reportPath === null ? null : await readTestReport(sandbox, reportPath, repoDir);
+
+  // The reporter flags broke the invocation rather than the suite failing: no
+  // report was written and the output never reached the point of reporting on
+  // tests at all. Run exactly what the repository defines, so a good patch is
+  // not rejected over a flag this module added.
+  let reportFlagsRejected = false;
+  if (
+    reportPath !== null &&
+    report === null &&
+    result.exitCode !== 0 &&
+    !looksLikeTestOutput(result.stdout)
+  ) {
+    reportFlagsRejected = true;
+    result = await runCommand(
+      sandbox,
+      withEnv(command, options.env),
+      repoDir,
+      options.timeoutSec ?? DEFAULT_TEST_TIMEOUT_SEC,
+    );
+  }
 
   const durationMs = Date.now() - started;
-  const output = tail(result.stdout, options.outputTail ?? DEFAULT_OUTPUT_TAIL);
+  const rawOutput = result.stdout;
   const ok = result.exitCode === 0;
+
+  const caseSource: CaseSource = report
+    ? 'json'
+    : looksLikeTestOutput(rawOutput)
+      ? 'text'
+      : 'none';
+  const cases = report?.cases ?? (caseSource === 'text' ? extractFailedFromText(rawOutput, repoDir) : []);
+
+  // With `--reporter=json` the runner prints nothing a human can read, so the
+  // failing tests are rendered back out of the report. The full log stays in
+  // the sandbox either way (A9.2).
+  const output = tail(
+    rawOutput.trim().length > 0 ? rawOutput : renderReport(cases),
+    options.outputTail ?? DEFAULT_OUTPUT_TAIL,
+  );
 
   // A runner that exited zero because it found nothing to run has proven
   // nothing. `skipped` puts it where an absent suite already sits — allowed,
-  // unproven — instead of reporting an empty run as a passing one.
-  const zeroTests = ok && ranZeroTests(output);
+  // unproven — instead of reporting an empty run as a passing one. The report's
+  // own count answers this exactly when there is one; the text patterns are the
+  // fallback for when there is not.
+  const zeroTests = ok && (report ? report.totals.total === 0 : ranZeroTests(output));
+
+  const failedNames = cases.filter((entry) => entry.status === 'failed');
 
   return {
     ok,
@@ -462,10 +576,91 @@ export async function runTargetTests(
       : ok
         ? `\`${command}\` passed in ${(durationMs / 1000).toFixed(1)}s${
             detection.framework === 'none' ? '' : ` (${detection.framework})`
-          }.`
-        : `\`${command}\` failed with exit code ${result.exitCode}. ` +
-          `${firstFailureLine(output) ?? 'See the attached log.'}`,
+          }${report ? ` — ${report.totals.passed} of ${report.totals.total} tests passing` : ''}.`
+        : `\`${command}\` failed with exit code ${result.exitCode}` +
+          (failedNames.length > 0
+            ? `: ${failedNames.length} failing test${failedNames.length === 1 ? '' : 's'}, ` +
+              `${failedNames
+                .slice(0, 3)
+                .map((entry) => `\`${entry.id}\``)
+                .join(', ')}${failedNames.length > 3 ? `, and ${failedNames.length - 3} more` : ''}.`
+            : `. ${firstFailureLine(output) ?? 'See the attached log.'}`) +
+          (reportFlagsRejected
+            ? ' (Re-run without the JSON reporter, which this repository refused.)'
+            : ''),
+    cases,
+    caseSource,
+    totals: report?.totals ?? null,
   };
+}
+
+/**
+ * Runners that can write a jest-shaped JSON report on request. Vitest's json
+ * reporter is a deliberate copy of jest's, so one parser reads both; everything
+ * else falls back to reading the runner's console output.
+ */
+function supportsJsonReport(framework: TestFramework): boolean {
+  return framework === 'vitest' || framework === 'jest';
+}
+
+/** The flags that make that runner write its report to `path`. */
+function reportFlagsFor(framework: TestFramework, path: string): string {
+  const quoted = shellQuote(path);
+  return framework === 'jest'
+    ? `--json --outputFile=${quoted}`
+    : `--reporter=json --outputFile=${quoted}`;
+}
+
+/**
+ * Append runner flags to a command that may be an npm script wrapper.
+ *
+ * `npm run test --silent` needs a `--` before flags meant for the runner, or
+ * npm swallows them; a direct `npx vitest run` does not, and a command that
+ * already carries a `--` must not be given a second one.
+ */
+function withRunnerFlags(command: string, flags: string): string {
+  const isScriptWrapper = /\b(?:npm|pnpm|yarn|bun)\s+(?:run|run-script)\b/.test(command);
+  const alreadySeparated = / -- /.test(`${command} `);
+  return isScriptWrapper && !alreadySeparated ? `${command} -- ${flags}` : `${command} ${flags}`;
+}
+
+/**
+ * Read the report the runner wrote, or null if it wrote none this module can
+ * read.
+ *
+ * Two ways in, because with `--reporter=json` the runner prints nothing to the
+ * console: if this comes back empty the run has no per-test detail at all, the
+ * comparison cannot be made, and a pre-existing failure starts blocking pull
+ * requests again. A download that fails for a transport reason is not a reason
+ * to lose the evidence, so `cat` is tried after it.
+ */
+async function readTestReport(
+  sandbox: Sandbox,
+  path: string,
+  repoDir: string,
+): Promise<ReturnType<typeof parseJsonTestReport>> {
+  try {
+    const buffer = await downloadFile(sandbox, path, 120);
+    const parsed = parseJsonTestReport(buffer.toString('utf8'), repoDir);
+    if (parsed) return parsed;
+  } catch {
+    // Fall through to `cat`.
+  }
+  const result = await runCommand(sandbox, `cat ${shellQuote(path)}`, undefined, 120);
+  if (result.exitCode !== 0) return null;
+  return parseJsonTestReport(result.stdout, repoDir);
+}
+
+/** A human-readable rendering of a JSON-only run, for the log and the card. */
+function renderReport(cases: readonly TestCaseResult[]): string {
+  const failed = cases.filter((entry) => entry.status === 'failed');
+  if (cases.length === 0) return '';
+  const header = `${cases.length} test(s) reported, ${failed.length} failing.`;
+  if (failed.length === 0) return header;
+  return [
+    header,
+    ...failed.map((entry) => `FAIL ${entry.id}${entry.message ? `\n  ${entry.message}` : ''}`),
+  ].join('\n');
 }
 
 /* -------------------------------------------------------------------------- */
@@ -479,24 +674,65 @@ export interface PullRequestGate {
   readonly reason: string;
   /** True when nothing failed but nothing was proven either. */
   readonly unproven: boolean;
+  /**
+   * True when the suite is red but every red test was red before the patch.
+   * Allowed, and never silent: every surface that renders this says so.
+   */
+  readonly preExistingFailuresOnly?: boolean;
 }
 
 /**
- * A6.4, stated once so nothing else has to restate it: a failing suite is not
- * a warning, it is a stop.
+ * A6.4, stated once so nothing else has to restate it: a test **this change
+ * broke** is not a warning, it is a stop.
+ *
+ * Without a baseline that reads "any red test is a stop", which refuses every
+ * pull request on every repository that already has one broken test. With one,
+ * it reads what A6.4 means: a failure that was already there is reported and
+ * does not block; a failure that was not is absolute. The two directions are
+ * decided in `compareTestRuns`, and the gate does not restate them — it reads
+ * `blocking`.
+ *
+ * Where no comparison could be made — no baseline, no per-test detail, a
+ * suite-level crash nothing attributes — `comparison` is absent or
+ * `comparable: false`, and this falls straight back to the old rule: any
+ * failure blocks, with the reason saying why it had to.
  *
  * A repository with no suite is `allowed` but `unproven` — the gate does not
  * pretend an absent suite passed, and the approval card says so plainly so the
  * human is deciding with the truth in front of them.
  */
-export function pullRequestGate(result: TestRunResult): PullRequestGate {
+export function pullRequestGate(
+  result: TestRunResult,
+  comparison?: BaselineComparison | null,
+): PullRequestGate {
   if (!result.ok) {
+    // The one branch that lets a red suite through, and it is narrow: the two
+    // runs were comparable *and* nothing failing now was passing before.
+    if (comparison?.comparable && !comparison.blocking) {
+      return {
+        allowed: true,
+        unproven: false,
+        preExistingFailuresOnly: true,
+        reason:
+          `The target's own test suite is red, but no test this change touched regressed: ` +
+          `${describeComparison(comparison)} The suite was run on the base tree first and ` +
+          'compared test by test, so the failures above are not this patch\'s doing.',
+      };
+    }
+
+    const detail = comparison?.comparable
+      ? ` ${describeComparison(comparison)}`
+      : comparison
+        ? ` No baseline comparison was possible: ${comparison.reason} Every failure is ` +
+          'therefore treated as this patch\'s.'
+        : '';
+
     return {
       allowed: false,
       unproven: false,
       reason:
-        `The target's own test suite failed (${result.command}, exit ${result.exitCode}). ` +
-        'The patch is rejected and no pull request will be opened.',
+        `The target's own test suite failed (${result.command}, exit ${result.exitCode}).` +
+        `${detail} The patch is rejected and no pull request will be opened.`,
     };
   }
   if (result.skipped) {
@@ -510,16 +746,27 @@ export function pullRequestGate(result: TestRunResult): PullRequestGate {
           'successful build and the criterion re-check, and by nothing else.',
     };
   }
+  // Green. The baseline is still worth a sentence when it was red: a patch that
+  // repaired something on the way past is evidence a reviewer should have.
+  const improved = comparison?.comparable && comparison.fixed.length > 0;
   return {
     allowed: true,
     unproven: false,
-    reason: `The target's own test suite passed: ${result.summary}`,
+    reason:
+      `The target's own test suite passed: ${result.summary}` +
+      (improved && comparison
+        ? ` It also fixed ${comparison.fixed.length} test(s) that were failing on the base ` +
+          `branch: ${nameList(comparison.fixed)}.`
+        : ''),
   };
 }
 
 /** Convenience for a call site that only needs the boolean. */
-export function blocksPullRequest(result: TestRunResult): boolean {
-  return !pullRequestGate(result).allowed;
+export function blocksPullRequest(
+  result: TestRunResult,
+  comparison?: BaselineComparison | null,
+): boolean {
+  return !pullRequestGate(result, comparison).allowed;
 }
 
 /* -------------------------------------------------------------------------- */

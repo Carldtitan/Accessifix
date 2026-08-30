@@ -25,6 +25,20 @@ const POLL_INTERVAL_MS = 2_000;
 /** After this long with no answer, the interface is reminded (A7.5). */
 const REMINDER_AFTER_MS = 60_000;
 
+/**
+ * How long the database may stay unreachable before the wait gives up.
+ *
+ * Generous on purpose: the run has already paid for its crawl, audit, fix and
+ * verify by this point, and abandoning that because a laptop changed networks
+ * is a far worse outcome than waiting out the outage. The run is resumable
+ * either way, so the cost of waiting is time and the cost of quitting is work.
+ */
+const DB_FAILURE_GRACE_MS = 5 * 60_000;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 export interface RaiseHandoffInput {
   runId: string;
   kind: HandoffKind;
@@ -203,6 +217,21 @@ export async function awaitHandoff(
   const existing = await loadHandoff(handoffId);
   if (!existing) throw new Error(`Handoff ${handoffId} does not exist.`);
 
+  /*
+   * A dropped connection must not decide the run.
+   *
+   * This loop is the one place the pipeline waits on a person, so it is the one
+   * place that can be polling for minutes. At a two-second interval a wait of
+   * any realistic length makes hundreds of queries, and a single `ECONNRESET`
+   * from the pooler used to throw straight out of the conductor and end the run
+   * — losing a completed crawl, audit, fix and verify because the network
+   * hiccuped while somebody was reading the diff.
+   *
+   * A read that fails is not an answer. It is retried, and only a database that
+   * stays unreachable for `DB_FAILURE_GRACE_MS` is allowed to stop the wait.
+   */
+  let firstFailureAt: number | null = null;
+
   // Wake the poll the moment an answer lands in this process.
   let wake: (() => void) | null = null;
   const unsubscribe = subscribeToRun(existing.runId, (event) => {
@@ -213,7 +242,24 @@ export async function awaitHandoff(
     for (;;) {
       if (options.signal?.aborted) throw new HandoffAbortedError(handoffId);
 
-      const row = await loadHandoff(handoffId);
+      let row: Handoff | null;
+      try {
+        row = await loadHandoff(handoffId);
+        firstFailureAt = null;
+      } catch (error) {
+        firstFailureAt ??= Date.now();
+        const downFor = Date.now() - firstFailureAt;
+        if (downFor >= DB_FAILURE_GRACE_MS) {
+          throw new Error(
+            `The decision on handoff ${handoffId} could not be read for ` +
+              `${Math.round(downFor / 1000)}s: ${(error as Error).message}. ` +
+              'The run is left awaiting approval and can be resumed.',
+          );
+        }
+        await sleep(interval);
+        continue;
+      }
+
       if (!row) throw new Error(`Handoff ${handoffId} disappeared while waiting.`);
 
       if (row.status !== 'pending') {
@@ -222,14 +268,19 @@ export async function awaitHandoff(
 
       if (Date.now() - lastReminder >= REMINDER_AFTER_MS) {
         lastReminder = Date.now();
-        await emitEvent({
-          runId: row.runId,
-          type: 'approval',
-          capability: 'approval',
-          summary: `Still waiting on a decision: ${row.intent}`,
-          detail: `Unanswered for ${Math.round((Date.now() - started) / 1000)}s.`,
-          data: { handoffId: row.id, status: 'pending', reminder: true },
-        });
+        // A reminder is a courtesy; failing to write one must not end the wait.
+        try {
+          await emitEvent({
+            runId: row.runId,
+            type: 'approval',
+            capability: 'approval',
+            summary: `Still waiting on a decision: ${row.intent}`,
+            detail: `Unanswered for ${Math.round((Date.now() - started) / 1000)}s.`,
+            data: { handoffId: row.id, status: 'pending', reminder: true },
+          });
+        } catch {
+          // Retried on the next reminder tick.
+        }
       }
 
       await new Promise<void>((resolve) => {

@@ -211,9 +211,8 @@ export function TargetsPanel({ targets }: { targets: ReadonlyArray<TargetListIte
             <span className="eyebrow">New</span>
             <h2 id="add-target">Connect a target</h2>
             <p>
-              The deployed URL is fetched before the target is stored. A non-2xx response is refused
-              with a stated reason. Pull requests are opened later with your own GitHub token, and
-              only after you approve the handoff.
+              Paste your GitHub repository and the URL where it is live. AccessiFix reads
+              the code and audits the running site.
             </p>
           </div>
         </div>
@@ -232,15 +231,14 @@ export function TargetsPanel({ targets }: { targets: ReadonlyArray<TargetListIte
               type="text"
               value={repo}
               onChange={(event) => setRepo(event.target.value)}
-              placeholder="owner/repository"
+              placeholder="https://github.com/owner/repo"
               autoComplete="off"
               required
               aria-invalid={connectError ? true : undefined}
               aria-describedby={connectError ? `${repoHelpId} ${errorId}` : repoHelpId}
             />
             <small id={repoHelpId}>
-              In <code>owner/repository</code> form. Requires the <code>repo</code> scope on your
-              GitHub account.
+              Paste the URL or type owner/repo.
             </small>
           </div>
 
@@ -252,15 +250,14 @@ export function TargetsPanel({ targets }: { targets: ReadonlyArray<TargetListIte
               type="url"
               value={url}
               onChange={(event) => setUrl(event.target.value)}
-              placeholder="https://example.com"
+              placeholder="https://yourapp.vercel.app"
               autoComplete="url"
               required
               aria-invalid={connectError ? true : undefined}
               aria-describedby={connectError ? `${urlHelpId} ${errorId}` : urlHelpId}
             />
             <small id={urlHelpId}>
-              Checked now, and again before every run. A non-2xx response stops the run with a
-              stated reason.
+              We check it responds before starting.
             </small>
           </div>
 

@@ -36,7 +36,11 @@ export type BrowserEnvironment = {
   /** WCAG criterion this path is exercising, when there is exactly one. */
   criterion?: string;
   state: EnvironmentState;
-  /** Latest captured frame. Omit to show the placeholder frame. */
+  /**
+   * URL of the latest captured frame — an `/api/artifacts/{id}` reference, not
+   * image data. Omit to show the placeholder, which says truthfully that no
+   * frame exists rather than standing in for one.
+   */
   screenshotUrl?: string;
   /** Relative freshness, e.g. "2s ago". */
   capturedAt?: string;
@@ -84,6 +88,9 @@ function announce(environments: ReadonlyArray<BrowserEnvironment>): string {
  * - Every card states its status in text as well as tint.
  * - Status changes are announced once, through a single polite live region.
  *   Focus is never moved (A11.6 / WCAG 3.2.x).
+ * - A real frame carries alt text naming what it is a picture of. A screenshot
+ *   cannot be described in an alt attribute; what alt can honestly say is which
+ *   browser took it and what was being tested, so that is what it says.
  * - Placeholder frames are labelled as placeholders, not passed off as capture.
  */
 export function EnvironmentGrid({
@@ -113,7 +120,7 @@ export function EnvironmentGrid({
                 // eslint-disable-next-line @next/next/no-img-element
                 <img
                   src={environment.screenshotUrl}
-                  alt={`Latest captured frame from ${environment.engine}, testing ${environment.pathLabel}`}
+                  alt={`Browser frame captured by ${environment.engine} while running: ${environment.pathLabel}.`}
                   loading="lazy"
                   decoding="async"
                 />

@@ -5,7 +5,7 @@ import { Icon } from "@/components/Icon";
 import { RunSummaryBar } from "@/components/RunSummaryBar";
 import { StatusLabel } from "@/components/StatusLabel";
 import {
-  findingsByPage,
+  findingsByLane,
   formatUtcDate,
   jobsToEnvironments,
   runStatusLabel,
@@ -100,7 +100,11 @@ export default async function OverviewPage() {
   /* ---------------------------------------------------------------------- */
 
   const score = latest.score;
-  const environments = jobsToEnvironments(latest.jobs, findingsByPage(latest.findings));
+  const environments = jobsToEnvironments(
+    latest.jobs,
+    findingsByLane(latest.findings),
+    latest.frames,
+  );
   const summary = toRunSummary(
     latest.run,
     latest.activeModel ? { activeModel: latest.activeModel } : {},

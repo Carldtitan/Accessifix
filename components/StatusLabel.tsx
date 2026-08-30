@@ -40,6 +40,7 @@ export type StatusValue =
   | "BLOCKED"
   // criterion state, as the score reports it (lib/pipeline/score.ts)
   | "passing"
+  | "not_evaluated"
   | "failing"
   | "flagged"
   | "blocked"
@@ -76,6 +77,8 @@ const tones: Record<StatusValue, StatusTone> = {
   BLOCKED: "blocked",
 
   passing: "done",
+  /* Neutral, never green. Nobody checked it, so it has not passed. */
+  not_evaluated: "neutral",
   failing: "blocked",
   flagged: "attention",
   blocked: "blocked",
@@ -91,6 +94,7 @@ const labels: Partial<Record<StatusValue, string>> = {
   DECIDE: "Decide",
   FLAG: "Flag",
   BLOCKED: "Blocked",
+  not_evaluated: "Not checked",
 };
 
 function toLabel(value: StatusValue): string {

@@ -5,28 +5,61 @@
  * contract: `buildFixPrompt` states what the agent must return, and
  * `parseFixResponse` refuses anything that is not that.
  *
- * The agent returns the **whole new file**, not a diff. That is not a
- * stylistic choice. A model-authored unified diff has to be right about line
- * numbers and surrounding context before it can be right about accessibility,
- * and when it is wrong the failure is a patch that will not apply — which the
- * run discovers only in the sandbox. Full contents always apply. The diff shown
- * to the reviewer and stored in the ledger is computed here, from the file we
- * gave the agent and the file it gave back, so it is a true description of the
- * change by construction.
+ * The agent never returns a diff. A model-authored unified diff has to be right
+ * about line numbers and surrounding context before it can be right about
+ * accessibility, and when it is wrong the failure is a patch that will not
+ * apply — which the run discovers only in the sandbox. The diff shown to the
+ * reviewer and stored in the ledger is computed here, from the file we gave the
+ * agent and the file it gave back, so it is a true description of the change by
+ * construction. That invariant is the whole point of this module and nothing
+ * below weakens it.
  *
- * Note that this diverges from `PatchSchema` in `lib/harness/schemas.ts`, which
- * asks the saved FIX manifest for a diff. Use `FIX_PATCH_RESPONSE_FORMAT` from
- * this module when dispatching with the prompt this module builds.
+ * What the agent returns instead depends on the size of the file, and that is
+ * the one thing here that was learned the hard way:
+ *
+ *  - **Small file — the whole new contents.** The simplest contract there is.
+ *    The bytes are the bytes and the host diffs them.
+ *
+ *  - **Large file — a short list of exact string replacements.** Above
+ *    `TARGETED_EDIT_LINE_THRESHOLD` a model cannot hand back the file it was
+ *    given; it regenerates it from context, paraphrases what it could not hold,
+ *    and returns something that reads like the original and is not. One real
+ *    run on a 2,000-line component produced a diff of roughly two thousand
+ *    deletions for a change that should have added `aria-pressed` to three
+ *    buttons, with live calls replaced by an invented placeholder identifier,
+ *    and every check of the day passed it: it was not empty, and it was not
+ *    short enough to look truncated. Edits remove the opportunity — the model
+ *    quotes only the lines it wants changed, `applyFixEdits` requires each
+ *    quotation to occur exactly once, and every byte it did not quote is
+ *    carried over by the host untouched.
+ *
+ * Three guards stand behind both contracts, because a contract is a request and
+ * a guard is a fact: `findPlaceholderMarker` refuses a file that gained a
+ * summary marker, `assessPatchSize` refuses a diff out of all proportion to the
+ * findings it claims, and both produce a skip with a stated reason rather than
+ * a patch. A patch like the one above reaching a pull request would destroy a
+ * working application, so the default answer to a change that cannot be
+ * accounted for is no.
+ *
+ * The provider-side half of the contract lives in `lib/harness/schemas.ts` as
+ * `FILE_PATCH_RESPONSE_FORMAT` and `FILE_EDIT_RESPONSE_FORMAT`, because that is
+ * what the saved FIX manifest is built from; the first is re-exported here as
+ * `FIX_PATCH_RESPONSE_FORMAT` so there is exactly one description of a FIX
+ * response in the codebase. There used to be two — the manifest asked for a
+ * unified diff while this module asked for file contents — and the result was a
+ * run that produced nothing and could not say why. The parser below still
+ * accepts the old shape, but it says out loud that it did.
  */
 
 import { z } from 'zod';
 
+import { FILE_PATCH_RESPONSE_FORMAT } from '@/lib/harness/schemas';
+
 import type { FixGroup, GroupedFinding } from './group';
 
 /**
- * The `response_format` shape TrueForge accepts, declared structurally rather
- * than imported. It is four lines, and this module has no other reason to
- * depend on the harness.
+ * The `response_format` shape TrueForge accepts, declared structurally so the
+ * parser's own types do not depend on the client's zod unions.
  */
 export interface JsonSchemaResponseFormat {
   readonly type: 'json_schema';
@@ -90,7 +123,29 @@ const CRITERION_PATTERN = /^[1-4]\.\d{1,2}\.\d{1,2}$/;
 
 const RawFileSchema = z.object({
   filePath: z.string().min(1),
-  newContents: z.string(),
+  /**
+   * Optional at the schema level so that a response in the wrong shape becomes
+   * a skip carrying a reason rather than a `FixResponseError` that says only
+   * "does not match the schema". `parseFixResponse` requires one of
+   * `newContents` or `diff` and names which was missing.
+   */
+  newContents: z.string().optional(),
+  /**
+   * Never asked for, sometimes given: a manifest still pinned to the old
+   * `accessifix_patch_set` shape constrains the model to answer with a diff.
+   * Accepted here only so the host can apply it against the exact bytes it
+   * sent and then compute its own diff from the result.
+   */
+  diff: z.string().optional(),
+  /**
+   * The second contract, for a file too large to return whole
+   * (`FILE_EDIT_RESPONSE_FORMAT`): the exact snippets to replace. Optional
+   * here for the same reason `newContents` is — a response in the wrong shape
+   * has to become a skip that says which shape it was in.
+   */
+  edits: z
+    .array(z.preprocess(normalizeEditEntry, z.object({ find: z.string(), replace: z.string() })))
+    .optional(),
   criteria: z.array(z.string()).default([]),
   findingIds: z.array(z.string()).default([]),
   rationale: z.string().min(1),
@@ -108,11 +163,20 @@ const RawSkippedSchema = z.object({
  * model reaches for: `patches` instead of `files`, `sourcePath` instead of
  * `filePath`, `contents` instead of `newContents`. Rewriting a key is a repair;
  * inventing a value is not, and nothing below invents one.
+ *
+ * The top-level alias is not a nicety. `files` carries a `[]` default, so a
+ * response that used `patches` at the top level parsed cleanly into a response
+ * with no files and no skips — a silent no-op, which is the one failure mode
+ * this product exists to eliminate. `normalizeResponse` collapses the aliases
+ * before validation, and `parseFixResponse` refuses to return empty-handed.
  */
-export const FixResponseSchema = z.object({
-  files: z.array(z.preprocess(normalizeFileEntry, RawFileSchema)).default([]),
-  skipped: z.array(z.preprocess(normalizeSkippedEntry, RawSkippedSchema)).default([]),
-});
+export const FixResponseSchema = z.preprocess(
+  normalizeResponse,
+  z.object({
+    files: z.array(z.preprocess(normalizeFileEntry, RawFileSchema)).default([]),
+    skipped: z.array(z.preprocess(normalizeSkippedEntry, RawSkippedSchema)).default([]),
+  }),
+);
 
 export type FixResponse = z.infer<typeof FixResponseSchema>;
 
@@ -128,13 +192,87 @@ function firstString(source: Record<string, unknown>, keys: readonly string[]): 
   return undefined;
 }
 
+function firstArray(source: Record<string, unknown>, keys: readonly string[]): unknown[] {
+  for (const key of keys) {
+    const value = source[key];
+    if (Array.isArray(value)) return value;
+  }
+  return [];
+}
+
+/** Like `firstArray`, but absent stays absent so `.optional()` still means something. */
+function firstArrayOrUndefined(
+  source: Record<string, unknown>,
+  keys: readonly string[],
+): unknown[] | undefined {
+  for (const key of keys) {
+    const value = source[key];
+    if (Array.isArray(value)) return value;
+  }
+  return undefined;
+}
+
+/** The names a FIX response has actually arrived under, at the top level. */
+const FILES_KEYS = ['files', 'patches', 'filePatches', 'changes'] as const;
+
+function normalizeResponse(value: unknown): unknown {
+  const raw = asRecord(value);
+  return {
+    ...raw,
+    files: firstArray(raw, FILES_KEYS),
+    skipped: firstArray(raw, ['skipped', 'skips', 'declined']),
+  };
+}
+
+/** Which of `FILES_KEYS` a payload actually used. For the skip reason. */
+export function fileKeysUsed(payload: unknown): string[] {
+  const raw = asRecord(payload);
+  return FILES_KEYS.filter((key) => Array.isArray(raw[key]));
+}
+
 function normalizeFileEntry(value: unknown): unknown {
   const raw = asRecord(value);
+  const edits = firstArrayOrUndefined(raw, [
+    'edits',
+    'replacements',
+    'stringReplacements',
+    'string_replacements',
+  ]);
   return {
     ...raw,
     filePath: firstString(raw, ['filePath', 'sourcePath', 'path', 'file']),
     newContents: firstString(raw, ['newContents', 'newContent', 'contents', 'content', 'source']),
+    diff: firstString(raw, ['diff', 'patch', 'unifiedDiff', 'unified_diff']),
     rationale: firstString(raw, ['rationale', 'reason', 'explanation', 'why']),
+    ...(edits === undefined ? {} : { edits }),
+  };
+}
+
+/** The names a single edit has arrived under. Same rule: rename, never invent. */
+function normalizeEditEntry(value: unknown): unknown {
+  const raw = asRecord(value);
+  return {
+    ...raw,
+    find: firstString(raw, [
+      'find',
+      'search',
+      'old',
+      'oldText',
+      'old_text',
+      'oldString',
+      'old_string',
+      'before',
+    ]),
+    replace: firstString(raw, [
+      'replace',
+      'replacement',
+      'new',
+      'newText',
+      'new_text',
+      'newString',
+      'new_string',
+      'after',
+    ]),
   };
 }
 
@@ -147,79 +285,19 @@ function normalizeSkippedEntry(value: unknown): unknown {
   };
 }
 
-const NULLABLE_STRING = { type: ['string', 'null'] } as const;
-
 /**
  * `response_format` for a FIX turn dispatched with `buildFixPrompt`.
  *
- * Pass this on an inline agent spec — the saved FIX manifest asks for diffs and
- * would constrain the model to the wrong shape.
+ * The same object the saved FIX manifest is built from, so the constraint the
+ * provider applies and the shape this module parses cannot drift apart again.
+ * A saved manifest whose `json_schema.name` is not `FIX_RESPONSE_FORMAT_NAME`
+ * is stale; `npm run agents:init -- --update` replaces it.
  */
-export const FIX_PATCH_RESPONSE_FORMAT: JsonSchemaResponseFormat = {
-  type: 'json_schema',
-  json_schema: {
-    name: 'accessifix_file_patch',
-    description:
-      'The complete new contents of each file changed, with the findings each change addresses.',
-    strict: true,
-    schema: {
-      type: 'object',
-      additionalProperties: false,
-      required: ['files', 'skipped'],
-      properties: {
-        files: {
-          type: 'array',
-          description: 'One entry for the file you were given. Empty if you changed nothing.',
-          items: {
-            type: 'object',
-            additionalProperties: false,
-            required: ['filePath', 'newContents', 'criteria', 'findingIds', 'rationale', 'risk'],
-            properties: {
-              filePath: {
-                type: 'string',
-                description: 'Repository-relative path, exactly as it was given to you.',
-              },
-              newContents: {
-                type: 'string',
-                description:
-                  'The complete file after your change. Every line, first to last. Never an excerpt, never a diff, never an ellipsis.',
-              },
-              criteria: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'WCAG success criterion numbers this change addresses.',
-              },
-              findingIds: {
-                type: 'array',
-                items: { type: 'string' },
-                description: 'Ids of the findings this change addresses, from the list given.',
-              },
-              rationale: {
-                type: 'string',
-                description: 'Why the change is correct, in prose a reviewer can check.',
-              },
-              risk: { ...NULLABLE_STRING, description: 'What it might break, or null.' },
-            },
-          },
-        },
-        skipped: {
-          type: 'array',
-          description: 'Findings you deliberately did not fix, each with a real reason.',
-          items: {
-            type: 'object',
-            additionalProperties: false,
-            required: ['criterion', 'findingIds', 'reason'],
-            properties: {
-              criterion: NULLABLE_STRING,
-              findingIds: { type: 'array', items: { type: 'string' } },
-              reason: { type: 'string' },
-            },
-          },
-        },
-      },
-    },
-  },
-};
+export const FIX_PATCH_RESPONSE_FORMAT =
+  FILE_PATCH_RESPONSE_FORMAT as JsonSchemaResponseFormat;
+
+/** The `json_schema.name` a correctly-registered FIX manifest carries. */
+export const FIX_RESPONSE_FORMAT_NAME = FIX_PATCH_RESPONSE_FORMAT.json_schema.name;
 
 /* -------------------------------------------------------------------------- */
 /* The prompt                                                                 */
@@ -251,6 +329,14 @@ const REMEDIATION_RULES = `NON-NEGOTIABLE REMEDIATION RULES
 
 4. ARIA state attributes must be wired to component state, never written as static text. aria-expanded={isOpen}, not aria-expanded="false". aria-checked={checked}, aria-selected={index === activeIndex}, aria-pressed={isPressed}. A hardcoded state attribute is the exact failure this product exists to catch: the tree changes when the user acts, the attribute does not, and a screen reader announces the opposite of what is on screen. Bind the attribute to the same variable that drives the visual state so the two cannot diverge again.`;
 
+/**
+ * The OUTPUT section for a file small enough to hand back whole.
+ *
+ * Kept for exactly that case. When the model can hold the file, returning it is
+ * the simplest contract there is — the bytes are the bytes, and the host diffs
+ * them. It stops being simple the moment the file outgrows what the model can
+ * reproduce, which is what `EDIT_OUTPUT_RULES` below exists for.
+ */
 const OUTPUT_RULES = `OUTPUT
 
 - Return the COMPLETE new contents of the file in \`newContents\`. Every line from the first to the last, including the parts you did not touch. Not a diff, not an excerpt, not a fragment with "... rest unchanged ...". The application computes the diff itself by comparing what you return against what it gave you, so an abbreviated file is read as a deletion of everything you left out.
@@ -258,6 +344,39 @@ const OUTPUT_RULES = `OUTPUT
 - Do not reformat, rename, restructure, upgrade a dependency, or improve adjacent code, however tempting.
 - Do not change the visual design. Adding an accessible name, a label association, a state binding, a keyboard handler or a focus style is in scope. Redesigning a component is not.
 - Keep the framework's idioms. If the file uses a design-system Button, keep using it. If it is a server component, it stays one. If the project has design tokens, change the token, not the component.
+- List in \`findingIds\` the ids of exactly the findings your change addresses, and in \`criteria\` their criterion numbers.
+- If you cannot fix a finding safely, put it in \`skipped\` with a real reason. An honest skip is worth more than a patch that breaks the build: VERIFY runs the repository's own test suite against your work, and a failing suite stops the pull request entirely.
+- No prose outside the JSON object.`;
+
+/**
+ * The OUTPUT section for a file too large to hand back whole.
+ *
+ * Above `TARGETED_EDIT_LINE_THRESHOLD` the whole-file contract stops being a
+ * contract the model can keep. It cannot copy two thousand lines; it
+ * regenerates them, paraphrasing whatever it could not hold, and the result is
+ * a file that reads like the original and is not. Asking instead for the few
+ * snippets it wants changed removes the opportunity entirely: every byte it
+ * does not quote is carried over by the host, because the host never asked for
+ * it.
+ *
+ * The uniqueness rule is the load-bearing part. `applyFixEdits` matches each
+ * \`find\` literally and requires exactly one occurrence; missing or ambiguous is
+ * a skip with a reason, never a guess at which occurrence was meant.
+ */
+const EDIT_OUTPUT_RULES = `OUTPUT — TARGETED EDITS
+
+This file is too large to return whole, and the schema you are held to does not accept a whole file. Return the exact string replacements that make your change, in \`edits\`.
+
+- Each edit is { "find": "<snippet copied out of the file below>", "replace": "<that snippet after your change>" }.
+- \`find\` is copied byte for byte out of the CURRENT CONTENTS block below: same indentation, same quotes, same line breaks, same trailing commas. It is matched literally. Nothing fuzzy-matches it, nothing repairs it, and a snippet you retyped from memory will not match.
+- \`find\` must occur EXACTLY ONCE in that file. If the lines you want appear more than once, widen the snippet with the lines around it until it is unique. A \`find\` that is missing, or that occurs twice, is rejected and the findings stay open.
+- Keep every \`find\` small: the lines you are changing, plus the least context that makes them unique. Never quote a whole component and never quote the whole file.
+- \`replace\` is that same snippet after the change. An empty string deletes it. Never put an ellipsis, "unchanged", "rest of file" or any other placeholder inside \`find\` or \`replace\` — both are inserted as literal text.
+- Edits apply in order, each one against the result of the one before it.
+- Everything you do not quote is carried over untouched. You do not need to mention it and you must not try to.
+- Prefer few, small edits. Three buttons that need the same attribute are three small edits, not one edit spanning the component.
+- Change only what the findings require. Do not reformat, rename, restructure, upgrade a dependency or improve adjacent code. Do not change the visual design: an accessible name, a label association, a state binding, a keyboard handler or a focus style is in scope; a redesign is not.
+- Keep the framework's idioms. If the file uses a design-system Button, keep using it. If the project has design tokens, change the token, not the component.
 - List in \`findingIds\` the ids of exactly the findings your change addresses, and in \`criteria\` their criterion numbers.
 - If you cannot fix a finding safely, put it in \`skipped\` with a real reason. An honest skip is worth more than a patch that breaks the build: VERIFY runs the repository's own test suite against your work, and a failing suite stops the pull request entirely.
 - No prose outside the JSON object.`;
@@ -278,10 +397,20 @@ export function buildFixPrompt(
   const truncated = fileContents.length > maxChars;
   const body = truncated ? fileContents.slice(0, maxChars) : fileContents;
 
+  /*
+   * The prompt's contract and the parser's contract are one decision, taken
+   * once from the file's size. `writePatches` asks the same function which
+   * `response_format` to dispatch with, so the schema the model is held to and
+   * the OUTPUT section it is reading cannot describe different shapes — which
+   * is the exact divergence that cost this project a whole run once before.
+   */
+  const contract = chooseFixContract(fileContents);
+
   const header = [
     `FILE: ${group.filePath}`,
     options.repoFullName ? `REPOSITORY: ${options.repoFullName}` : null,
     options.ref ? `REF: ${options.ref}` : null,
+    `SIZE: ${lineCount(fileContents)} lines`,
     `FINDINGS: ${group.findings.length} (${group.criteria.join(', ')})`,
     group.pageUrls.length > 0 ? `OBSERVED ON: ${group.pageUrls.join(', ')}` : null,
   ]
@@ -303,11 +432,14 @@ export function buildFixPrompt(
     '',
     REMEDIATION_RULES,
     '',
-    OUTPUT_RULES,
+    contract === 'targeted-edits' ? EDIT_OUTPUT_RULES : OUTPUT_RULES,
     '',
     options.projectNotes ? `PROJECT NOTES\n\n${options.projectNotes}\n` : '',
     `CURRENT CONTENTS OF ${group.filePath}`,
     '',
+    contract === 'targeted-edits'
+      ? 'Every `find` you send must be copied out of this block exactly as it appears here.'
+      : '',
     truncated
       ? `(TRUNCATED at ${maxChars} characters. Do not return a truncated file — if you cannot ` +
         'see the whole file, skip the findings you cannot safely fix.)'
@@ -341,6 +473,433 @@ function renderFindings(findings: readonly GroupedFinding[]): string {
 function collapse(text: string, max: number): string {
   const single = text.replace(/\s+/g, ' ').trim();
   return single.length <= max ? single : `${single.slice(0, max)}…`;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Which contract this file gets                                              */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * Above this many lines, FIX is asked for targeted edits instead of the whole
+ * file.
+ *
+ * The number is not a performance knob. A model asked to hand back two thousand
+ * lines does not copy them — they are not in a buffer it can memcpy — it
+ * regenerates them from context, and what comes back is a file that is
+ * *plausible* rather than *identical*. A real run on a 2,000-line component
+ * produced a diff of roughly two thousand deletions for a change that should
+ * have added `aria-pressed` to three buttons, with live calls replaced by an
+ * invented placeholder identifier. The whole-file contract is fine for a file a
+ * model can hold and actively dangerous for one it cannot.
+ *
+ * 400 lines is well inside the range that comes back faithfully and well below
+ * where paraphrasing starts. Under it, the whole-file path is kept — it has the
+ * simplest failure mode there is, "the bytes are the bytes".
+ */
+export const TARGETED_EDIT_LINE_THRESHOLD = 400;
+
+/** The two shapes a FIX answer may take. */
+export type FixContract = 'whole-file' | 'targeted-edits';
+
+/** Number of lines in a string, counting a final line without a terminator. */
+function lineCount(text: string): number {
+  if (text === '') return 0;
+  const n = text.split('\n').length;
+  return text.endsWith('\n') ? n - 1 : n;
+}
+
+/**
+ * Which contract a file of this size gets. Called by `buildFixPrompt` to write
+ * the OUTPUT section, by `writePatches` to choose the response format, and by
+ * `parseFixResponse` to decide what it is reading — one function, so the three
+ * cannot disagree about a file.
+ */
+export function chooseFixContract(fileContents: string): FixContract {
+  return lineCount(fileContents) > TARGETED_EDIT_LINE_THRESHOLD
+    ? 'targeted-edits'
+    : 'whole-file';
+}
+
+/* -------------------------------------------------------------------------- */
+/* Placeholder corruption                                                     */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The tells that a model summarised the file instead of reproducing it.
+ *
+ * Each has been produced by a real model asked for a file it could not hold: a
+ * marker where a block used to be, a comment saying the rest is unchanged, a
+ * bare ellipsis standing in for a hundred lines. Every one of them compiles to
+ * *something*, which is what makes them dangerous — a truncated file is
+ * obvious, a summarised one looks like code.
+ */
+const PLACEHOLDER_MARKERS: readonly { readonly label: string; readonly pattern: RegExp }[] = [
+  { label: 'REDACTED', pattern: /\bREDACTED\b/g },
+  {
+    label: '"... rest of file ..."',
+    pattern: /(?:\.{3}|…)[^\n]{0,40}\brest of (?:the )?(?:file|code|component|imports)\b/gi,
+  },
+  { label: '"rest unchanged"', pattern: /\brest (?:of [^\n]{0,40})?(?:is |are )?unchanged\b/gi },
+  {
+    label: '"// unchanged"',
+    pattern: /^[ \t]*(?:\/\/|#|--)[ \t]*(?:\.{3}|…)?[ \t]*(?:rest[ \t]+)?unchanged\b[^\n]*$/gim,
+  },
+  {
+    label: '"/* unchanged */"',
+    pattern: /\{?\/\*[ \t]*(?:\.{3}|…)?[ \t]*(?:rest[ \t]+)?unchanged[^*]{0,60}\*\/\}?/gi,
+  },
+  {
+    label: '"/* ... */" standing alone',
+    pattern: /^[ \t]*\{?[ \t]*\/\*[ \t]*(?:\.{3}|…)[ \t]*\*\/[ \t]*\}?[ \t]*,?[ \t]*$/gm,
+  },
+  { label: '"<!-- ... -->"', pattern: /<!--[ \t]*(?:\.{3}|…)[^>]{0,60}-->/g },
+  {
+    label: 'a line that is only an ellipsis',
+    pattern: /^[ \t]*(?:\/\/[ \t]*|#[ \t]*)?(?:\.{3}|…)[ \t]*,?[ \t]*$/gm,
+  },
+  {
+    label: '"code omitted"',
+    pattern:
+      /\b(?:remaining|existing|unchanged|other)[^\n]{0,30}\b(?:code|lines|imports|functions|components|handlers|helpers)\b[^\n]{0,20}\b(?:omitted|elided|truncated|snipped|unchanged)\b/gi,
+  },
+  { label: '"for brevity"', pattern: /\bfor brevity\b/gi },
+  {
+    label: '"same as before"',
+    pattern: /^[ \t]*(?:\/\/|\/\*|\{\/\*|#)[^\n]{0,20}\bsame as (?:before|above|the original)\b[^\n]*$/gim,
+  },
+  {
+    label: 'an implementation placeholder',
+    pattern: /\b(?:YOUR_CODE_HERE|IMPLEMENTATION_HERE|CODE_HERE|TODO: (?:restore|keep|reinsert))\b/g,
+  },
+];
+
+/** A marker the returned file has and the file we sent did not. */
+export interface PlaceholderHit {
+  /** Human name of the marker, for the skip reason. */
+  readonly marker: string;
+  /** The line it appeared on, trimmed. */
+  readonly sample: string;
+  /** 1-based line in the returned file. */
+  readonly line: number;
+  readonly countBefore: number;
+  readonly countAfter: number;
+}
+
+function countMatches(text: string, pattern: RegExp): { count: number; first: number } {
+  const flags = pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`;
+  const re = new RegExp(pattern.source, flags);
+  let count = 0;
+  let first = -1;
+  for (;;) {
+    const match = re.exec(text);
+    if (match === null) break;
+    if (first === -1) first = match.index;
+    count += 1;
+    if (match[0].length === 0) re.lastIndex += 1;
+  }
+  return { count, first };
+}
+
+/**
+ * The first sign the returned file was summarised rather than reproduced.
+ *
+ * A marker only counts as corruption if the file *gained* it. That qualifier is
+ * not timidity — the very file this guard was written for legitimately contains
+ * a helper named `REDACTED`, and a detector firing on mere presence would refuse
+ * every honest patch to it forever. What the corrupt run did was delete real
+ * calls and leave the marker behind, and the count is what shows that: markers
+ * the file already carried are its own, markers it did not are the model's.
+ */
+export function findPlaceholderMarker(before: string, after: string): PlaceholderHit | null {
+  for (const { label, pattern } of PLACEHOLDER_MARKERS) {
+    const countBefore = countMatches(before, pattern).count;
+    const hit = countMatches(after, pattern);
+    if (hit.count <= countBefore) continue;
+
+    const line = after.slice(0, hit.first).split('\n').length;
+    const sample = (after.split('\n')[line - 1] ?? '').trim().slice(0, 120);
+    return { marker: label, sample, line, countBefore, countAfter: hit.count };
+  }
+  return null;
+}
+
+/* -------------------------------------------------------------------------- */
+/* Proportionality                                                            */
+/* -------------------------------------------------------------------------- */
+
+/**
+ * The most of a file one accessibility patch may rewrite, as a fraction of its
+ * lines.
+ *
+ * A remediation is a surgical change: an attribute bound to state, a label
+ * associated with an input, a colour token adjusted. Whatever else a diff
+ * touching a quarter of a file is, it is not that — and the reviewer who would
+ * have to read it is exactly the person this guard protects.
+ */
+export const MAX_CHANGED_LINE_FRACTION = 0.25;
+
+/**
+ * Changed lines allowed per finding the patch claims, before the fraction rule
+ * is consulted. `aria-pressed` on a button is two lines; a keyboard handler with
+ * a focus style is a dozen. Twenty is generous for the honest case and nowhere
+ * near a rewrite.
+ */
+export const CHANGED_LINES_PER_FINDING = 20;
+
+/** Slack on top of the per-finding budget, for an import and a wired-through prop. */
+export const CHANGED_LINE_BASE_ALLOWANCE = 10;
+
+/**
+ * No patch is refused for size below this many changed lines. A 40-line file has
+ * no room for a quarter-of-the-file rule, and refusing a 12-line fix to a
+ * 30-line component would be the guard doing the harm.
+ */
+export const MIN_CHANGED_LINE_ALLOWANCE = 30;
+
+/**
+ * Lines a patch may delete beyond what it adds.
+ *
+ * An accessibility fix nearly always grows a file: an attribute, a handler, a
+ * label. It shrinks one only when it collapses something — a div-plus-role
+ * scaffold replaced by a real `<button>` — and that is worth a handful of lines,
+ * not a hundred. Net deletion at scale means content went missing, and missing
+ * content is what a summarised file looks like from the diff's side.
+ */
+export const MAX_EXCESS_DELETED_LINES = 10;
+
+export interface PatchSizeVerdict {
+  readonly ok: boolean;
+  /** Present when `ok` is false. Used as the skip reason, verbatim. */
+  readonly reason?: string;
+  readonly changedLines: number;
+  readonly allowance: number;
+  readonly fileLines: number;
+}
+
+/**
+ * Is this diff the size of the fix it claims to be?
+ *
+ * Run on the host, against the host's own diff, after the bytes are settled — so
+ * it measures what a reviewer would actually see rather than what the model said
+ * it did. Two independent rules, and either one refusing is a skip:
+ *
+ *  1. **Volume.** Changed lines are capped by the smaller of a per-finding
+ *     budget and a fraction of the file, floored so small files are never
+ *     squeezed. A three-button `aria-pressed` fix costs single digits; the
+ *     corrupt run that motivated this cost four thousand.
+ *  2. **Net deletion.** Removing much more than you add is how a summarised file
+ *     shows up in a diff, and it is not how a remediation behaves.
+ *
+ * Refusing is not a failure of the run. The finding stays open with a reason a
+ * human can read, which is the whole product: the patch this exists to stop
+ * would otherwise have reached a pull request and destroyed a working
+ * application.
+ */
+export function assessPatchSize(input: {
+  readonly filePath: string;
+  readonly originalContents: string;
+  readonly stats: PatchStats;
+  /** How many findings the patch says it addresses. Never zero at the call site. */
+  readonly findingCount: number;
+}): PatchSizeVerdict {
+  const fileLines = Math.max(1, lineCount(input.originalContents));
+  const changedLines = input.stats.linesAdded + input.stats.linesRemoved;
+  const claimed = Math.max(1, input.findingCount);
+
+  const perFinding = CHANGED_LINE_BASE_ALLOWANCE + claimed * CHANGED_LINES_PER_FINDING;
+  const fraction = Math.ceil(fileLines * MAX_CHANGED_LINE_FRACTION);
+  const allowance = Math.max(MIN_CHANGED_LINE_ALLOWANCE, Math.min(perFinding, fraction));
+  const base = { changedLines, allowance, fileLines };
+
+  if (changedLines > allowance) {
+    const percent = Math.round((changedLines / fileLines) * 100);
+    return {
+      ...base,
+      ok: false,
+      reason:
+        `FIX returned a change to ${input.filePath} that rewrites ${changedLines} lines ` +
+        `(${input.stats.linesAdded} added, ${input.stats.linesRemoved} removed) of a ` +
+        `${fileLines}-line file — about ${percent}% of it — for ${claimed} finding` +
+        `${claimed === 1 ? '' : 's'}. An accessibility remediation of that size is not a ` +
+        `remediation; the budget for this patch was ${allowance} changed lines. Almost always ` +
+        'this is a large file the model regenerated from memory rather than edited, which ' +
+        'silently paraphrases whatever it could not hold. Rejected rather than put in front of ' +
+        'a reviewer — the findings stay open.',
+    };
+  }
+
+  const excessDeleted = input.stats.linesRemoved - input.stats.linesAdded;
+  if (excessDeleted > MAX_EXCESS_DELETED_LINES) {
+    return {
+      ...base,
+      ok: false,
+      reason:
+        `FIX returned a change to ${input.filePath} that deletes ${excessDeleted} more lines ` +
+        `than it adds (${input.stats.linesRemoved} removed against ${input.stats.linesAdded} ` +
+        'added). An accessibility fix adds an attribute, a label or a handler; it does not net ' +
+        `out at ${excessDeleted} lines of working code removed, and at most ` +
+        `${MAX_EXCESS_DELETED_LINES} are allowed. Rejected — the findings stay open.`,
+    };
+  }
+
+  return { ...base, ok: true };
+}
+
+/* -------------------------------------------------------------------------- */
+/* Targeted edits                                                             */
+/* -------------------------------------------------------------------------- */
+
+/** One exact string replacement, applied on the host. */
+export interface FixEdit {
+  readonly find: string;
+  readonly replace: string;
+}
+
+/** Edits accepted for one file. More than this is a rewrite wearing a costume. */
+export const MAX_EDITS_PER_FILE = 24;
+
+/** Lines one `find` snippet may span. Enough for a JSX element, not a component. */
+export const MAX_EDIT_FIND_LINES = 80;
+
+export type ApplyEditsResult =
+  | { readonly ok: true; readonly contents: string; readonly warnings: readonly string[] }
+  | { readonly ok: false; readonly reason: string };
+
+function occurrences(haystack: string, needle: string): number {
+  if (needle === '') return 0;
+  let count = 0;
+  let from = 0;
+  for (;;) {
+    const at = haystack.indexOf(needle, from);
+    if (at === -1) return count;
+    count += 1;
+    from = at + needle.length;
+  }
+}
+
+/** A snippet, shortened for a skip reason a human has to read in a list. */
+function excerpt(text: string, max = 90): string {
+  const single = text.replace(/\s+/g, ' ').trim();
+  return single.length <= max ? single : `${single.slice(0, max)}…`;
+}
+
+/**
+ * Apply a model's edit list to the exact bytes we sent it.
+ *
+ * Every `find` must occur **exactly once** in the text as it stands when that
+ * edit runs. Zero occurrences means the model quoted something that is not there
+ * — usually because it retyped the snippet rather than copying it — and two
+ * occurrences mean it does not know which one it meant. Both are refused by
+ * name. Nothing here fuzzy-matches and nothing picks "the first one": a silent
+ * wrong choice inside somebody's component is exactly the outcome this module
+ * exists to prevent.
+ *
+ * The one repair allowed is line terminators. A model shown a CRLF file answers
+ * in LF as often as not; converting the snippet's newlines and *still* requiring
+ * the converted form to be uniquely present changes no other byte and cannot
+ * select a different site. That is a rename, not an invention.
+ *
+ * Edits apply in order, each against the result of the last, so a later edit may
+ * legitimately depend on an earlier one — and a `find` made ambiguous by an
+ * earlier `replace` is caught rather than guessed at.
+ */
+export function applyFixEdits(original: string, edits: readonly FixEdit[]): ApplyEditsResult {
+  if (edits.length === 0) {
+    return {
+      ok: false,
+      reason: 'FIX returned an empty `edits` list, so there is nothing to apply.',
+    };
+  }
+  if (edits.length > MAX_EDITS_PER_FILE) {
+    return {
+      ok: false,
+      reason:
+        `FIX returned ${edits.length} edits for one file, above the limit of ` +
+        `${MAX_EDITS_PER_FILE}. That is a rewrite expressed as replacements, not a remediation.`,
+    };
+  }
+
+  const warnings: string[] = [];
+  let working = original;
+
+  for (let i = 0; i < edits.length; i += 1) {
+    const edit = edits[i]!;
+    const label = `edit ${i + 1} of ${edits.length}`;
+
+    if (edit.find.length === 0) {
+      return {
+        ok: false,
+        reason: `FIX returned ${label} with an empty \`find\`, which matches nothing.`,
+      };
+    }
+    if (lineCount(edit.find) > MAX_EDIT_FIND_LINES) {
+      return {
+        ok: false,
+        reason:
+          `FIX returned ${label} whose \`find\` spans ${lineCount(edit.find)} lines, above the ` +
+          `limit of ${MAX_EDIT_FIND_LINES}. A snippet that large is the whole file arriving by ` +
+          'another route, and it is the shape that gets paraphrased. Quote only the lines you change.',
+      };
+    }
+    if (edit.find === edit.replace) {
+      warnings.push(
+        `FIX returned ${label} whose \`replace\` is identical to its \`find\`; it changed nothing.`,
+      );
+      continue;
+    }
+
+    let find = edit.find;
+    let replace = edit.replace;
+    let found = occurrences(working, find);
+
+    if (found === 0) {
+      // Terminators only. Same characters, same site, different line endings.
+      const crlf = find.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n');
+      const lf = find.replace(/\r\n/g, '\n');
+      const candidates: readonly (readonly [string, 'CRLF' | 'LF'])[] = [
+        [crlf, 'CRLF'],
+        [lf, 'LF'],
+      ];
+      for (const [candidate, style] of candidates) {
+        if (candidate === find) continue;
+        if (occurrences(working, candidate) !== 1) continue;
+        warnings.push(
+          `FIX quoted ${label} with line endings that do not match the file; it was matched ` +
+            `after converting the snippet to ${style}. No other byte was changed.`,
+        );
+        find = candidate;
+        replace =
+          style === 'CRLF'
+            ? replace.replace(/\r\n/g, '\n').replace(/\n/g, '\r\n')
+            : replace.replace(/\r\n/g, '\n');
+        found = 1;
+        break;
+      }
+    }
+
+    if (found === 0) {
+      return {
+        ok: false,
+        reason:
+          `FIX asked to replace a snippet that does not appear in the file (${label}): ` +
+          `"${excerpt(edit.find)}". Nothing was applied and nothing was guessed at.`,
+      };
+    }
+    if (found > 1) {
+      return {
+        ok: false,
+        reason:
+          `FIX asked to replace a snippet that appears ${found} times in the file (${label}): ` +
+          `"${excerpt(edit.find)}". An ambiguous edit is refused rather than applied to whichever ` +
+          'occurrence happened to come first.',
+      };
+    }
+
+    const at = working.indexOf(find);
+    working = working.slice(0, at) + replace + working.slice(at + find.length);
+  }
+
+  return { ok: true, contents: working, warnings };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -384,18 +943,35 @@ export function parseFixResponse(
     );
   }
 
+  const keysUsed = fileKeysUsed(payload);
   const parsed = FixResponseSchema.safeParse(payload);
   if (!parsed.success) {
     throw new FixResponseError(
-      `FIX response for ${group.filePath} does not match the schema: ${formatIssues(parsed.error)}`,
+      `FIX response for ${group.filePath} does not match the schema: ${formatIssues(parsed.error)}` +
+        (keysUsed.length > 0 && !keysUsed.includes('files')
+          ? ` The response used \`${keysUsed.join('`, `')}\` where \`files\` was expected, which is the ` +
+            `${FIX_RESPONSE_FORMAT_NAME} contract drifting from the saved FIX manifest. ` +
+            'Re-register it with `npm run agents:init -- --update`.'
+          : ''),
       typeof raw === 'string' ? raw : undefined,
       parsed.error,
+    );
+  }
+
+  if (keysUsed.length > 0 && !keysUsed.includes('files')) {
+    warnings.push(
+      `FIX answered under \`${keysUsed.join('`, `')}\` rather than \`files\`. The saved FIX ` +
+        'manifest is out of date; re-register it with `npm run agents:init -- --update`.',
     );
   }
 
   const validIds = new Set(group.findingIds);
   const validCriteria = new Set(group.criteria);
   const minRatio = options.minLengthRatio ?? 0.4;
+  // The same decision `buildFixPrompt` took when it wrote the OUTPUT section, taken
+  // again from the same bytes rather than passed along, so a caller cannot parse a
+  // response against a contract the agent was never given.
+  const contract = chooseFixContract(originalContents);
 
   for (const skip of parsed.data.skipped) {
     skipped.push({
@@ -436,7 +1012,88 @@ export function parseFixResponse(
       }
     }
 
-    if (file.newContents.trim().length === 0) {
+    /*
+     * Which of the three shapes came back, and the bytes it means.
+     *
+     * `edits` is what a large file is asked for and `newContents` is what a
+     * small one is asked for, but either may arrive under either contract — a
+     * model held to a stale manifest, a session that answered in the shape it
+     * knew. Both are accepted and both are then held to the same guards below,
+     * because the guards are about the bytes, not about which key carried them.
+     *
+     * A unified diff is accepted too, for the same reason it always was: a
+     * manifest still pinned to the old `accessifix_patch_set` shape constrains
+     * the model to answer with one, and throwing it away is how a run ends up
+     * with nothing to show and nothing to say. Accepting it does not weaken the
+     * rule that the host owns the diff — `applyUnifiedDiff` checks every context
+     * and every removed line against the exact bytes we sent, so a diff
+     * describing some other file cannot apply at all, and the diff we store is
+     * still recomputed further down from the bytes on both ends.
+     */
+    let newContents: string | undefined;
+
+    const editList = file.edits;
+    if (editList !== undefined && editList.length > 0) {
+      if (contract === 'whole-file') {
+        warnings.push(
+          `FIX answered with ${editList.length} targeted edit(s) for ${group.filePath} where ` +
+            'whole contents were asked for. They were applied on the host, which is the safer ' +
+            'of the two, so the patch stands.',
+        );
+      }
+      const applied = applyFixEdits(originalContents, editList);
+      if (!applied.ok) {
+        skipped.push({
+          findingIds: group.findingIds,
+          criterion: null,
+          reason: `${applied.reason} The findings stay open.`,
+        });
+        continue;
+      }
+      warnings.push(...applied.warnings);
+      newContents = applied.contents;
+    } else if (typeof file.newContents === 'string') {
+      if (contract === 'targeted-edits') {
+        warnings.push(
+          `FIX returned whole contents for ${group.filePath}, which is ${lineCount(originalContents)} ` +
+            'lines and was asked for targeted edits. A file that size is regenerated rather than ' +
+            'copied, so the answer was accepted only provisionally and is held to the ' +
+            'placeholder and proportionality checks below.',
+        );
+      }
+      newContents = file.newContents;
+    } else if (typeof file.diff === 'string' && file.diff.trim().length > 0) {
+      const applied = applyUnifiedDiff(originalContents, file.diff);
+      if (applied === null) {
+        skipped.push({
+          findingIds: group.findingIds,
+          criterion: null,
+          reason:
+            `FIX answered with a unified diff for ${group.filePath} rather than the shape the ` +
+            'prompt asked for, and the diff does not apply to the bytes that were sent. It was ' +
+            'rejected rather than guessed at. The saved FIX manifest is out of date; re-register ' +
+            'it with `npm run agents:init -- --update`.',
+        });
+        continue;
+      }
+      warnings.push(
+        `FIX returned a diff for ${group.filePath} instead of the shape the prompt asked for. ` +
+          'It applied cleanly to the bytes we sent, so the patch was rebuilt from the result.',
+      );
+      newContents = applied;
+    } else {
+      skipped.push({
+        findingIds: group.findingIds,
+        criterion: null,
+        reason:
+          `FIX returned an entry for ${group.filePath} carrying no \`${
+            contract === 'targeted-edits' ? 'edits' : 'newContents'
+          }\`, no contents and no diff, so there is nothing to apply. The findings stay open.`,
+      });
+      continue;
+    }
+
+    if (newContents.trim().length === 0) {
       skipped.push({
         findingIds: group.findingIds,
         criterion: null,
@@ -445,7 +1102,7 @@ export function parseFixResponse(
       continue;
     }
 
-    if (file.newContents === originalContents) {
+    if (newContents === originalContents) {
       skipped.push({
         findingIds: group.findingIds,
         criterion: null,
@@ -454,7 +1111,7 @@ export function parseFixResponse(
       continue;
     }
 
-    if (isNormalizationOnly(originalContents, file.newContents)) {
+    if (isNormalizationOnly(originalContents, newContents)) {
       skipped.push({
         findingIds: group.findingIds,
         criterion: null,
@@ -466,14 +1123,41 @@ export function parseFixResponse(
       continue;
     }
 
-    if (looksTruncated(originalContents, file.newContents, minRatio)) {
+    if (looksTruncated(originalContents, newContents, minRatio)) {
       skipped.push({
         findingIds: group.findingIds,
         criterion: null,
         reason:
-          `FIX returned ${group.filePath} at ${file.newContents.length} characters against an ` +
+          `FIX returned ${group.filePath} at ${newContents.length} characters against an ` +
           `original of ${originalContents.length}. That is an abbreviated file, not a patch, ` +
           'so it was rejected rather than applied.',
+      });
+      continue;
+    }
+
+    /*
+     * Did the model reproduce the file, or describe it?
+     *
+     * A truncated file is caught above by length. A *summarised* one is not: it
+     * is the right size, it parses, and somewhere in the middle a working block
+     * has become `// ... unchanged ...` or a live call has become a placeholder
+     * identifier. That is the shape a large-file rewrite actually fails in, and
+     * it reaches a reviewer looking like ordinary code.
+     *
+     * Only markers the file *gained* count, which is what lets this run against
+     * a file that legitimately contains one of these words.
+     */
+    const placeholder = findPlaceholderMarker(originalContents, newContents);
+    if (placeholder !== null) {
+      skipped.push({
+        findingIds: group.findingIds,
+        criterion: null,
+        reason:
+          `FIX returned ${group.filePath} containing ${placeholder.marker} at line ` +
+          `${placeholder.line} — "${placeholder.sample}" — which the file it was given does not ` +
+          `have (${placeholder.countBefore} before, ${placeholder.countAfter} after). That is a ` +
+          'summary of the file standing in for the file: the model wrote a placeholder where ' +
+          'real code used to be. Rejected outright — the findings stay open.',
       });
       continue;
     }
@@ -503,22 +1187,71 @@ export function parseFixResponse(
     const diff = unifiedDiff(
       group.filePath,
       originalContents,
-      file.newContents,
+      newContents,
       options.diffContext ?? 3,
     );
+    const stats = diffStats(diff);
+
+    /*
+     * The last gate, and the one that would have caught the run this was
+     * written for: is the change the size of the fix it claims to be?
+     *
+     * It is measured here, on the host's own diff, because that is the only
+     * number that is not the model's opinion — the same bytes a reviewer would
+     * read and the same bytes that would land in the commit. `aria-pressed` on
+     * three buttons is single digits of changed lines. Two thousand deletions
+     * for the same claim is not a bigger version of that fix; it is a different
+     * change nobody proposed, and it reached a pull request once.
+     */
+    const size = assessPatchSize({
+      filePath: group.filePath,
+      originalContents,
+      stats,
+      findingCount: findingIds.length,
+    });
+    if (!size.ok) {
+      skipped.push({
+        findingIds: group.findingIds,
+        criterion: null,
+        reason: size.reason ?? `FIX returned a disproportionate change to ${group.filePath}.`,
+      });
+      continue;
+    }
 
     patches.push({
       filePath: group.filePath,
-      newContents: file.newContents,
+      newContents,
       originalContents,
       diff,
       findingIds,
       criteria: criteria.length > 0 ? criteria : criteriaOf(group, findingIds),
       rationale: file.rationale,
       risk: file.risk ?? null,
-      stats: diffStats(diff),
+      stats,
     });
     emitted = true;
+  }
+
+  /*
+   * The rule this whole module exists to enforce, stated once at the end: a FIX
+   * turn that produced no patch has to say why. A response that named no file
+   * and skipped nothing used to leave both lists empty, the run reported "FIX
+   * produced no patches" with no explanation, and the findings were closed out
+   * of the pass without anybody being told. That is the failure mode this
+   * product exists to eliminate, so it must not be ours.
+   */
+  if (patches.length === 0 && skipped.length === 0) {
+    const shape =
+      keysUsed.length > 0
+        ? `It answered under \`${keysUsed.join('`, `')}\` with no entries.`
+        : 'It named no `files` array at all.';
+    skipped.push({
+      findingIds: group.findingIds,
+      criterion: null,
+      reason:
+        `FIX returned a response for ${group.filePath} that proposed no change and skipped ` +
+        `nothing. ${shape} Nothing was applied and the findings stay open for a human.`,
+    });
   }
 
   return { patches, skipped, warnings };

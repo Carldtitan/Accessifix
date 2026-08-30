@@ -75,6 +75,7 @@ import {
   type OpenPullRequestInput,
   type PullRequestPlan,
 } from './lanes';
+import type { FixableFinding } from '@/lib/fix/group';
 import { emitEvent } from './events';
 import { awaitHandoff, loadHandoff, raiseHandoff } from './handoff';
 import { claimRun, holdLease, type LeaseHandle } from './lease';
@@ -356,13 +357,35 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     }
 
     /* ---- 4. Fix -------------------------------------------------------- */
+    /*
+     * A resumed run must not mistake its own progress for nothing to do.
+     *
+     * `openDecideFindings` asks for `open` or `fixing`. Once VERIFY has passed,
+     * the findings it covered are `verified`, so a run interrupted between
+     * verification and the pull request comes back here to an empty list and
+     * used to end at "No DECIDE findings to fix" — discarding a completed
+     * crawl, audit, fix and verify, and stranding the approval card with no
+     * conductor able to act on it. That is not "nothing to fix"; it is a fix
+     * already made and not yet delivered.
+     *
+     * So the patches decide. Findings still open drive a first pass; if there
+     * are none but the ledger holds patches, the run carries on to deliver
+     * them, and `fixPhase` reuses what is already there rather than paying a
+     * model to write it twice.
+     */
     const decidable = await openDecideFindings(runId, 'baseline');
-    if (decidable.length === 0) {
+    const carried = await patchedFindings(runId, 'baseline');
+
+    if (decidable.length === 0 && carried.length === 0) {
       await transition(runId, 'done', {
         reason: 'No DECIDE findings to fix. FLAG findings stay in the human queue (A5.4).',
       });
       return;
     }
+
+    // What the pull request cites. On a resume the open list is empty and the
+    // covered findings are the ones the stored patches name.
+    const fixTargets = decidable.length > 0 ? decidable : carried;
 
     const token = await githubTokenForUser(context.userId);
     if (!token) {
@@ -376,11 +399,12 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     }
 
     if (reached('fixing')) await enterState(runId, 'fixing');
-    const proposed = await fixPhase(context, token, decidable);
+    const fixed = await fixPhase(context, token, fixTargets);
+    const proposed = fixed.patches;
 
     if (proposed.length === 0) {
       await transition(runId, 'done', {
-        reason: 'FIX produced no patches. The findings remain open for a human.',
+        reason: describeNoPatches(fixed.skipped),
       });
       return;
     }
@@ -409,6 +433,7 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
       proposed,
       verification.criteriaFixed,
       verification.evidence,
+      fixTargets,
     );
 
     let plan: PullRequestPlan;
@@ -435,9 +460,46 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     }
 
     await prPhase(context, seam, proposed, gate.requestId, gate.operations);
-    await finalAuditPhase(context, verification.previewUrl ?? context.deployedUrl);
 
-    await transition(runId, 'done');
+    /*
+     * Re-audit only something that could actually have changed.
+     *
+     * The final pass exists to measure the fix. It can only do that against a
+     * build that contains the fix: a preview serving the patched tree. With no
+     * preview the only URL available is the deployed site, whose code is the
+     * unmerged base - so the pass would re-crawl, re-run every lane and
+     * re-score to arrive, expensively and inevitably, at the number it started
+     * with. A delta of zero there says nothing about the patch, and reads as
+     * evidence the patch did nothing, which is worse than saying nothing.
+     *
+     * So it is skipped, and the run says why. The comparison a merged pull
+     * request makes possible is a second run against the redeployed site.
+     */
+    if (verification.previewUrl) {
+      await finalAuditPhase(context, verification.previewUrl);
+      await transition(runId, 'done');
+      return;
+    }
+
+    await emitEvent({
+      runId,
+      type: 'score',
+      capability: 'ledger',
+      summary:
+        'Final audit skipped: the patch is in a pull request, not in the deployed site.',
+      detail:
+        'Nothing serves the patched build, so the only URL available is the one the ' +
+        'baseline already measured. Re-auditing it would compare the site against ' +
+        'itself and report no change, which would misread as the fix having had no ' +
+        'effect. The baseline stands as what this run measured; merging the pull ' +
+        'request and running again is what measures the difference.',
+    });
+
+    await transition(runId, 'done', {
+      reason:
+        'Pull request opened. The baseline is what this run measured: the fix is not ' +
+        'in the deployed site yet, so there is nothing new to audit.',
+    });
   } catch (error) {
     /*
      * A locked job means another conductor is holding work on this run. That is
@@ -869,6 +931,58 @@ interface StoredPatch {
   findingIds: string[];
 }
 
+/** One finding the FIX pass did not patch, and the sentence that says why. */
+interface SkipNote {
+  filePath: string;
+  criterion: string;
+  reason: string;
+}
+
+/**
+ * What the FIX pass produced, and what it declined.
+ *
+ * `skipped` is not diagnostics. It is the other half of the answer: a run that
+ * ends without a pull request has to be able to say, finding by finding, why.
+ * The pass used to return only the patches, so "FIX produced no patches" was
+ * the entire report on a five-minute run — and when the agent was answering in
+ * a shape the parser silently discarded, that sentence was also the only
+ * symptom. A silent no-op is the failure mode this product exists to
+ * eliminate; it must not be ours.
+ */
+interface FixOutcome {
+  patches: StoredPatch[];
+  skipped: SkipNote[];
+}
+
+/** The closing sentence of a run that patched nothing, with the reasons. */
+function describeNoPatches(skipped: readonly SkipNote[]): string {
+  const head = 'FIX produced no patches. The findings remain open for a human.';
+  if (skipped.length === 0) {
+    return (
+      `${head} No reason was recorded for any of them, which is itself a defect — ` +
+      'the FIX pass is expected to state one per finding.'
+    );
+  }
+
+  const seen = new Set<string>();
+  const lines: string[] = [];
+  for (const note of skipped) {
+    const key = `${note.filePath}|${note.criterion}|${note.reason}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    lines.push(`- ${note.criterion} in ${note.filePath}: ${note.reason}`);
+  }
+
+  const shown = lines.slice(0, 8);
+  const rest = lines.length - shown.length;
+  return [
+    head,
+    '',
+    ...shown,
+    ...(rest > 0 ? [`- and ${rest} more, in the run timeline.`] : []),
+  ].join('\n');
+}
+
 /**
  * A5.3: only `DECIDE` findings are fixable. `FLAG` stays with a human (A5.4).
  *
@@ -887,6 +1001,30 @@ async function openDecideFindings(runId: string, phase: RunPhase): Promise<Findi
         eq(findings.verdict, 'DECIDE'),
         inArray(findings.status, ['open', 'fixing']),
       ),
+    );
+}
+
+/**
+ * The findings that this run's surviving patches were written for.
+ *
+ * Read by id from the patch rows rather than by status, because their status is
+ * exactly what a resume cannot rely on: a finding covered by a verified patch
+ * is `verified`, which every "what is left to do" query excludes.
+ */
+async function patchedFindings(runId: string, phase: RunPhase): Promise<Finding[]> {
+  const rows = await db
+    .select()
+    .from(patches)
+    .where(and(eq(patches.runId, runId), ne(patches.status, 'rejected')));
+
+  const ids = [...new Set(rows.flatMap((row) => row.findingIds))];
+  if (ids.length === 0) return [];
+
+  return db
+    .select()
+    .from(findings)
+    .where(
+      and(eq(findings.runId, runId), eq(findings.phase, phase), inArray(findings.id, ids)),
     );
 }
 
@@ -972,7 +1110,7 @@ async function fixPhase(
   context: PipelineContext,
   token: string,
   fixable: Finding[],
-): Promise<StoredPatch[]> {
+): Promise<FixOutcome> {
   // A restarted run must not propose the same patch twice. Patches already on
   // the ledger are the FIX pass's output; rebuild the in-memory view from them
   // and skip straight to VERIFY.
@@ -991,19 +1129,22 @@ async function fixPhase(
     });
 
     const criteriaByFinding = new Map(fixable.map((finding) => [finding.id, finding.criterion]));
-    return existing.map((patch) => ({
-      id: patch.id,
-      filePath: patch.filePath,
-      diff: patch.diff,
-      criteria: [
-        ...new Set(
-          patch.findingIds
-            .map((id) => criteriaByFinding.get(id))
-            .filter((value): value is string => Boolean(value)),
-        ),
-      ],
-      findingIds: patch.findingIds,
-    }));
+    return {
+      patches: existing.map((patch) => ({
+        id: patch.id,
+        filePath: patch.filePath,
+        diff: patch.diff,
+        criteria: [
+          ...new Set(
+            patch.findingIds
+              .map((id) => criteriaByFinding.get(id))
+              .filter((value): value is string => Boolean(value)),
+          ),
+        ],
+        findingIds: patch.findingIds,
+      })),
+      skipped: [],
+    };
   }
 
   // VIS and ACT audited the deployed site, so their findings name an element
@@ -1017,19 +1158,29 @@ async function fixPhase(
   // A5.2: the batching is by file. Findings with no known source path go to the
   // human queue instead of being guessed at.
   const withSource = fixableWithPaths.filter((finding) => finding.sourcePath);
-  const withoutSource = fixableWithPaths.length - withSource.length;
+  const withoutSource = fixableWithPaths.filter((finding) => !finding.sourcePath);
 
-  if (withoutSource > 0) {
+  // Every finding this pass will not patch collects a sentence here, and those
+  // sentences travel all the way to the run's closing state event.
+  const notes: SkipNote[] = withoutSource.map((finding) => ({
+    filePath: '(no source file)',
+    criterion: finding.criterion,
+    reason:
+      'The audit decided this finding, but it could not be mapped to a file in the ' +
+      'repository, so there is nothing to patch.',
+  }));
+
+  if (withoutSource.length > 0) {
     await emitEvent({
       runId: context.runId,
       type: 'log',
       agent: 'FIX',
-      summary: `${withoutSource} finding(s) have no source location and were not batched.`,
+      summary: `${withoutSource.length} finding(s) have no source location and were not batched.`,
       detail: 'A fix needs a file. These stay open for a human.',
     });
   }
 
-  if (withSource.length === 0) return [];
+  if (withSource.length === 0) return { patches: [], skipped: notes };
 
   await db
     .update(findings)
@@ -1118,6 +1269,7 @@ async function fixPhase(
         }
 
         for (const skipped of outcome.skipped ?? []) {
+          notes.push({ filePath, criterion: skipped.criterion, reason: skipped.reason });
           await emitEvent({
             runId: context.runId,
             type: 'log',
@@ -1127,9 +1279,52 @@ async function fixPhase(
           });
         }
 
+        // A warning is the parser reporting a repair it had to make — a response
+        // in the wrong shape, a path it had to reconcile. It is not a failure, and
+        // it is exactly the thing that is invisible until it costs a whole run.
+        for (const warning of outcome.warnings ?? []) {
+          await emitEvent({
+            runId: context.runId,
+            type: 'log',
+            agent: 'FIX',
+            summary: `FIX response for ${filePath} needed repair.`,
+            detail: warning,
+          });
+        }
+
+        if (outcome.patches.length === 0 && (outcome.skipped ?? []).length === 0) {
+          const reason =
+            `FIX returned nothing usable for ${filePath} and gave no reason. The findings ` +
+            'stay open.';
+          for (const finding of forFile) {
+            notes.push({ filePath, criterion: finding.criterion, reason });
+          }
+          await emitEvent({
+            runId: context.runId,
+            type: 'log',
+            agent: 'FIX',
+            summary: `FIX produced no patch for ${filePath} and no reason.`,
+            detail: reason,
+          });
+        }
+
         return { patches: outcome.patches.length };
       },
-      { onError: () => ({ patches: 0 }) },
+      {
+        // `runJob` has already written the failure to the ledger and the
+        // timeline. Stepping aside here keeps the other files going, but the
+        // findings in this one must still carry a sentence into the run report
+        // rather than disappearing into a patch count of zero.
+        onError: (error) => {
+          const reason =
+            `The FIX job for ${filePath} failed: ` +
+            (error instanceof Error ? error.message : String(error));
+          for (const finding of forFile) {
+            notes.push({ filePath, criterion: finding.criterion, reason });
+          }
+          return { patches: 0 };
+        },
+      },
     );
   });
 
@@ -1146,7 +1341,7 @@ async function fixPhase(
       .where(and(eq(findings.runId, context.runId), inArray(findings.id, uncovered)));
   }
 
-  return stored;
+  return { patches: stored, skipped: notes };
 }
 
 /* -------------------------------------------------------------------------- */
@@ -1258,21 +1453,24 @@ async function verifyPhase(
         .where(and(eq(findings.runId, context.runId), inArray(findings.id, coveredFindingIds)));
     }
 
+    // "tests failed" on its own sent a maintainer to read a diff that was fine.
+    // The line has to answer the only question they have — *is our change at
+    // fault?* — so it names the tests and says whether they were already red.
     await emitEvent({
       runId: context.runId,
       type: 'log',
       agent: 'VERIFY',
       capability: 'sandbox',
-      summary: passed
-        ? `Build and ${outcome.testCommand} passed; ${criteriaFixed.length} criterion(s) re-checked clean.`
-        : `Verification failed: ${outcome.buildPassed ? 'build ok' : 'build failed'}, ${outcome.testsPassed ? 'tests ok' : 'tests failed'}.`,
-      detail: outcome.testSummary,
+      summary: verifySummaryLine(outcome, passed, criteriaFixed.length),
+      detail: verifyDetail(outcome),
       data: {
         buildPassed: outcome.buildPassed,
         testsPassed: outcome.testsPassed,
         testCommand: outcome.testCommand,
         recommendation: outcome.recommendation,
         recheck: outcome.recheck,
+        failingTests: outcome.failingTests ?? [],
+        baseline: outcome.baseline ?? null,
       },
     });
 
@@ -1287,14 +1485,17 @@ async function verifyPhase(
         recommendation: outcome.recommendation,
         criteriaFixed,
         previewUrl: outcome.previewUrl ?? null,
+        failingTests: outcome.failingTests ?? [],
+        baseline: outcome.baseline ?? null,
       },
     });
 
     return {
       ok: passed,
       reason: passed
-        ? `Build and ${outcome.testCommand} passed. ${criteriaFixed.length} criterion(s) re-checked clean.`
-        : `The target's own test suite did not pass (${outcome.testCommand}), so no pull request was opened (A6.4). ${outcome.testSummary}`,
+        ? `Build and ${outcome.testCommand} passed. ${criteriaFixed.length} criterion(s) re-checked clean.` +
+          preExistingNote(outcome)
+        : `${verifySummaryLine(outcome, passed, criteriaFixed.length)} ${outcome.testSummary}`,
       criteriaFixed,
       previewUrl: outcome.previewUrl ?? null,
       evidence: {
@@ -1329,6 +1530,86 @@ async function verifyPhase(
   }
 }
 
+/** The shape the verify seam hands back, narrowed to what the timeline reads. */
+type VerifySeamOutcome = Awaited<ReturnType<typeof verifyPatches>>;
+
+/**
+ * The one line a maintainer sees in the timeline.
+ *
+ * "Verification failed: build ok, tests failed" told them nothing they could
+ * act on — not which tests, and above all not whether the change was at fault.
+ * Every branch below answers that, because reading it is how a maintainer
+ * decides whether to look at the diff or at their own `main`.
+ */
+function verifySummaryLine(
+  outcome: VerifySeamOutcome,
+  passed: boolean,
+  criteriaCount: number,
+): string {
+  const baseline = outcome.baseline;
+  const command = outcome.testCommand || 'the test suite';
+
+  if (passed) {
+    const preExisting = baseline?.preExisting.length ?? 0;
+    return preExisting > 0
+      ? `Build passed and ${command} regressed nothing; ` +
+          `${preExisting} test(s) were already failing on the base branch. ` +
+          `${criteriaCount} criterion(s) re-checked clean.`
+      : `Build and ${command} passed; ${criteriaCount} criterion(s) re-checked clean.`;
+  }
+
+  const broke = [...(baseline?.regressions ?? []), ...(baseline?.introduced ?? [])];
+  if (broke.length > 0) {
+    return (
+      `Verification failed: this change broke ${broke.length} test(s) that passed on the ` +
+      `base branch — ${broke.slice(0, 3).map((test) => test.id).join(', ')}` +
+      `${broke.length > 3 ? `, and ${broke.length - 3} more` : ''}.`
+    );
+  }
+  if (!outcome.buildPassed) {
+    return `Verification failed: the patched tree did not build (${command} not reached, or reached and separate).`;
+  }
+  if (baseline && !baseline.comparable && !outcome.testsPassed) {
+    return (
+      `Verification failed: ${command} failed and no baseline comparison was possible, so ` +
+      'every failure is counted against this change.'
+    );
+  }
+  return `Verification failed: build ok, ${command} did not clear the gate.`;
+}
+
+/** The paragraph under that line: the comparison, then the runner's own words. */
+function verifyDetail(outcome: VerifySeamOutcome): string {
+  const baseline = outcome.baseline;
+  const parts: string[] = [];
+  if (baseline) {
+    parts.push(baseline.ran ? baseline.reason : `No baseline run: ${baseline.reason}`);
+  }
+  if (outcome.testSummary) parts.push(outcome.testSummary);
+  const failing = outcome.failingTests ?? [];
+  if (failing.length > 0) {
+    parts.push(
+      'Failing now: ' +
+        failing
+          .slice(0, 10)
+          .map((test) => `${test.id}${test.message ? ` — ${test.message}` : ''}`)
+          .join('; ') +
+        (failing.length > 10 ? `; and ${failing.length - 10} more` : ''),
+    );
+  }
+  return parts.join('\n\n');
+}
+
+/** A pass that carried somebody else's broken tests past should say so. */
+function preExistingNote(outcome: VerifySeamOutcome): string {
+  const preExisting = outcome.baseline?.preExisting.length ?? 0;
+  if (preExisting === 0) return '';
+  return (
+    ` ${preExisting} test(s) were already failing on the base branch before this change and ` +
+    'still are; none of them are this change\'s doing.'
+  );
+}
+
 /* -------------------------------------------------------------------------- */
 /* Phase 6: pull request and final score                                      */
 /* -------------------------------------------------------------------------- */
@@ -1347,6 +1628,7 @@ function pullRequestSeamInput(
   proposed: StoredPatch[],
   criteriaFixed: string[],
   evidence: VerifyOutcome['evidence'],
+  findings: readonly FixableFinding[],
 ): Omit<OpenPullRequestInput, 'approval'> {
   const criteria = [...new Set(proposed.flatMap((patch) => patch.criteria))].sort();
   return {
@@ -1358,7 +1640,18 @@ function pullRequestSeamInput(
     // A10.5: the body cites each criterion, which is also what makes the
     // pull request reviewable by Qodo.
     body: buildPullRequestBody(context, proposed, criteria, criteriaFixed),
-    patches: proposed.map((patch) => ({ filePath: patch.filePath, diff: patch.diff })),
+    // The criteria and finding ids travel with the diff: `composeTitle` and the
+    // body cite them, and a patch stripped to bytes produces a pull request
+    // that claims nothing it actually fixed.
+    patches: proposed.map((patch) => ({
+      filePath: patch.filePath,
+      diff: patch.diff,
+      criteria: patch.criteria,
+      findingIds: patch.findingIds,
+    })),
+    // The ledger rows behind those ids, so the title can count them and the
+    // body can quote what was wrong before.
+    findings,
     // The gates read this rather than taking the conductor's word (A6.4).
     verification: evidence,
     ...(context.signal === undefined ? {} : { signal: context.signal }),
