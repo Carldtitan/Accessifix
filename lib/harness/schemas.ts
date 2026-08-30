@@ -255,6 +255,62 @@ export const FilePatchSetResponseSchema = z.object({
 
 export type FilePatchSetResponse = z.infer<typeof FilePatchSetResponseSchema>;
 
+/**
+ * The second FIX contract: a small set of exact string replacements.
+ *
+ * Whole file contents are the right answer for a small file and the wrong one
+ * for a large file, and the difference is not stylistic. Asked to return two
+ * thousand lines back, a model does not copy them — it regenerates them from
+ * context, paraphrases what it cannot hold, and hands back a file that is
+ * *plausible* rather than *the same*. One real run produced a diff of roughly
+ * two thousand deletions for a change that should have added `aria-pressed` to
+ * three buttons, with live code replaced by placeholder identifiers. Nothing in
+ * a whole-file contract can prevent that, because the corruption is inside the
+ * only thing the model was asked to produce.
+ *
+ * An edit list removes the opportunity. The model quotes the few lines it wants
+ * to change and says what they become; every byte it did not quote is carried
+ * over by the host, untouched, because the host never asked for them. It is
+ * also far cheaper — a handful of lines instead of a full regeneration.
+ *
+ * `find` is matched literally and must occur exactly once. Missing or
+ * ambiguous is a skip with a reason, never a guess: `applyFixEdits` in
+ * `lib/fix/patch.ts` owns that rule, and the diff is still computed on the host
+ * from the bytes that went out and the bytes that came back.
+ */
+export const FileEditSchema = z.object({
+  /** Copied byte for byte out of the file that was sent. Matched literally. */
+  find: z.string().min(1),
+  /** The same snippet after the change. Empty string deletes it. */
+  replace: z.string(),
+});
+
+export type FileEdit = z.infer<typeof FileEditSchema>;
+
+export const FileEditPatchSchema = z.object({
+  filePath: z.string().min(1),
+  edits: z.array(FileEditSchema).min(1),
+  criteria: z.array(CriterionIdSchema).min(1),
+  findingIds: z.array(z.string()).default([]),
+  rationale: z.string().min(1),
+  risk: z.string().nullish(),
+});
+
+export const FileEditSetResponseSchema = z.object({
+  files: z.array(FileEditPatchSchema).default([]),
+  skipped: z
+    .array(
+      z.object({
+        criterion: CriterionIdSchema.nullish(),
+        findingIds: z.array(z.string()).default([]),
+        reason: z.string().min(1),
+      }),
+    )
+    .default([]),
+});
+
+export type FileEditSetResponse = z.infer<typeof FileEditSetResponseSchema>;
+
 // ---------------------------------------------------------------------------
 // Verification (VERIFY)
 // ---------------------------------------------------------------------------
@@ -497,6 +553,103 @@ export const FILE_PATCH_RESPONSE_FORMAT: ResponseFormat = jsonSchemaResponseForm
   "accessifix_file_patch",
   FILE_PATCH_SET_JSON_SCHEMA,
   "The complete new contents of each file changed, with the findings each change addresses.",
+);
+
+/**
+ * The provider-side constraint that matches `FileEditSetResponseSchema`, used
+ * for a file too large to be returned whole. Same envelope as the patch set —
+ * `files` and `skipped`, one entry per file — with `edits` where `newContents`
+ * would be, so the parser, the ledger and the skip reasons are unchanged.
+ */
+export const FILE_EDIT_SET_JSON_SCHEMA: JsonSchema = {
+  type: "object",
+  additionalProperties: false,
+  required: ["files", "skipped"],
+  properties: {
+    files: {
+      type: "array",
+      description: "One entry for the file you were given. Empty if you changed nothing.",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["filePath", "edits", "criteria", "findingIds", "rationale", "risk"],
+        properties: {
+          filePath: {
+            type: "string",
+            description: "Repository-relative path, exactly as it was given to you.",
+          },
+          edits: {
+            type: "array",
+            minItems: 1,
+            description:
+              "The exact string replacements that make your change. Keep them few and small.",
+            items: {
+              type: "object",
+              additionalProperties: false,
+              required: ["find", "replace"],
+              properties: {
+                find: {
+                  type: "string",
+                  description:
+                    "A snippet copied byte for byte out of the file you were shown - same indentation, same quotes, same line breaks. It must occur EXACTLY ONCE in that file; widen it with neighbouring lines until it does. It is matched literally and is never fuzzy-matched or repaired.",
+                },
+                replace: {
+                  type: "string",
+                  description:
+                    "The same snippet after your change. An empty string deletes it. Never write an ellipsis, \"unchanged\", or any other placeholder here - the text is inserted literally.",
+                },
+              },
+            },
+          },
+          criteria: {
+            type: "array",
+            minItems: 1,
+            items: { type: "string", enum: CRITERION_ENUM },
+            description:
+              "Criterion numbers this change addresses, from the supported WCAG 2.2 A/AA set. Never empty.",
+          },
+          findingIds: {
+            type: "array",
+            items: { type: "string" },
+            description: "Ids of exactly the findings this change addresses, from the list given.",
+          },
+          rationale: { type: "string", description: "Why this change is correct." },
+          risk: { ...nullableString, description: "What it might break, or null." },
+        },
+      },
+    },
+    skipped: {
+      type: "array",
+      description: "Findings you deliberately did not fix, each with a real reason.",
+      items: {
+        type: "object",
+        additionalProperties: false,
+        required: ["criterion", "findingIds", "reason"],
+        properties: {
+          criterion: {
+            ...nullableString,
+            description: "The criterion of the finding that was skipped, or null.",
+          },
+          findingIds: { type: "array", items: { type: "string" } },
+          reason: { type: "string" },
+        },
+      },
+    },
+  },
+};
+
+/**
+ * `response_format` for a FIX turn on a file too large to return whole.
+ *
+ * Dispatched as an inline manifest by `writePatches` rather than saved as an
+ * eighth agent: it is the same FIX agent, same model, same skills, with one
+ * field swapped, and a second registry entry would be a second thing to keep
+ * in step with the roster.
+ */
+export const FILE_EDIT_RESPONSE_FORMAT: ResponseFormat = jsonSchemaResponseFormat(
+  "accessifix_file_edits",
+  FILE_EDIT_SET_JSON_SCHEMA,
+  "Exact string replacements for one file, with the findings each change addresses.",
 );
 
 /** `response_format` for VERIFY. */

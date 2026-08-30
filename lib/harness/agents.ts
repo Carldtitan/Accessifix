@@ -18,6 +18,7 @@ import type { AgentSpec, ResponseFormat, RuntimeConfig } from "./client";
 import { renderCriterionTable, requireCriterion } from "./criteria";
 import {
   ALL_VERDICTS,
+  FILE_EDIT_RESPONSE_FORMAT,
   FILE_PATCH_RESPONSE_FORMAT,
   FLAG_ONLY,
   VERIFICATION_RESPONSE_FORMAT,
@@ -644,6 +645,54 @@ export function buildFallbackSpec(
   const primary = resolveModel(definition, options.availableModels);
   if (primary === definition.fallbackModel) return null;
   return buildAgentSpec(definition, { ...options, modelOverride: definition.fallbackModel });
+}
+
+/**
+ * The half of FIX's OUTPUT section that changes when the file is too large to
+ * return whole. Replaces the `newContents` paragraphs, keeps everything else.
+ *
+ * It is a *replacement* rather than an addition on purpose: FIX_INSTRUCTIONS
+ * tells the agent in three places to return every line of the file, and an
+ * agent holding both contracts at once will pick the one it already knows.
+ */
+const FIX_EDITS_OUTPUT = `OUTPUT - TARGETED EDITS
+
+This file is too large to return whole, and the schema you are held to does not accept a whole file. Return the exact string replacements that make your change, in \`edits\`.
+
+- Each edit is { "find": "<snippet copied out of the file you were shown>", "replace": "<that snippet after your change>" }.
+- \`find\` is copied byte for byte from the file in the prompt: same indentation, same quotes, same line breaks, same trailing commas. It is matched literally. Nothing fuzzy-matches it, nothing repairs it, and a snippet you retyped from memory will not match.
+- \`find\` must occur EXACTLY ONCE in the file. If the lines you want appear more than once, widen the snippet with the lines around it until it is unique. A \`find\` that is missing or occurs twice is rejected and the findings stay open.
+- Keep every \`find\` small: the lines you are changing, plus the least context that makes them unique. Never quote a whole component and never quote the whole file.
+- \`replace\` is that same snippet after the change. An empty string deletes it. Never put an ellipsis, "unchanged", "rest of file", or any other placeholder inside \`find\` or \`replace\` - both are used as literal text.
+- Edits are applied in order, each one against the result of the one before it.
+- Everything you do not quote is carried over untouched. You do not need to mention it, and you must not try to.
+- Prefer few edits. Three buttons that need the same attribute are three small edits, not one edit spanning the component.`;
+
+/**
+ * The FIX manifest with the targeted-edit contract in place of the whole-file
+ * one.
+ *
+ * Built from a base spec - normally the saved FIX agent's own manifest, read
+ * back from the control plane - so the model, the skills and the sandbox
+ * settings are the ones FIX actually runs with and only the output contract
+ * differs. A second registry entry would be a second thing to keep in step
+ * with the roster; this is the same agent, asked a different question.
+ */
+export function buildFixEditsSpec(base: AgentSpec): AgentSpec {
+  const instructions = typeof base.instructions === "string" ? base.instructions : "";
+  const marker = "OUTPUT\n";
+  const head = instructions.includes(marker)
+    ? instructions.slice(0, instructions.indexOf(marker))
+    : `${instructions}\n\n`;
+  const tail = [
+    "- If you cannot fix a finding safely, put it in `skipped` with a real reason. Skipping honestly is better than a patch that breaks the build.",
+    "- No prose outside the JSON object.",
+  ].join("\n");
+  return {
+    ...base,
+    instructions: `${head}${FIX_EDITS_OUTPUT}\n${tail}`,
+    response_format: FILE_EDIT_RESPONSE_FORMAT,
+  };
 }
 
 /** One line per agent, for the boot log and the run summary bar. */
