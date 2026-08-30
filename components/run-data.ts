@@ -467,9 +467,10 @@ function describeJob(phase: string, jobKey: string): string {
 /**
  * One `pipeline_jobs` row is one environment card.
  *
- * `pageFindings` lets a page-keyed job report how many findings came out of it.
- * A job whose key is not a page URL reports no count at all rather than zero,
- * because "none found" and "not counted here" are different claims.
+ * `laneFindings` lets each card report the findings *its own agent* recorded,
+ * on its own page, in its own run phase. A job that records no findings at all
+ * reports no count rather than zero, because "none found" and "not counted
+ * here" are different claims.
  *
  * `frames` is the run's captured screenshots, by page. A card gets one only if
  * a browser phase actually captured that page; everything else keeps the
@@ -477,7 +478,7 @@ function describeJob(phase: string, jobKey: string): string {
  */
 export function jobsToEnvironments(
   jobs: ReadonlyArray<JobWire>,
-  pageFindings: ReadonlyMap<string, number> = new Map(),
+  laneFindings: LaneFindingCounts = { byPage: new Map(), byPhase: new Map() },
   frames: ReadonlyArray<FrameWire> = [],
 ): BrowserEnvironment[] {
   const frameIndex = indexFrames(frames);
@@ -491,7 +492,7 @@ export function jobsToEnvironments(
     .sort((a, b) => rank(a) - rank(b) || a.phase.localeCompare(b.phase))
     .map((job) => {
       const state = JOB_STATE[job.status] ?? "queued";
-      const findings = pageFindings.get(pageKeyOf(job.jobKey));
+      const findings = laneFindingCount(job, laneFindings, state);
       const captured = formatUtcTime(job.completedAt ?? job.startedAt);
       const screenshotUrl = frameFor(job, frameIndex);
       const environment: BrowserEnvironment = {
@@ -611,17 +612,89 @@ export function toFindingCards(rows: ReadonlyArray<FindingWire>): Finding[] {
   return rows.map(toFindingCard);
 }
 
-/** How many findings each page produced, for the environment cards. */
-export function findingsByPage(rows: ReadonlyArray<FindingWire>): Map<string, number> {
-  const counts = new Map<string, number>();
+/**
+ * How many findings each *lane* produced, for the environment cards.
+ *
+ * Not by page. A page-keyed count gives every lane that visited a page the
+ * page's whole total, so a run where ACT found three and VIS found two showed
+ * "7 findings" on all six cards — including MEDIA, which found none. The card
+ * names one agent, so the number beside it has to be that agent's.
+ *
+ * Keyed by run phase as well, because the final audit re-walks the same pages
+ * with the same lanes and its findings are a separate set from the baseline's.
+ *
+ * `byPhase` exists for PAGES, whose job is one singleton per phase rather than
+ * one per page (it is comparative, so it cannot be), while its findings are
+ * still recorded against individual pages.
+ */
+export interface LaneFindingCounts {
+  /** `phase   agent   pageUrl` */
+  readonly byPage: ReadonlyMap<string, number>;
+  /** `phase   agent`, summed over every page. */
+  readonly byPhase: ReadonlyMap<string, number>;
+}
+
+const SEP = " ";
+
+function bump(counts: Map<string, number>, key: string): void {
+  counts.set(key, (counts.get(key) ?? 0) + 1);
+}
+
+export function findingsByLane(rows: ReadonlyArray<FindingWire>): LaneFindingCounts {
+  const byPage = new Map<string, number>();
+  const byPhase = new Map<string, number>();
   for (const row of rows) {
+    const lane = `${row.phase}${SEP}${row.agent}`;
+    bump(byPhase, lane);
+
     const url = row.pageUrl;
-    counts.set(url, (counts.get(url) ?? 0) + 1);
-    // A job keys a page with or without its trailing slash; count both spellings.
+    bump(byPage, `${lane}${SEP}${url}`);
+    // A job keys a page with or without its trailing slash; index both
+    // spellings as aliases of the one finding.
     const alt = url.endsWith("/") ? url.slice(0, -1) : url + "/";
-    counts.set(alt, (counts.get(alt) ?? 0) + 1);
+    if (alt !== url) bump(byPage, `${lane}${SEP}${alt}`);
   }
-  return counts;
+  return { byPage, byPhase };
+}
+
+/**
+ * The run phase and page a job's key refers to.
+ *
+ * `null` for a key that names neither — `crawl`, `score`, a source path under
+ * `fix`. Those jobs record no findings, and a count of zero beside them would
+ * be a claim about accessibility rather than a statement that this job does
+ * not count findings.
+ */
+function laneKeyOf(jobKey: string): { phase: string; page: string | null } | null {
+  const scoped = /^(baseline|final):(.+)$/.exec(jobKey);
+  if (scoped) return { phase: scoped[1], page: scoped[2] };
+  if (jobKey === "baseline" || jobKey === "final") return { phase: jobKey, page: null };
+  return null;
+}
+
+/**
+ * The number for one card, or `undefined` to print nothing.
+ *
+ * A lane that finished is reported even at zero: "MEDIA found nothing" is a
+ * result, and the honest one. A lane still running or failed is reported only
+ * when it has something, because zero there means "not finished", which is a
+ * different claim and the one that has bitten this UI before.
+ */
+export function laneFindingCount(
+  job: JobWire,
+  counts: LaneFindingCounts,
+  state: EnvironmentState,
+): number | undefined {
+  if (!job.agent) return undefined;
+  const key = laneKeyOf(job.jobKey);
+  if (!key) return undefined;
+
+  const lane = `${key.phase}${SEP}${job.agent}`;
+  const found =
+    key.page === null ? counts.byPhase.get(lane) : counts.byPage.get(`${lane}${SEP}${key.page}`);
+
+  if (state === "done") return found ?? 0;
+  return found !== undefined && found > 0 ? found : undefined;
 }
 
 export interface CriterionGroup {

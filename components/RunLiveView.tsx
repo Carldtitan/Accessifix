@@ -14,7 +14,7 @@ import { RunSummaryBar } from "./RunSummaryBar";
 import { StatusLabel } from "./StatusLabel";
 import {
   eventsToTimeline,
-  findingsByPage,
+  findingsByLane,
   formatDuration,
   groupByCriterion,
   jobsToEnvironments,
@@ -346,7 +346,7 @@ export function RunLiveView(props: RunLiveViewProps) {
     },
   );
 
-  const environments = jobsToEnvironments(jobs, findingsByPage(findings), frames);
+  const environments = jobsToEnvironments(jobs, findingsByLane(findings), frames);
   const groups = groupByCriterion(findings);
   const matrixRows = scoreToMatrixRows(score, finalScore);
   const timeline = eventsToTimeline(events);
