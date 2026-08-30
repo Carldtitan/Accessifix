@@ -38,7 +38,17 @@ const client =
   postgres(connectionString, {
     // Required for the Supabase session pooler.
     prepare: false,
-    max: 5,
+    /*
+     * One connection per serverless instance, five for a long-lived server.
+     *
+     * Supabase's poolers have a hard client ceiling — 15 on this project — and
+     * a serverless host multiplies instances rather than reusing one process.
+     * At `max: 5` a handful of concurrent requests exhausted it and every query
+     * failed with `EMAXCONNSESSION`, which surfaced as "This page couldn't
+     * load" on a deployment that was otherwise healthy. A serverless instance
+     * handles one request at a time, so a pool of one costs it nothing.
+     */
+    max: process.env.VERCEL ? 1 : 5,
     idle_timeout: 20,
     connect_timeout: 15,
     ssl: sslModeFor(connectionString),
