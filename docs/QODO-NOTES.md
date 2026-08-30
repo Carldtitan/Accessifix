@@ -86,3 +86,16 @@ pushes are rejected for everyone including the repository owner.
   - `createBranch` compares `base...tip` on the reuse path and refuses unless identical or ahead. **Ahead alone is not sufficient**: a colliding branch cut from current main with another author's commits also reads ahead, and those commits would ride into the PR under our approved patch — so every commit above the base must also be the signed-in user's.
   - Cypress, TestCafe, Nightwatch and WebdriverIO now classify as e2e. Previously only Playwright was excluded, so `test: "cypress run"` was executed without a served app and the environment failure blocked the PR.
 - **We dismissed:** Nothing. One deliberate behaviour change recorded: if a resumed run omits `fromRef` and the default branch has moved, the base comparison reads `diverged` and branch reuse is refused **loudly**, rather than silently building on an unapproved parent. `BranchResult.baseSha` is exposed so a resuming caller can pin it.
+
+---
+
+## PR #17 — Sign-in redirect, landing page, and the run-integrity fixes
+
+- **Link:** https://github.com/Carldtitan/Accessifix/pull/17
+- **Qodo found:** `Bugs (0)`, `Rule violations (0)`, `Requirement gaps (0)` — "Great, no issues found!" on the branch as it stood at the auth and landing-page changes.
+- **We changed:** Nothing in response to Qodo. The branch then carried nine further commits, found by running the product against a real target rather than by review:
+  - **A stale Turbopack cache, not a code bug.** A run died with `countFileLines is not defined` — an identifier present in no source file. The dev server had been running for two hours, HMR had half-applied an intermediate save, and its persistent cache kept serving the broken module. `tsc --noEmit` was clean throughout, which is the proof the tree was fine: an undefined identifier cannot survive a clean typecheck. Wiping `.next` and restarting fixed it. Worth recording because the symptom pointed at code that did not exist.
+  - **The pull request cited nothing it fixed.** The seam from the conductor to the GitHub layer mapped patches to `{filePath, diff}`, dropping `criteria` and `findingIds`, and `composeInputFor` hardcoded `findings: []`. A change repairing four findings across SC 1.4.11 and SC 4.1.2 was one click away from opening a pull request titled "Accessibility fixes (1 file, 0 findings)" with a file list reading "SC " and nothing after it. The stored rows were correct the whole time, so nothing in the database looked wrong — only the composed title did.
+  - **Lane cards reported the page's findings, not the lane's.** The count was keyed on page URL, so every lane that visited a page was credited with the page's total: six cards each claiming "7 findings", MEDIA included, which had found none. Now keyed on (run phase, agent, page). A finished lane reports zero honestly; a running or failed one reports nothing, because zero there means "not finished".
+  - **Vercel had not built since the timeout change.** `maxDuration: 800` is above the plan's 300-second ceiling, so every deployment failed at config validation.
+- **We dismissed:** Nothing. A re-review was requested with `/review` after the later commits landed and had not posted when this entry was written; anything it raises will be appended here rather than replacing this record.
