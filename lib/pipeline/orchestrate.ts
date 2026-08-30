@@ -357,13 +357,35 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     }
 
     /* ---- 4. Fix -------------------------------------------------------- */
+    /*
+     * A resumed run must not mistake its own progress for nothing to do.
+     *
+     * `openDecideFindings` asks for `open` or `fixing`. Once VERIFY has passed,
+     * the findings it covered are `verified`, so a run interrupted between
+     * verification and the pull request comes back here to an empty list and
+     * used to end at "No DECIDE findings to fix" — discarding a completed
+     * crawl, audit, fix and verify, and stranding the approval card with no
+     * conductor able to act on it. That is not "nothing to fix"; it is a fix
+     * already made and not yet delivered.
+     *
+     * So the patches decide. Findings still open drive a first pass; if there
+     * are none but the ledger holds patches, the run carries on to deliver
+     * them, and `fixPhase` reuses what is already there rather than paying a
+     * model to write it twice.
+     */
     const decidable = await openDecideFindings(runId, 'baseline');
-    if (decidable.length === 0) {
+    const carried = await patchedFindings(runId, 'baseline');
+
+    if (decidable.length === 0 && carried.length === 0) {
       await transition(runId, 'done', {
         reason: 'No DECIDE findings to fix. FLAG findings stay in the human queue (A5.4).',
       });
       return;
     }
+
+    // What the pull request cites. On a resume the open list is empty and the
+    // covered findings are the ones the stored patches name.
+    const fixTargets = decidable.length > 0 ? decidable : carried;
 
     const token = await githubTokenForUser(context.userId);
     if (!token) {
@@ -377,7 +399,7 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     }
 
     if (reached('fixing')) await enterState(runId, 'fixing');
-    const fixed = await fixPhase(context, token, decidable);
+    const fixed = await fixPhase(context, token, fixTargets);
     const proposed = fixed.patches;
 
     if (proposed.length === 0) {
@@ -411,7 +433,7 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
       proposed,
       verification.criteriaFixed,
       verification.evidence,
-      decidable,
+      fixTargets,
     );
 
     let plan: PullRequestPlan;
@@ -942,6 +964,30 @@ async function openDecideFindings(runId: string, phase: RunPhase): Promise<Findi
         eq(findings.verdict, 'DECIDE'),
         inArray(findings.status, ['open', 'fixing']),
       ),
+    );
+}
+
+/**
+ * The findings that this run's surviving patches were written for.
+ *
+ * Read by id from the patch rows rather than by status, because their status is
+ * exactly what a resume cannot rely on: a finding covered by a verified patch
+ * is `verified`, which every "what is left to do" query excludes.
+ */
+async function patchedFindings(runId: string, phase: RunPhase): Promise<Finding[]> {
+  const rows = await db
+    .select()
+    .from(patches)
+    .where(and(eq(patches.runId, runId), ne(patches.status, 'rejected')));
+
+  const ids = [...new Set(rows.flatMap((row) => row.findingIds))];
+  if (ids.length === 0) return [];
+
+  return db
+    .select()
+    .from(findings)
+    .where(
+      and(eq(findings.runId, runId), eq(findings.phase, phase), inArray(findings.id, ids)),
     );
 }
 

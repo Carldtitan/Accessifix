@@ -112,7 +112,26 @@ export async function scoreRun(runId: string, phase: RunPhase): Promise<RunScore
 
     const entry = counts.get(row.criterion) ?? { total: 0, open: 0 };
     entry.total += 1;
-    if (row.status !== 'fixed' && row.status !== 'verified' && row.status !== 'dismissed') {
+    /*
+     * Only a human's dismissal closes a finding for scoring.
+     *
+     * `fixed` and `verified` describe a *patch* — that FIX wrote one and that
+     * it built and passed the target's tests. Neither is an observation about
+     * the page. A patch waiting in an unmerged pull request changes nothing a
+     * screen reader encounters, and the re-check that would be evidence
+     * reports "0 criterion(s) re-checked clean" precisely because nothing
+     * serves the patched tree yet.
+     *
+     * Counting them as closed rewrote the baseline after the fact: a run that
+     * had recorded "2 failing, 8 findings" re-scored on resume as "0 failing,
+     * 8 findings" — every finding still in the ledger, every criterion
+     * reported as passing, and nothing anywhere having been re-audited.
+     *
+     * The `final` phase does not need the exemption either: it re-audits and
+     * inserts its own rows, so its score is computed from what that pass
+     * actually observed rather than from the baseline's remediation state.
+     */
+    if (row.status !== 'dismissed') {
       entry.open += 1;
       openFindings += 1;
     }
