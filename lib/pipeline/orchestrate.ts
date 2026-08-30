@@ -460,9 +460,46 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
     }
 
     await prPhase(context, seam, proposed, gate.requestId, gate.operations);
-    await finalAuditPhase(context, verification.previewUrl ?? context.deployedUrl);
 
-    await transition(runId, 'done');
+    /*
+     * Re-audit only something that could actually have changed.
+     *
+     * The final pass exists to measure the fix. It can only do that against a
+     * build that contains the fix: a preview serving the patched tree. With no
+     * preview the only URL available is the deployed site, whose code is the
+     * unmerged base - so the pass would re-crawl, re-run every lane and
+     * re-score to arrive, expensively and inevitably, at the number it started
+     * with. A delta of zero there says nothing about the patch, and reads as
+     * evidence the patch did nothing, which is worse than saying nothing.
+     *
+     * So it is skipped, and the run says why. The comparison a merged pull
+     * request makes possible is a second run against the redeployed site.
+     */
+    if (verification.previewUrl) {
+      await finalAuditPhase(context, verification.previewUrl);
+      await transition(runId, 'done');
+      return;
+    }
+
+    await emitEvent({
+      runId,
+      type: 'score',
+      capability: 'ledger',
+      summary:
+        'Final audit skipped: the patch is in a pull request, not in the deployed site.',
+      detail:
+        'Nothing serves the patched build, so the only URL available is the one the ' +
+        'baseline already measured. Re-auditing it would compare the site against ' +
+        'itself and report no change, which would misread as the fix having had no ' +
+        'effect. The baseline stands as what this run measured; merging the pull ' +
+        'request and running again is what measures the difference.',
+    });
+
+    await transition(runId, 'done', {
+      reason:
+        'Pull request opened. The baseline is what this run measured: the fix is not ' +
+        'in the deployed site yet, so there is nothing new to audit.',
+    });
   } catch (error) {
     /*
      * A locked job means another conductor is holding work on this run. That is
