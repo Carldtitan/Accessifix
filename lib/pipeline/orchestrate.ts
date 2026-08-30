@@ -75,6 +75,7 @@ import {
   type OpenPullRequestInput,
   type PullRequestPlan,
 } from './lanes';
+import type { FixableFinding } from '@/lib/fix/group';
 import { emitEvent } from './events';
 import { awaitHandoff, loadHandoff, raiseHandoff } from './handoff';
 import { claimRun, holdLease, type LeaseHandle } from './lease';
@@ -410,6 +411,7 @@ async function conductRun(runId: string, options: RunPipelineOptions = {}): Prom
       proposed,
       verification.criteriaFixed,
       verification.evidence,
+      decidable,
     );
 
     let plan: PullRequestPlan;
@@ -1543,6 +1545,7 @@ function pullRequestSeamInput(
   proposed: StoredPatch[],
   criteriaFixed: string[],
   evidence: VerifyOutcome['evidence'],
+  findings: readonly FixableFinding[],
 ): Omit<OpenPullRequestInput, 'approval'> {
   const criteria = [...new Set(proposed.flatMap((patch) => patch.criteria))].sort();
   return {
@@ -1554,7 +1557,18 @@ function pullRequestSeamInput(
     // A10.5: the body cites each criterion, which is also what makes the
     // pull request reviewable by Qodo.
     body: buildPullRequestBody(context, proposed, criteria, criteriaFixed),
-    patches: proposed.map((patch) => ({ filePath: patch.filePath, diff: patch.diff })),
+    // The criteria and finding ids travel with the diff: `composeTitle` and the
+    // body cite them, and a patch stripped to bytes produces a pull request
+    // that claims nothing it actually fixed.
+    patches: proposed.map((patch) => ({
+      filePath: patch.filePath,
+      diff: patch.diff,
+      criteria: patch.criteria,
+      findingIds: patch.findingIds,
+    })),
+    // The ledger rows behind those ids, so the title can count them and the
+    // body can quote what was wrong before.
+    findings,
     // The gates read this rather than taking the conductor's word (A6.4).
     verification: evidence,
     ...(context.signal === undefined ? {} : { signal: context.signal }),

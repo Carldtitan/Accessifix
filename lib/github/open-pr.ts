@@ -46,6 +46,8 @@ import {
 } from '@/lib/fix/gate';
 import type { FilePatch } from '@/lib/fix/patch';
 import { materializeAllPatches, PatchesDoNotApplyError } from '@/lib/fix/source';
+import type { StoredPatchInput } from '@/lib/fix/source';
+import type { FixableFinding } from '@/lib/fix/group';
 import type { BuildResult } from '@/lib/verify/build';
 import type { RecheckReport } from '@/lib/verify/recheck';
 import type { TestRunResult } from '@/lib/verify/tests';
@@ -80,7 +82,21 @@ export interface PipelineOpenPullRequestInput {
   branch: string;
   title: string;
   body: string;
-  patches: readonly { filePath: string; diff: string }[];
+  /**
+   * The stored patches, with the findings and criteria they were written for.
+   *
+   * Not merely `{filePath, diff}`: the title and body are composed from these,
+   * and a patch that arrives without its criteria produces a pull request
+   * titled "Accessibility fixes (1 file, 0 findings)" over a diff that fixes
+   * four. The citation is the product; it travels with the bytes.
+   */
+  patches: readonly StoredPatchInput[];
+  /**
+   * The findings those patches address, for the before/after evidence and the
+   * count in the title. Empty means the pull request cites no finding, so the
+   * conductor passes the ledger rows the FIX pass worked from.
+   */
+  findings?: readonly FixableFinding[];
   /** Verification evidence. The gates read this; they do not take our word. */
   verification?: {
     buildPassed: boolean;
@@ -260,7 +276,7 @@ function composeInputFor(
     baseBranch: base,
     branch: input.branch,
     patches,
-    findings: [],
+    findings: input.findings ?? [],
     build: evidence.build,
     tests: evidence.tests,
     recheck: evidence.recheck,

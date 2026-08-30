@@ -37,6 +37,7 @@ import type { InteractionPath, PageCapture } from '@/lib/browser/types';
 import type { Finding, RunPhase } from '@/lib/db/schema';
 
 import type { FindingClaim } from './ledger';
+import type { FixableFinding } from '@/lib/fix/group';
 
 /* -------------------------------------------------------------------------- */
 /* Audit lanes                                                                */
@@ -235,7 +236,18 @@ export interface OpenPullRequestInput {
   branch: string;
   title: string;
   body: string;
-  patches: readonly { filePath: string; diff: string }[];
+  /**
+   * The stored patches together with the criteria and findings they were
+   * written for. Bytes alone compose a pull request that cites nothing.
+   */
+  patches: readonly {
+    filePath: string;
+    diff: string;
+    criteria?: readonly string[];
+    findingIds?: readonly string[];
+  }[];
+  /** The ledger rows behind those ids, for the title's count and the evidence. */
+  findings?: readonly FixableFinding[];
   /**
    * Verification evidence. The gates in `openVerifiedPullRequest` read this
    * rather than taking the conductor's word: a failing suite is a hard stop,
